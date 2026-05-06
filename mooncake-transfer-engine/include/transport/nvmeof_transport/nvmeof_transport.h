@@ -17,8 +17,10 @@
 
 #include <bits/stdint-uintn.h>
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
+#include <thread>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -62,6 +64,9 @@ class NVMeoFTransport : public Transport {
    private:
     void startTransfer(Slice *slice);
 
+    void startPollingWorker();
+    void stopPollingWorker();
+
    private:
     struct pair_hash {
         template <class T1, class T2>
@@ -96,7 +101,8 @@ class NVMeoFTransport : public Transport {
 
     void addSliceToCUFileBatch(void *source_addr, uint64_t file_offset,
                                uint64_t slice_len, uint64_t desc_id,
-                               TransferRequest::OpCode op, CUfileHandle_t fh);
+                               TransferRequest::OpCode op, CUfileHandle_t fh,
+                               Transport::Slice* slice);
 
     const char *getName() const override { return "nvmeof"; }
 
@@ -108,6 +114,10 @@ class NVMeoFTransport : public Transport {
 
     std::shared_ptr<CUFileDescPool> desc_pool_;
     RWSpinlock context_lock_;
+
+    std::thread polling_worker_;
+    std::atomic<bool> polling_worker_running_{false};
+    std::atomic<uint64_t> total_completed_tasks_{0};
 };
 }  // namespace mooncake
 

@@ -37,9 +37,12 @@ namespace mooncake {
 NVMeoFTransport::NVMeoFTransport() {
     CUFILE_CHECK(cuFileDriverOpen());
     desc_pool_ = std::make_shared<CUFileDescPool>();
+    startPollingWorker();
 }
 
-NVMeoFTransport::~NVMeoFTransport() {}
+NVMeoFTransport::~NVMeoFTransport() {
+    stopPollingWorker();
+}
 
 Transport::TransferStatusEnum from_cufile_transfer_status(
     CUfileStatus_t status) {
@@ -92,6 +95,11 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         // TODO(FIXME): what to do if multi slices have different status?
         if (transfer_status.s == COMPLETED) {
             transfer_status.transferred_bytes += event.ret;
+            for (auto* slice : task.slice_list) {
+                if (slice->status == Slice::PENDING || slice->status == Slice::POSTED) {
+                    slice->markSuccess();
+                }
+            }
         } else {
             break;
         }
@@ -165,6 +173,7 @@ Status NVMeoFTransport::submitTransferTask(
                 // Add slice to task
                 addSliceToTask(source_addr, slice_len, file_offset,
                                request.opcode, task, file_path);
+                Slice* slice = task.slice_list.back();
 
                 // Get cufile handle
                 auto buf_key = std::make_pair(target_id, buffer_id);
@@ -181,7 +190,7 @@ Status NVMeoFTransport::submitTransferTask(
                 // Add slice to CUFile batch
                 addSliceToCUFileBatch(source_addr, file_offset, slice_len,
                                       nvmeof_desc->desc_idx_, request.opcode,
-                                      fh);
+                                      fh, slice);
             }
             ++buffer_id;
             current_offset += buffer_desc.length;
@@ -264,6 +273,7 @@ Status NVMeoFTransport::submitTransfer(
                 uint64_t slice_len = slice_end - slice_start;
                 addSliceToTask(source_addr, slice_len, file_offset,
                                request.opcode, task, file_path);
+                Slice* slice = task.slice_list.back();
                 // 4. get cufile handle
                 auto buf_key = std::make_pair(target_id, buffer_id);
                 CUfileHandle_t fh;
@@ -279,7 +289,7 @@ Status NVMeoFTransport::submitTransfer(
                 // 5. add cufile request
                 addSliceToCUFileBatch(source_addr, file_offset, slice_len,
                                       nvmeof_desc.desc_idx_, request.opcode,
-                                      fh);
+                                      fh, slice);
             }
             ++buffer_id;
             current_offset += buffer_desc.length;
@@ -357,12 +367,12 @@ void NVMeoFTransport::addSliceToTask(void *source_addr, uint64_t slice_len,
 
 void NVMeoFTransport::addSliceToCUFileBatch(
     void *source_addr, uint64_t file_offset, uint64_t slice_len,
-    uint64_t desc_id, TransferRequest::OpCode op, CUfileHandle_t fh) {
+    uint64_t desc_id, TransferRequest::OpCode op, CUfileHandle_t fh, Transport::Slice* slice) {
     CUfileIOParams_t params;
     params.mode = CUFILE_BATCH;
     params.opcode =
         op == Transport::TransferRequest::READ ? CUFILE_READ : CUFILE_WRITE;
-    params.cookie = (void *)0;
+    params.cookie = (void*)slice;
     params.u.batch.devPtr_base = source_addr;
     params.u.batch.devPtr_offset = 0;
     params.u.batch.file_offset = file_offset;
@@ -372,4 +382,41 @@ void NVMeoFTransport::addSliceToCUFileBatch(
     // request.target_offset << " length " << request.length;
     desc_pool_->pushParams(desc_id, params);
 }
+
+void NVMeoFTransport::startPollingWorker() {
+    polling_worker_running_.store(true);
+    polling_worker_ = std::thread([this]() {
+        while(polling_worker_running_.load()) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+
+            for (int desc_idx = 0; desc_idx < (int)desc_pool_->MAX_NR_DESC; ++desc_idx) {
+                auto* desc = desc_pool_->getDesc(desc_idx);
+                if (!desc) continue;
+
+                int slice_num = desc->io_params.size();
+                for (int slice_id = 0; slice_id < slice_num; ++slice_id) {
+                    auto event = desc_pool_->getTransferStatus(desc_idx, slice_id);
+                    if (event.status == CUFILE_COMPLETE) {
+                        auto* slice = (Transport::Slice*)desc->io_params[slice_id].cookie;
+                        if (slice && (slice->status == Transport::Slice::PENDING ||
+                                      slice->status == Transport::Slice::POSTED)) {
+                            slice->markSuccess();
+                            total_completed_tasks_.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+void NVMeoFTransport::stopPollingWorker() {
+    if (polling_worker_running_.load()) {
+        polling_worker_running_.store(false);
+        if (polling_worker_.joinable()) {
+            polling_worker_.join();
+        }
+    }
+}
+
 }  // namespace mooncake
