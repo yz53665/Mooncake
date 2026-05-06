@@ -106,7 +106,101 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 // Dummy implement for solving build issues, WIP
 Status NVMeoFTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
-    /* TBD */
+    std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
+        segment_desc_map;
+
+    // Process each transfer task
+    for (size_t index = 0; index < task_list.size(); ++index) {
+        auto &task = *task_list[index];
+        assert(task.request);
+        auto &request = *task.request;
+
+        // Get batch descriptor from task
+        BatchID batch_id = task.batch_id;
+        auto &batch_desc = *((BatchDesc *)(batch_id));
+        auto batch_size = batch_desc.batch_size;
+
+        auto nvmeof_desc = new NVMeoFBatchDesc();
+        nvmeof_desc->desc_idx_ = desc_pool_->allocCUfileDesc(batch_size);
+        nvmeof_desc->transfer_status.reserve(batch_size);
+        nvmeof_desc->task_to_slices.reserve(batch_size);
+        batch_desc.context = nvmeof_desc;
+
+        // Get segment descriptor for target
+        auto target_id = request.target_id;
+        if (!segment_desc_map.count(target_id)) {
+            segment_desc_map[target_id] =
+                metadata_->getSegmentDescByID(target_id);
+            assert(segment_desc_map[target_id] != nullptr);
+        }
+
+        auto &desc = segment_desc_map.at(target_id);
+        assert(desc->protocol == "nvmeof");
+
+        // Record starting slice index for this task
+        size_t slice_id = desc_pool_->getSliceNum(nvmeof_desc->desc_idx_);
+
+        // Process request in chunks (similar to submitTransfer)
+        uint32_t buffer_id = 0;
+        uint64_t segment_start = request.target_offset;
+        uint64_t segment_end = request.target_offset + request.length;
+        uint64_t current_offset = 0;
+
+        for (auto &buffer_desc : desc->nvmeof_buffers) {
+            bool is_overlap =
+                overlap((void *)segment_start, request.length,
+                        (void *)current_offset, buffer_desc.length);
+            if (is_overlap) {
+                uint64_t slice_start =
+                    std::max(segment_start, current_offset);
+                uint64_t slice_end =
+                    std::min(segment_end, current_offset + buffer_desc.length);
+                const char *file_path =
+                    buffer_desc.local_path_map["amax"].c_str();
+                void *source_addr =
+                    (char *)request.source + slice_start - segment_start;
+                uint64_t file_offset = slice_start - current_offset;
+                uint64_t slice_len = slice_end - slice_start;
+
+                // Add slice to task
+                addSliceToTask(source_addr, slice_len, file_offset,
+                               request.opcode, task, file_path);
+
+                // Get cufile handle
+                auto buf_key = std::make_pair(target_id, buffer_id);
+                CUfileHandle_t fh;
+                {
+                    RWSpinlock::WriteGuard guard(context_lock_);
+                    if (!segment_to_context_.count(buf_key)) {
+                        segment_to_context_[buf_key] =
+                            std::make_shared<CuFileContext>(file_path);
+                    }
+                    fh = segment_to_context_.at(buf_key)->getHandle();
+                }
+
+                // Add slice to CUFile batch
+                addSliceToCUFileBatch(source_addr, file_offset, slice_len,
+                                      nvmeof_desc->desc_idx_, request.opcode,
+                                      fh);
+            }
+            ++buffer_id;
+            current_offset += buffer_desc.length;
+        }
+
+        // Update task_to_slices mapping
+        nvmeof_desc->transfer_status.push_back(
+            TransferStatus{.s = PENDING, .transferred_bytes = 0});
+        nvmeof_desc->task_to_slices.push_back(
+            {slice_id, task.slice_count - slice_id});
+    }
+
+    // Submit the batch
+    if (!task_list.empty()) {
+        auto &batch_desc = *((BatchDesc *)(task_list[0]->batch_id));
+        auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
+        desc_pool_->submitBatch(nvmeof_desc.desc_idx_);
+    }
+
     return Status::OK();
 }
 
