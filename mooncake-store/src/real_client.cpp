@@ -751,7 +751,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     client_buffer_allocator_ = ClientBufferAllocator::create(
         local_buffer_size, this->protocol, should_use_hugepage,
         use_spdk_dma_for_client_buffer);
-    if (local_buffer_size > 0 && protocol != "cxl") {
+    if (local_buffer_size > 0 && protocol != "cxl" && protocol != "nvmeof") {
+        local_buffer_size, this->protocol, should_use_hugepage);
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
         auto result = client_->RegisterLocalMemory(
@@ -799,6 +800,31 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << toString(mount_result.error());
             return tl::unexpected(mount_result.error());
         }
+
+    } else if (protocol == "nvmeof") {
+        size_t nvmeof_pool_size = 0;
+        const char *env = std::getenv("MC_NVMEOF_POOL_SIZE");
+        if (env) {
+            char *end = nullptr;
+            unsigned long long val = strtoull(env, &end, 10);
+            if (end != env && *end == '\0')
+                nvmeof_pool_size = static_cast<size_t>(val);
+        }
+        if (nvmeof_pool_size == 0) {
+            LOG(INFO) << "MC_NVMEOF_POOL_SIZE not set or zero, "
+                      << "NVMeoF segment base=0 (logical offset); "
+                      << "storage capacity managed by transport metadata";
+        }
+        LOG(INFO) << "NVMeoF protocol: mounting segment base=0"
+                  << " size=" << nvmeof_pool_size;
+        auto mount_result = client_->MountSegment(
+            nullptr, nvmeof_pool_size, protocol, kWildcardLocation);
+        if (!mount_result.has_value()) {
+            LOG(ERROR) << "Failed to mount NVMeoF segment: "
+                       << toString(mount_result.error());
+            return tl::unexpected(mount_result.error());
+        }
+        LOG(INFO) << "NVMeoF segment mounted to master";
 
     } else {
         auto max_mr_size = globalConfig().max_mr_size;     // Max segment size
@@ -1099,7 +1125,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         return {};
     }
     if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
-        protocol != "cxl") {
+        protocol != "cxl" && protocol != "nvmeof") {
         auto unregister_result = client_->unregisterLocalMemory(
             client_buffer_allocator_->getBase(), true);
         if (!unregister_result) {

@@ -2778,17 +2778,31 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
 
-        // Check if the segment overlaps with any existing segment
-        for (auto& it : mounted_segments_) {
-            auto& mtseg = it.second;
-            uintptr_t l1 = reinterpret_cast<uintptr_t>(mtseg.base);
-            uintptr_t r1 = reinterpret_cast<uintptr_t>(mtseg.size) + l1;
-            uintptr_t l2 = reinterpret_cast<uintptr_t>(buffer);
-            uintptr_t r2 = reinterpret_cast<uintptr_t>(size) + l2;
-            if (std::max(l1, l2) < std::min(r1, r2)) {
-                LOG(ERROR) << "segment_overlaps base1=" << mtseg.base
-                           << " size1=" << mtseg.size << " base2=" << buffer
-                           << " size2=" << size;
+        // NVMeoF: no DDR memory allocation, skip overlap check and
+        // registerLocalMemory. segment.base is treated as logical offset 0.
+        bool is_nvmeof = (protocol == "nvmeof");
+
+        if (!is_nvmeof) {
+            // Check if the segment overlaps with any existing segment
+            for (auto& it : mounted_segments_) {
+                auto& mtseg = it.second;
+                uintptr_t l1 = reinterpret_cast<uintptr_t>(mtseg.base);
+                uintptr_t r1 = reinterpret_cast<uintptr_t>(mtseg.size) + l1;
+                uintptr_t l2 = reinterpret_cast<uintptr_t>(buffer);
+                uintptr_t r2 = reinterpret_cast<uintptr_t>(size) + l2;
+                if (std::max(l1, l2) < std::min(r1, r2)) {
+                    LOG(ERROR) << "segment_overlaps base1=" << mtseg.base
+                               << " size1=" << mtseg.size << " base2=" << buffer
+                               << " size2=" << size;
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                }
+            }
+
+            int rc = transfer_engine_->registerLocalMemory(
+                (void*)buffer, size, location, true, true);
+            if (rc != 0) {
+                LOG(ERROR) << "register_local_memory_failed base=" << buffer
+                           << " size=" << size << ", error=" << rc;
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
         }
@@ -2804,7 +2818,7 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         Segment segment;
         segment.id = generate_uuid();
         segment.name = local_hostname_;
-        segment.base = reinterpret_cast<uintptr_t>(buffer);
+        segment.base = is_nvmeof ? 0 : reinterpret_cast<uintptr_t>(buffer);
         segment.size = size;
         segment.protocol = protocol;
         if (metadata_connstring_ == P2PHANDSHAKE) {

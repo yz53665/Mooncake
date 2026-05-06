@@ -37,7 +37,6 @@ namespace mooncake {
 NVMeoFTransport::NVMeoFTransport() {
     CUFILE_CHECK(cuFileDriverOpen());
     desc_pool_ = std::make_shared<CUFileDescPool>();
-    startPollingWorker();
 }
 
 NVMeoFTransport::~NVMeoFTransport() {
@@ -111,28 +110,24 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return Status::OK();
 }
 
-// Dummy implement for solving build issues, WIP
 Status NVMeoFTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
+    if (task_list.empty()) return Status::OK();
+
+    // All tasks must share the same batch — reuse the NVMeoFBatchDesc
+    // already allocated by allocateBatchID (stored in batch_desc.context).
+    BatchID batch_id = task_list[0]->batch_id;
+    auto &batch_desc = *((BatchDesc *)(batch_id));
+    auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
+
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
         segment_desc_map;
 
-    // Process each transfer task
     for (size_t index = 0; index < task_list.size(); ++index) {
         auto &task = *task_list[index];
+        assert(task.batch_id == batch_id);
         assert(task.request);
         auto &request = *task.request;
-
-        // Get batch descriptor from task
-        BatchID batch_id = task.batch_id;
-        auto &batch_desc = *((BatchDesc *)(batch_id));
-        auto batch_size = batch_desc.batch_size;
-
-        auto nvmeof_desc = new NVMeoFBatchDesc();
-        nvmeof_desc->desc_idx_ = desc_pool_->allocCUfileDesc(batch_size);
-        nvmeof_desc->transfer_status.reserve(batch_size);
-        nvmeof_desc->task_to_slices.reserve(batch_size);
-        batch_desc.context = nvmeof_desc;
 
         // Get segment descriptor for target
         auto target_id = request.target_id;
@@ -146,9 +141,9 @@ Status NVMeoFTransport::submitTransferTask(
         assert(desc->protocol == "nvmeof");
 
         // Record starting slice index for this task
-        size_t slice_id = desc_pool_->getSliceNum(nvmeof_desc->desc_idx_);
+        size_t slice_id = desc_pool_->getSliceNum(nvmeof_desc.desc_idx_);
 
-        // Process request in chunks (similar to submitTransfer)
+        // Process request in chunks (same as submitTransfer)
         uint32_t buffer_id = 0;
         uint64_t segment_start = request.target_offset;
         uint64_t segment_end = request.target_offset + request.length;
@@ -189,7 +184,7 @@ Status NVMeoFTransport::submitTransferTask(
 
                 // Add slice to CUFile batch
                 addSliceToCUFileBatch(source_addr, file_offset, slice_len,
-                                      nvmeof_desc->desc_idx_, request.opcode,
+                                      nvmeof_desc.desc_idx_, request.opcode,
                                       fh, slice);
             }
             ++buffer_id;
@@ -197,19 +192,14 @@ Status NVMeoFTransport::submitTransferTask(
         }
 
         // Update task_to_slices mapping
-        nvmeof_desc->transfer_status.push_back(
+        nvmeof_desc.transfer_status.push_back(
             TransferStatus{.s = PENDING, .transferred_bytes = 0});
-        nvmeof_desc->task_to_slices.push_back(
+        nvmeof_desc.task_to_slices.push_back(
             {slice_id, task.slice_count - slice_id});
     }
 
-    // Submit the batch
-    if (!task_list.empty()) {
-        auto &batch_desc = *((BatchDesc *)(task_list[0]->batch_id));
-        auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
-        desc_pool_->submitBatch(nvmeof_desc.desc_idx_);
-    }
-
+    // Submit once for all tasks in the batch
+    desc_pool_->submitBatch(nvmeof_desc.desc_idx_);
     return Status::OK();
 }
 
@@ -323,7 +313,11 @@ Status NVMeoFTransport::freeBatchID(BatchID batch_id) {
 int NVMeoFTransport::install(std::string &local_server_name,
                              std::shared_ptr<TransferMetadata> meta,
                              std::shared_ptr<Topology> topo) {
-    return Transport::install(local_server_name, meta, topo);
+    int ret = Transport::install(local_server_name, meta, topo);
+    if (ret == 0) {
+        startPollingWorker();
+    }
+    return ret;
 }
 
 int NVMeoFTransport::registerLocalMemory(void *addr, size_t length,
