@@ -50,6 +50,13 @@ if (USE_NVMEOF)
     add_executable(nvmeof_transport_test ${WORKSPACE}/nvmeof_transport_test.cpp)
     target_link_libraries(nvmeof_transport_test PUBLIC transfer_engine gtest gtest_main )
     # add_test(NAME nvmeof_transport_test COMMAND nvmeof_transport_test)
+
+    if (USE_CUDA)
+        add_executable(nvmeof_gds_transport_test ${WORKSPACE}/nvmeof_gds_transport_test.cpp)
+        target_include_directories(nvmeof_gds_transport_test PRIVATE /usr/local/cuda/include)
+        target_link_libraries(nvmeof_gds_transport_test PUBLIC transfer_engine gtest gtest_main cuda cudart)
+        # add_test(NAME nvmeof_gds_transport_test COMMAND nvmeof_gds_transport_test)
+    endif()
 endif()
 
 if (USE_TCP)
