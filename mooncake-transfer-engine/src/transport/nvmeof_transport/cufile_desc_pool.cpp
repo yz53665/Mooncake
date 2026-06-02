@@ -111,7 +111,10 @@ int CUFileDescPool::allocCUfileDesc(size_t batch_size) {
         desc->io_params.clear();
         desc->io_params.reserve(max_batch_size_);
         desc->io_events.resize(max_batch_size_);
-
+        for (size_t i = 0; i < max_batch_size_; ++i) {
+            desc->io_events[i].status = CUFILE_WAITING;
+            desc->io_events[i].ret = 0;
+        }
         descs_[idx] = desc;
         return idx;
     } catch (...) {
