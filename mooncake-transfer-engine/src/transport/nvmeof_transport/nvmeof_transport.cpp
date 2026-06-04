@@ -104,10 +104,93 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return Status::OK();
 }
 
-// Dummy implement for solving build issues, WIP
 Status NVMeoFTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
-    /* TBD */
+    if (task_list.empty()) {
+        return Status::OK();
+    }
+
+    auto &batch_desc = toBatchDesc(task_list[0]->batch_id);
+    auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
+    size_t slice_id = desc_pool_->getSliceNum(nvmeof_desc.desc_idx_);
+
+    std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
+        segment_desc_map;
+
+    for (size_t index = 0; index < task_list.size(); ++index) {
+        assert(task_list[index]);
+        auto &task = *task_list[index];
+        assert(task.request);
+        auto &request = *task.request;
+        auto target_id = request.target_id;
+
+        if (!segment_desc_map.count(target_id)) {
+            segment_desc_map[target_id] =
+                metadata_->getSegmentDescByID(target_id);
+            if (!segment_desc_map[target_id]) {
+                LOG(ERROR) << "NVMeoFTransport: Cannot find segment desc for "
+                              "target_id="
+                           << target_id;
+                return Status::InvalidArgument(
+                    "NVMeoFTransport: Cannot find segment desc for target_id: "
+                    + std::to_string(target_id));
+            }
+        }
+
+        auto &desc = segment_desc_map.at(target_id);
+        if (desc->protocol != "nvmeof") {
+            LOG(ERROR) << "NVMeoFTransport: Segment protocol mismatch, "
+                          "expected nvmeof, got "
+                       << desc->protocol;
+            return Status::InvalidArgument(
+                "NVMeoFTransport: Segment protocol mismatch");
+        }
+
+        uint32_t buffer_id = 0;
+        uint64_t segment_start = request.target_offset;
+        uint64_t segment_end = request.target_offset + request.length;
+        uint64_t current_offset = 0;
+        for (auto &buffer_desc : desc->nvmeof_buffers) {
+            bool is_overlap = overlap(
+                (void *)segment_start, request.length, (void *)current_offset,
+                buffer_desc.length);
+            if (is_overlap) {
+                uint64_t slice_start = std::max(segment_start, current_offset);
+                uint64_t slice_end =
+                    std::min(segment_end, current_offset + buffer_desc.length);
+                const char *file_path =
+                    buffer_desc.local_path_map[local_server_name_].c_str();
+                void *source_addr =
+                    (char *)request.source + slice_start - segment_start;
+                uint64_t file_offset = slice_start - current_offset;
+                uint64_t slice_len = slice_end - slice_start;
+                addSliceToTask(source_addr, slice_len, file_offset,
+                               request.opcode, task, file_path);
+                auto buf_key = std::make_pair(target_id, buffer_id);
+                CUfileHandle_t fh;
+                {
+                    RWSpinlock::WriteGuard guard(context_lock_);
+                    if (!segment_to_context_.count(buf_key)) {
+                        segment_to_context_[buf_key] =
+                            std::make_shared<CuFileContext>(file_path);
+                    }
+                    fh = segment_to_context_.at(buf_key)->getHandle();
+                }
+                addSliceToCUFileBatch(source_addr, file_offset, slice_len,
+                                      nvmeof_desc.desc_idx_, request.opcode,
+                                      fh);
+            }
+            ++buffer_id;
+            current_offset += buffer_desc.length;
+        }
+
+        nvmeof_desc.transfer_status.push_back(
+            TransferStatus{.s = PENDING, .transferred_bytes = 0});
+        nvmeof_desc.task_to_slices.push_back({slice_id, task.slice_count});
+        slice_id += task.slice_count;
+    }
+
+    desc_pool_->submitBatch(nvmeof_desc.desc_idx_);
     return Status::OK();
 }
 
