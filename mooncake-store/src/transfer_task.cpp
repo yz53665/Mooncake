@@ -1133,7 +1133,33 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     std::vector<TransferRequest>& requests) {
     // Allocate batch ID
     const size_t batch_size = requests.size();
-    BatchID batch_id = engine_.allocateBatchID(batch_size);
+    BatchID batch_id = INVALID_BATCH_ID;
+
+    // Check if the target segment uses nvmeof protocol
+    if (!requests.empty()) {
+        Transport::SegmentID target_id = requests[0].target_id;
+        auto metadata = engine_.getMetadata();
+        if (metadata) {
+            auto segment_desc = metadata->getSegmentDescByID(target_id);
+            if (segment_desc && segment_desc->protocol == "nvmeof") {
+                // Use NVMeoFTranport::allocateBatchID for nvmeof protocol
+                Transport* transport = engine_.getTransport("nvmeof");
+                if (!transport) {
+                    LOG(ERROR) << "NVMeoF transport not installed";
+                    return std::nullopt;
+                }
+                batch_id = transport->allocateBatchID(batch_size);
+                if (batch_id == INVALID_BATCH_ID) {
+                    LOG(ERROR) << "Failed to allocate NVMeoF batch ID";
+                    return std::nullopt;
+                }
+            }
+        }
+
+    if (batch_id == INVALID_BATCH_ID) {
+        batch_id = engine_.allocateBatchID(batch_size);
+    }
+
     if (batch_id == INVALID_BATCH_ID) {
         LOG(ERROR) << "Failed to allocate batch ID";
         return std::nullopt;
