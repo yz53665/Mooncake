@@ -1155,6 +1155,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
                 }
             }
         }
+    }
 
     if (batch_id == INVALID_BATCH_ID) {
         batch_id = engine_.allocateBatchID(batch_size);
