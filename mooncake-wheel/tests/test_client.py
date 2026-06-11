@@ -2,10 +2,10 @@ import os
 import sys
 
 sys.path.insert(0, "/home/sxx/code/mycode/Mooncake/mooncake-wheel")
-from mooncake_store import MooncakeDistributedStore # type: ignore
+from mooncake.store import MooncakeDistributedStore # type: ignore
 
-os.environ['MC_STORE_CLTENT_MIN_PORT'] = "14236"
-os.environ['MC_STORE_CLTENT_MAX_PORT'] = "14236"
+os.environ['MC_STORE_CLIENT_MIN_PORT'] = "14236"
+os.environ['MC_STORE_CLIENT_MAX_PORT'] = "14236"
 os.environ['MC_TE_ENDPOINT'] = "51.62.5.33:14236"
 
 store = MooncakeDistributedStore()

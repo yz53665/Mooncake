@@ -2601,19 +2601,22 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
         return tl::unexpected(err);
     }
 
-    int rc = transfer_engine_->unregisterLocalMemory(
-        reinterpret_cast<void*>(it->second.base));
-    if (rc != 0) {
-        LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
-                      "engine ret is "
-                   << rc;
-        if (rc != ERR_ADDRESS_NOT_REGISTERED) {
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    // Skip unregisterLocalMemory for nvmeof protocol
+    if (it->second.protocol != "nvmeof") {
+        int rc = transfer_engine_->unregisterLocalMemory(
+            reinterpret_cast<void*>(it->second.base));
+        if (rc != 0) {
+            LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
+                        "engine ret is "
+                    << rc;
+            if (rc != ERR_ADDRESS_NOT_REGISTERED) {
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            // Otherwise, the segment is already unregistered from transfer
+            // engine, we can continue
         }
-        // Otherwise, the segment is already unregistered from transfer
-        // engine, we can continue
     }
-
+    
     mounted_segments_.erase(it);
     return {};
 }
