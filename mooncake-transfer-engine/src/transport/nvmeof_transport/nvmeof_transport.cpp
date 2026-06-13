@@ -29,8 +29,10 @@
 #include "common.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
+#ifndef USE_NDS
 #include "transport/nvmeof_transport/cufile_context.h"
 #include "transport/nvmeof_transport/cufile_desc_pool.h"
+#endif
 #include "transport/transport.h"
 
 #ifdef USE_NDS
@@ -39,8 +41,6 @@
 
 namespace mooncake {
 NVMeoFTransport::NVMeoFTransport() {
-    CUFILE_CHECK(cuFileDriverOpen());
-    desc_pool_ = std::make_shared<CUFileDescPool>();
 #ifdef USE_NDS
     nds_thread_pool_size_ = kDefaultNdsThreadPoolSize;
     const char *nds_pool_size_env = getenv("MC_NDS_THREAD_POOL_SIZE");
@@ -67,6 +67,9 @@ NVMeoFTransport::NVMeoFTransport() {
                       << nds_device_id_ << " from MC_NDS_DEVICE_ID";
         }
     }
+#else
+    CUFILE_CHECK(cuFileDriverOpen());
+    desc_pool_ = std::make_shared<CUFileDescPool>();
 #endif
 }
 
@@ -80,6 +83,7 @@ NVMeoFTransport::~NVMeoFTransport() {
 #endif
 }
 
+#ifndef USE_NDS
 Transport::TransferStatusEnum from_cufile_transfer_status(
     CUfileStatus_t status) {
     switch (status) {
@@ -101,14 +105,19 @@ Transport::TransferStatusEnum from_cufile_transfer_status(
             return Transport::FAILED;
     }
 }
+#endif
 
 NVMeoFTransport::BatchID NVMeoFTransport::allocateBatchID(size_t batch_size) {
     auto nvmeof_desc = new NVMeoFBatchDesc();
     auto batch_id = Transport::allocateBatchID(batch_size);
     auto &batch_desc = *((BatchDesc *)(batch_id));
+#ifdef USE_NDS
+    nvmeof_desc->desc_idx_ = -1;
+#else
     nvmeof_desc->desc_idx_ = desc_pool_->allocCUfileDesc(batch_size);
     nvmeof_desc->transfer_status.reserve(batch_size);
     nvmeof_desc->task_to_slices.reserve(batch_size);
+#endif
     batch_desc.context = nvmeof_desc;
     return batch_id;
 }
@@ -117,26 +126,24 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                                           TransferStatus &status) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     auto &task = batch_desc.task_list[task_id];
-    auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
 
 #ifdef USE_NDS
-    if (nvmeof_desc.use_nds) {
-        status.transferred_bytes = task.transferred_bytes;
-        uint64_t success_slice_count = task.success_slice_count;
-        uint64_t failed_slice_count = task.failed_slice_count;
-        if (success_slice_count + failed_slice_count == task.slice_count) {
-            if (failed_slice_count) {
-                status.s = TransferStatusEnum::FAILED;
-            } else {
-                status.s = TransferStatusEnum::COMPLETED;
-            }
-            task.is_finished = true;
+    status.transferred_bytes = task.transferred_bytes;
+    uint64_t success_slice_count = task.success_slice_count;
+    uint64_t failed_slice_count = task.failed_slice_count;
+    if (success_slice_count + failed_slice_count == task.slice_count) {
+        if (failed_slice_count) {
+            status.s = TransferStatusEnum::FAILED;
         } else {
-            status.s = TransferStatusEnum::WAITING;
+            status.s = TransferStatusEnum::COMPLETED;
         }
-        return Status::OK();
+        task.is_finished = true;
+    } else {
+        status.s = TransferStatusEnum::WAITING;
     }
-#endif
+    return Status::OK();
+#else
+    auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
 
     TransferStatus transfer_status = {.s = Transport::PENDING,
                                       .transferred_bytes = 0};
@@ -156,6 +163,7 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     }
     status = transfer_status;
     return Status::OK();
+#endif
 }
 
 Status NVMeoFTransport::submitTransferTask(
@@ -165,18 +173,14 @@ Status NVMeoFTransport::submitTransferTask(
     }
 
     auto &batch_desc = toBatchDesc(task_list[0]->batch_id);
-    auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
 
 #ifdef USE_NDS
-    nvmeof_desc.use_nds = true;
 
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
         segment_desc_map;
 
     for (size_t index = 0; index < task_list.size(); ++index) {
-        assert(task_list[index]);
         auto &task = *task_list[index];
-        assert(task.request);
         auto &request = *task.request;
         auto target_id = request.target_id;
 
@@ -248,6 +252,7 @@ Status NVMeoFTransport::submitTransferTask(
 
     return Status::OK();
 #else
+    auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
 
     size_t slice_id = desc_pool_->getSliceNum(nvmeof_desc.desc_idx_);
 
@@ -335,7 +340,6 @@ Status NVMeoFTransport::submitTransferTask(
 Status NVMeoFTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
-    auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
 
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         LOG(ERROR)
@@ -360,13 +364,17 @@ Status NVMeoFTransport::submitTransfer(
 
 Status NVMeoFTransport::freeBatchID(BatchID batch_id) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
+#ifndef USE_NDS
     auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
     int desc_idx = nvmeof_desc.desc_idx_;
+#endif
     Status rc = Transport::freeBatchID(batch_id);
     if (rc != Status::OK()) {
         return rc;
     }
+#ifndef USE_NDS
     desc_pool_->freeCUfileDesc(desc_idx);
+#endif
     return Status::OK();
 }
 
@@ -382,7 +390,6 @@ int NVMeoFTransport::registerLocalMemory(void *addr, size_t length,
                                          bool update_metadata) {
     (void)remote_accessible;
     (void)update_metadata;
-    CUFILE_CHECK(cuFileBufRegister(addr, length, 0));
 #ifdef USE_NDS
     if (nds_device_id_ >= 0) {
         if (!nds_initialized_) {
@@ -402,13 +409,14 @@ int NVMeoFTransport::registerLocalMemory(void *addr, size_t length,
         LOG(INFO) << "NVMeoFTransport: nds_buf_register success for addr="
                   << addr << " length=" << length;
     }
+#else
+    CUFILE_CHECK(cuFileBufRegister(addr, length, 0));
 #endif
     return 0;
 }
 
 int NVMeoFTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
     (void)update_metadata;
-    CUFILE_CHECK(cuFileBufDeregister(addr));
 #ifdef USE_NDS
     if (nds_initialized_ && nds_device_id_ >= 0) {
         if (nds_buf_deregister(nds_device_id_, addr) != 0) {
@@ -418,6 +426,8 @@ int NVMeoFTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
             return -1;
         }
     }
+#else
+    CUFILE_CHECK(cuFileBufDeregister(addr));
 #endif
     return 0;
 }
@@ -445,6 +455,7 @@ void NVMeoFTransport::addSliceToTask(void *source_addr, uint64_t slice_len,
     __sync_fetch_and_add(&task.slice_count, 1);
 }
 
+#ifndef USE_NDS
 void NVMeoFTransport::addSliceToCUFileBatch(
     void *source_addr, uint64_t file_offset, uint64_t slice_len,
     uint64_t desc_id, TransferRequest::OpCode op, CUfileHandle_t fh) {
@@ -460,6 +471,7 @@ void NVMeoFTransport::addSliceToCUFileBatch(
     params.fh = fh;
     desc_pool_->pushParams(desc_id, params);
 }
+#endif
 
 #ifdef USE_NDS
 void NVMeoFTransport::initializeNdsThreadPool() {

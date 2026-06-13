@@ -30,10 +30,13 @@
 #include <utility>
 #include <vector>
 
-#include "cufile_context.h"
-#include "cufile_desc_pool.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
+
+#ifndef USE_NDS
+#include "cufile_context.h"
+#include "cufile_desc_pool.h"
+#endif
 
 #ifdef USE_NDS
 #include "nds_context.h"
@@ -43,10 +46,9 @@ namespace mooncake {
 
 struct NVMeoFBatchDesc {
     int desc_idx_;
+#ifndef USE_NDS
     std::vector<TransferStatus> transfer_status;
     std::vector<std::tuple<size_t, uint64_t>> task_to_slices;
-#ifdef USE_NDS
-    bool use_nds = false;
 #endif
 };
 
@@ -72,6 +74,12 @@ class NVMeoFTransport : public Transport {
     void addSliceToTask(void *source_addr, uint64_t slice_len,
                         uint64_t target_start, TransferRequest::OpCode op,
                         TransferTask &task, const char *file_path);
+
+#ifndef USE_NDS
+    void addSliceToCUFileBatch(void *source_addr, uint64_t file_offset,
+                               uint64_t slice_len, uint64_t desc_id,
+                               TransferRequest::OpCode op, CUfileHandle_t fh);
+#endif
 
    private:
     void startTransfer(Slice *slice);
@@ -115,12 +123,9 @@ class NVMeoFTransport : public Transport {
         return 0;
     }
 
-    void addSliceToCUFileBatch(void *source_addr, uint64_t file_offset,
-                               uint64_t slice_len, uint64_t desc_id,
-                               TransferRequest::OpCode op, CUfileHandle_t fh);
-
     const char *getName() const override { return "nvmeof"; }
 
+#ifndef USE_NDS
     std::unordered_map<BatchID, int> batch_to_cufile_desc_;
     std::unordered_map<std::pair<SegmentHandle, uint64_t>,
                        std::shared_ptr<CuFileContext>, pair_hash>
@@ -129,6 +134,7 @@ class NVMeoFTransport : public Transport {
 
     std::shared_ptr<CUFileDescPool> desc_pool_;
     RWSpinlock context_lock_;
+#endif
 
 #ifdef USE_NDS
     static constexpr size_t kDefaultNdsThreadPoolSize = 8;

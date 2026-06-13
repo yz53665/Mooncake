@@ -57,6 +57,12 @@ if (USE_NVMEOF)
         target_link_libraries(nvmeof_gds_transport_test PUBLIC transfer_engine gtest gtest_main cuda cudart)
         # add_test(NAME nvmeof_gds_transport_test COMMAND nvmeof_gds_transport_test)
     endif()
+
+    if (USE_NDS)
+        add_executable(nvmeof_nds_transport_test ${WORKSPACE}/nvmeof_nds_transport_test.cpp)
+        target_link_libraries(nvmeof_nds_transport_test PUBLIC transfer_engine gtest gtest_main gflags::gflags glog::glog)
+        # add_test(NAME nvmeof_nds_transport_test COMMAND nvmeof_nds_transport_test)
+    endif()
 endif()
 
 if (USE_TCP)
