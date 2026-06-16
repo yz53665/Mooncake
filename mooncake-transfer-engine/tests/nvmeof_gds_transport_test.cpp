@@ -231,7 +231,7 @@ TEST_F(NVMeoFGDSTransportTest, GDSReadWriteTest) {
         entry.length = kDataLength;
         entry.source = (uint8_t *)(gpu_addr);
         entry.target_id = segment_id;
-        entry.target_offset = remote_base;
+        entry.target_offset = remote_base + iter * kDataLength;
         s = xport->submitTransfer(batch_id, {entry});
         ASSERT_TRUE(s.ok());
 
@@ -253,7 +253,8 @@ TEST_F(NVMeoFGDSTransportTest, GDSReadWriteTest) {
         s = xport->freeBatchID(batch_id);
         ASSERT_TRUE(s.ok());
 
-        LOG(INFO) << "Write iteration " << iter << " completed";
+        LOG(INFO) << "Write iteration " << iter << " completed at offset "
+                  << (remote_base + iter * kDataLength);
     }
 
     // Read phase
@@ -269,7 +270,7 @@ TEST_F(NVMeoFGDSTransportTest, GDSReadWriteTest) {
         entry.length = kDataLength;
         entry.source = (uint8_t *)(gpu_addr);
         entry.target_id = segment_id;
-        entry.target_offset = remote_base;
+        entry.target_offset = remote_base + iter * kDataLength;
         s = xport->submitTransfer(batch_id, {entry});
         ASSERT_TRUE(s.ok());
 
@@ -300,14 +301,17 @@ TEST_F(NVMeoFGDSTransportTest, GDSReadWriteTest) {
                        cudaMemcpyDeviceToHost);
         ASSERT_EQ(err, cudaSuccess);
 
-        // Verify all bytes are printable characters
+        // Verify all bytes are the expected characters
+        char expected_char = 'a' + (iter % 26);
         for (size_t i = 0; i < kDataLength; ++i) {
             char c = read_back_data[i];
-            ASSERT_GE(c, 'a') << "Invalid character at offset " << i;
-            ASSERT_LE(c, 'z') << "Invalid character at offset " << i;
+            ASSERT_EQ(c, expected_char) << "Mismatch at offset " << i
+                                        << ", expected: " << expected_char
+                                        << ", actual: " << c;
         }
 
-        LOG(INFO) << "Read iteration " << iter << " completed, data verified";
+        LOG(INFO) << "Read iteration " << iter << " completed, data verified (all "
+                  << expected_char << ")";
     }
 
     LOG(INFO) << "GDS read/write test completed successfully";

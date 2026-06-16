@@ -9,7 +9,11 @@ set(NVMEOF_SOURCES ${NVMEOF_BASE_SOURCES})
 
 if(USE_CUDA)
     list(APPEND NVMEOF_SOURCES ${NVMEOF_CUDA_SOURCES})
-    target_include_directories(nvmeof_transport PUBLIC "/usr/local/cuda/include")
 endif()
 
 add_library(nvmeof_transport OBJECT ${NVMEOF_SOURCES})
+
+if(USE_CUDA)
+    target_include_directories(nvmeof_transport PUBLIC "/usr/local/cuda/include")
+endif()
+

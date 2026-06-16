@@ -862,7 +862,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 // munmap cleanup
                 hugepage_segment_ptrs_.emplace_back(
                     ptr, HugepageSegmentDeleter{mapped_size});
-            } else {
+            } else if (protocol != "nvmeof"){
                 segment_ptrs_.emplace_back(ptr);
             }
             auto mount_result =
