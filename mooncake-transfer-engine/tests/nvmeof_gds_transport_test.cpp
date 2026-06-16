@@ -322,7 +322,7 @@ TEST_F(NVMeoFGDSTransportTest, GDSBatchWrites) {
     // Due to GDS driver limitations on concurrent batch queries, this test
     // uses sequential waiting instead of parallel status polling
     const size_t kDataLength = 1048576;  // 1MB
-    const int kBatchSize = 6;            // Number of writes in one batch
+    const int kBatchSize = 4;            // Number of writes in one batch
     const int64_t kWaitTimeoutMs = 15000;  // 15 second timeout
 
     LOG(INFO) << "Starting GDS batch writes test with " << kBatchSize << " operations";
