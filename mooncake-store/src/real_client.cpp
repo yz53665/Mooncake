@@ -840,6 +840,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     align_up(segment_size, get_hugepage_size_from_env());
                 ptr = allocate_buffer_mmap_memory(mapped_size,
                                                   get_hugepage_size_from_env());
+            } else if (protocol == "nvmeof") {
+                ptr = (void*)1;
             } else {
                 ptr = allocate_buffer_allocator_memory(segment_size,
                                                        this->protocol);
@@ -860,7 +862,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 // munmap cleanup
                 hugepage_segment_ptrs_.emplace_back(
                     ptr, HugepageSegmentDeleter{mapped_size});
-            } else {
+            } else if (protocol != "nvmeof"){
                 segment_ptrs_.emplace_back(ptr);
             }
             auto mount_result =
@@ -1030,9 +1032,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 
     // Validate protocol is supported
-    if (protocol != "tcp" && protocol != "rdma") {
+    if (protocol != "tcp" && protocol != "rdma" && protocol != "nvmeof") {
         LOG(ERROR) << "Invalid " << CONFIG_KEY_PROTOCOL << ": " << protocol
-                   << ", must be 'tcp' or 'rdma'";
+                   << ", must be 'tcp', 'rdma' or 'nvmeof'";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 

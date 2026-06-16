@@ -29,18 +29,61 @@
 #include "common.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
+#ifndef USE_NDS
 #include "transport/nvmeof_transport/cufile_context.h"
 #include "transport/nvmeof_transport/cufile_desc_pool.h"
+#endif
 #include "transport/transport.h"
+
+#ifdef USE_NDS
+#include "transport/nvmeof_transport/nds.h"
+#endif
 
 namespace mooncake {
 NVMeoFTransport::NVMeoFTransport() {
+#ifdef USE_NDS
+    nds_thread_pool_size_ = kDefaultNdsThreadPoolSize;
+    const char *nds_pool_size_env = getenv("MC_NDS_THREAD_POOL_SIZE");
+    if (nds_pool_size_env) {
+        auto opt = parseFromString<int32_t>(nds_pool_size_env);
+        if (opt.has_value() && opt.value() > 0 && opt.value() <= 64) {
+            nds_thread_pool_size_ = static_cast<size_t>(opt.value());
+            LOG(INFO) << "NVMeoFTransport: NDS thread pool size set to "
+                      << nds_thread_pool_size_
+                      << " from MC_NDS_THREAD_POOL_SIZE";
+        } else {
+            LOG(WARNING) << "NVMeoFTransport: Invalid MC_NDS_THREAD_POOL_SIZE "
+                         << nds_pool_size_env << ", using default "
+                         << nds_thread_pool_size_;
+        }
+    }
+
+    const char *nds_device_env = getenv("MC_NDS_DEVICE_ID");
+    if (nds_device_env) {
+        auto opt = parseFromString<int32_t>(nds_device_env);
+        if (opt.has_value() && opt.value() >= 0) {
+            nds_device_id_ = opt.value();
+            LOG(INFO) << "NVMeoFTransport: NDS device_id set to "
+                      << nds_device_id_ << " from MC_NDS_DEVICE_ID";
+        }
+    }
+#else
     CUFILE_CHECK(cuFileDriverOpen());
     desc_pool_ = std::make_shared<CUFileDescPool>();
+#endif
 }
 
-NVMeoFTransport::~NVMeoFTransport() {}
+NVMeoFTransport::~NVMeoFTransport() {
+#ifdef USE_NDS
+    stopNdsThreadPool();
+    if (nds_initialized_ && nds_device_id_ >= 0) {
+        nds_deinit(nds_device_id_);
+        nds_initialized_ = false;
+    }
+#endif
+}
 
+#ifndef USE_NDS
 Transport::TransferStatusEnum from_cufile_transfer_status(
     CUfileStatus_t status) {
     switch (status) {
@@ -62,14 +105,19 @@ Transport::TransferStatusEnum from_cufile_transfer_status(
             return Transport::FAILED;
     }
 }
+#endif
 
 NVMeoFTransport::BatchID NVMeoFTransport::allocateBatchID(size_t batch_size) {
     auto nvmeof_desc = new NVMeoFBatchDesc();
     auto batch_id = Transport::allocateBatchID(batch_size);
     auto &batch_desc = *((BatchDesc *)(batch_id));
+#ifdef USE_NDS
+    nvmeof_desc->desc_idx_ = -1;
+#else
     nvmeof_desc->desc_idx_ = desc_pool_->allocCUfileDesc(batch_size);
     nvmeof_desc->transfer_status.reserve(batch_size);
     nvmeof_desc->task_to_slices.reserve(batch_size);
+#endif
     batch_desc.context = nvmeof_desc;
     return batch_id;
 }
@@ -78,19 +126,32 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                                           TransferStatus &status) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     auto &task = batch_desc.task_list[task_id];
+
+#ifdef USE_NDS
+    status.transferred_bytes = task.transferred_bytes;
+    uint64_t success_slice_count = task.success_slice_count;
+    uint64_t failed_slice_count = task.failed_slice_count;
+    if (success_slice_count + failed_slice_count == task.slice_count) {
+        if (failed_slice_count) {
+            status.s = TransferStatusEnum::FAILED;
+        } else {
+            status.s = TransferStatusEnum::COMPLETED;
+        }
+        task.is_finished = true;
+    } else {
+        status.s = TransferStatusEnum::WAITING;
+    }
+    return Status::OK();
+#else
     auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
-    // LOG(DEBUG) << "get t n " << nr;
-    // 1. get task -> id map
+
     TransferStatus transfer_status = {.s = Transport::PENDING,
                                       .transferred_bytes = 0};
     auto [slice_id, slice_num] = nvmeof_desc.task_to_slices[task_id];
     for (size_t i = slice_id; i < slice_id + slice_num; ++i) {
-        // LOG(INFO) << "task " << task_id << " i " << i << " upper bound " <<
-        // slice_num;
         auto event =
-            desc_pool_->getTransferStatus(nvmeof_desc.desc_idx_, slice_id);
+            desc_pool_->getTransferStatus(nvmeof_desc.desc_idx_, i);
         transfer_status.s = from_cufile_transfer_status(event.status);
-        // TODO(FIXME): what to do if multi slices have different status?
         if (transfer_status.s == COMPLETED) {
             transfer_status.transferred_bytes += event.ret;
         } else {
@@ -102,51 +163,131 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     }
     status = transfer_status;
     return Status::OK();
+#endif
 }
 
-// Dummy implement for solving build issues, WIP
 Status NVMeoFTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
-    /* TBD */
-    return Status::OK();
-}
-
-Status NVMeoFTransport::submitTransfer(
-    BatchID batch_id, const std::vector<TransferRequest> &entries) {
-    auto &batch_desc = *((BatchDesc *)(batch_id));
-    auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
-
-    if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
-        LOG(ERROR)
-            << "NVMeoFTransport: Exceed the limitation of current batch's "
-               "capacity";
-        return Status::InvalidArgument(
-            "NVMeoFTransport: Exceed the limitation of capacity, batch id: " +
-            std::to_string(batch_id));
+    if (task_list.empty()) {
+        return Status::OK();
     }
 
-    size_t task_id = batch_desc.task_list.size();
-    size_t slice_id = desc_pool_->getSliceNum(nvmeof_desc.desc_idx_);
-    batch_desc.task_list.resize(task_id + entries.size());
+    auto &batch_desc = toBatchDesc(task_list[0]->batch_id);
+
+#ifdef USE_NDS
+
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
         segment_desc_map;
-    // segment_desc_map[LOCAL_SEGMENT_ID] =
-    // getSegmentDescByID(LOCAL_SEGMENT_ID);
-    for (auto &request : entries) {
-        TransferTask &task = batch_desc.task_list[task_id];
+
+    for (size_t index = 0; index < task_list.size(); ++index) {
+        auto &task = *task_list[index];
+        auto &request = *task.request;
         auto target_id = request.target_id;
 
         if (!segment_desc_map.count(target_id)) {
             segment_desc_map[target_id] =
                 metadata_->getSegmentDescByID(target_id);
-            assert(segment_desc_map[target_id] != nullptr);
+            if (!segment_desc_map[target_id]) {
+                LOG(ERROR)
+                    << "NVMeoFTransport: Cannot find segment desc for "
+                       "target_id="
+                    << target_id;
+                return Status::InvalidArgument(
+                    "NVMeoFTransport: Cannot find segment desc for "
+                    "target_id: " +
+                    std::to_string(target_id));
+            }
         }
 
         auto &desc = segment_desc_map.at(target_id);
-        // LOG(INFO) << "desc " << desc->name << " " << desc->protocol;
-        assert(desc->protocol == "nvmeof");
-        // TODO: solving iterator invalidation due to vector resize
-        // Handle File Offset
+        if (desc->protocol != "nvmeof") {
+            LOG(ERROR) << "NVMeoFTransport: Segment protocol mismatch, "
+                          "expected nvmeof, got "
+                       << desc->protocol;
+            return Status::InvalidArgument(
+                "NVMeoFTransport: Segment protocol mismatch");
+        }
+
+        uint32_t buffer_id = 0;
+        uint64_t segment_start = request.target_offset;
+        uint64_t segment_end = request.target_offset + request.length;
+        uint64_t current_offset = 0;
+        for (auto &buffer_desc : desc->nvmeof_buffers) {
+            bool is_overlap = overlap(
+                (void *)segment_start, request.length,
+                (void *)current_offset, buffer_desc.length);
+            if (is_overlap) {
+                uint64_t slice_start =
+                    std::max(segment_start, current_offset);
+                uint64_t slice_end =
+                    std::min(segment_end,
+                             current_offset + buffer_desc.length);
+                const char *file_path =
+                    buffer_desc.local_path_map[local_server_name_].c_str();
+                void *source_addr =
+                    (char *)request.source + slice_start - segment_start;
+                uint64_t file_offset = slice_start - current_offset;
+                uint64_t slice_len = slice_end - slice_start;
+
+                addSliceToTask(source_addr, slice_len, file_offset,
+                               request.opcode, task, file_path);
+
+                auto buf_key = std::make_pair(target_id, buffer_id);
+                {
+                    RWSpinlock::WriteGuard guard(nds_context_lock_);
+                    if (!nds_segment_to_context_.count(buf_key)) {
+                        nds_segment_to_context_[buf_key] =
+                            std::make_shared<NdsFileContext>(
+                                file_path, nds_device_id_);
+                    }
+                }
+
+                Slice *slice = task.slice_list.back();
+                submitNdsSlice(slice);
+            }
+            ++buffer_id;
+            current_offset += buffer_desc.length;
+        }
+    }
+
+    return Status::OK();
+#else
+    auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
+
+    size_t slice_id = desc_pool_->getSliceNum(nvmeof_desc.desc_idx_);
+
+    std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
+        segment_desc_map;
+
+    for (size_t index = 0; index < task_list.size(); ++index) {
+        assert(task_list[index]);
+        auto &task = *task_list[index];
+        assert(task.request);
+        auto &request = *task.request;
+        auto target_id = request.target_id;
+
+        if (!segment_desc_map.count(target_id)) {
+            segment_desc_map[target_id] =
+                metadata_->getSegmentDescByID(target_id);
+            if (!segment_desc_map[target_id]) {
+                LOG(ERROR) << "NVMeoFTransport: Cannot find segment desc for "
+                              "target_id="
+                           << target_id;
+                return Status::InvalidArgument(
+                    "NVMeoFTransport: Cannot find segment desc for target_id: "
+                    + std::to_string(target_id));
+            }
+        }
+
+        auto &desc = segment_desc_map.at(target_id);
+        if (desc->protocol != "nvmeof") {
+            LOG(ERROR) << "NVMeoFTransport: Segment protocol mismatch, "
+                          "expected nvmeof, got "
+                       << desc->protocol;
+            return Status::InvalidArgument(
+                "NVMeoFTransport: Segment protocol mismatch");
+        }
+
         uint32_t buffer_id = 0;
         uint64_t segment_start = request.target_offset;
         uint64_t segment_end = request.target_offset + request.length;
@@ -154,15 +295,11 @@ Status NVMeoFTransport::submitTransfer(
         for (auto &buffer_desc : desc->nvmeof_buffers) {
             bool is_overlap = overlap(
                 (void *)segment_start, request.length, (void *)current_offset,
-                buffer_desc
-                    .length);  // this buffer intersects with user's target
+                buffer_desc.length);
             if (is_overlap) {
-                // 1. get_slice_start
                 uint64_t slice_start = std::max(segment_start, current_offset);
-                // 2. slice_end
                 uint64_t slice_end =
                     std::min(segment_end, current_offset + buffer_desc.length);
-                // 3. init slice and put into TransferTask
                 const char *file_path =
                     buffer_desc.local_path_map[local_server_name_].c_str();
                 void *source_addr =
@@ -171,11 +308,9 @@ Status NVMeoFTransport::submitTransfer(
                 uint64_t slice_len = slice_end - slice_start;
                 addSliceToTask(source_addr, slice_len, file_offset,
                                request.opcode, task, file_path);
-                // 4. get cufile handle
                 auto buf_key = std::make_pair(target_id, buffer_id);
                 CUfileHandle_t fh;
                 {
-                    // TODO: upgrade
                     RWSpinlock::WriteGuard guard(context_lock_);
                     if (!segment_to_context_.count(buf_key)) {
                         segment_to_context_[buf_key] =
@@ -183,7 +318,6 @@ Status NVMeoFTransport::submitTransfer(
                     }
                     fh = segment_to_context_.at(buf_key)->getHandle();
                 }
-                // 5. add cufile request
                 addSliceToCUFileBatch(source_addr, file_offset, slice_len,
                                       nvmeof_desc.desc_idx_, request.opcode,
                                       fh);
@@ -195,24 +329,52 @@ Status NVMeoFTransport::submitTransfer(
         nvmeof_desc.transfer_status.push_back(
             TransferStatus{.s = PENDING, .transferred_bytes = 0});
         nvmeof_desc.task_to_slices.push_back({slice_id, task.slice_count});
-        ++task_id;
         slice_id += task.slice_count;
     }
 
     desc_pool_->submitBatch(nvmeof_desc.desc_idx_);
-    // LOG(INFO) << "submit nr " << slice_id << " start " << start_slice_id;
     return Status::OK();
+#endif
+}
+
+Status NVMeoFTransport::submitTransfer(
+    BatchID batch_id, const std::vector<TransferRequest> &entries) {
+    auto &batch_desc = *((BatchDesc *)(batch_id));
+
+    if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
+        LOG(ERROR)
+            << "NVMeoFTransport: Exceed the limitation of current batch's "
+               "capacity";
+        return Status::InvalidArgument(
+            "NVMeoFTransport: Exceed the limitation of capacity, batch id: " +
+            std::to_string(batch_id));
+    }
+
+    size_t task_id = batch_desc.task_list.size();
+    batch_desc.task_list.resize(task_id + entries.size());
+    std::vector<TransferTask *> task_list;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        auto &task = batch_desc.task_list[task_id + i];
+        task.request = &entries[i];
+        task.batch_id = batch_id;
+        task_list.push_back(&task);
+    }
+    return submitTransferTask(task_list);
 }
 
 Status NVMeoFTransport::freeBatchID(BatchID batch_id) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
+#ifndef USE_NDS
     auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
     int desc_idx = nvmeof_desc.desc_idx_;
+#endif
     Status rc = Transport::freeBatchID(batch_id);
     if (rc != Status::OK()) {
         return rc;
     }
+#ifndef USE_NDS
     desc_pool_->freeCUfileDesc(desc_idx);
+#endif
     return Status::OK();
 }
 
@@ -228,13 +390,45 @@ int NVMeoFTransport::registerLocalMemory(void *addr, size_t length,
                                          bool update_metadata) {
     (void)remote_accessible;
     (void)update_metadata;
+#ifdef USE_NDS
+    if (nds_device_id_ >= 0) {
+        if (!nds_initialized_) {
+            if (nds_init(nds_device_id_) != 0) {
+                LOG(ERROR) << "NVMeoFTransport: nds_init failed for device_id="
+                           << nds_device_id_;
+                return -1;
+            }
+            nds_initialized_ = true;
+            initializeNdsThreadPool();
+        }
+        if (nds_buf_register(nds_device_id_, addr, length) != 0) {
+            LOG(ERROR) << "NVMeoFTransport: nds_buf_register failed for addr="
+                       << addr << " length=" << length;
+            return -1;
+        }
+        LOG(INFO) << "NVMeoFTransport: nds_buf_register success for addr="
+                  << addr << " length=" << length;
+    }
+#else
     CUFILE_CHECK(cuFileBufRegister(addr, length, 0));
+#endif
     return 0;
 }
 
 int NVMeoFTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
     (void)update_metadata;
+#ifdef USE_NDS
+    if (nds_initialized_ && nds_device_id_ >= 0) {
+        if (nds_buf_deregister(nds_device_id_, addr) != 0) {
+            LOG(ERROR)
+                << "NVMeoFTransport: nds_buf_deregister failed for addr="
+                << addr;
+            return -1;
+        }
+    }
+#else
     CUFILE_CHECK(cuFileBufDeregister(addr));
+#endif
     return 0;
 }
 
@@ -261,6 +455,7 @@ void NVMeoFTransport::addSliceToTask(void *source_addr, uint64_t slice_len,
     __sync_fetch_and_add(&task.slice_count, 1);
 }
 
+#ifndef USE_NDS
 void NVMeoFTransport::addSliceToCUFileBatch(
     void *source_addr, uint64_t file_offset, uint64_t slice_len,
     uint64_t desc_id, TransferRequest::OpCode op, CUfileHandle_t fh) {
@@ -274,8 +469,126 @@ void NVMeoFTransport::addSliceToCUFileBatch(
     params.u.batch.file_offset = file_offset;
     params.u.batch.size = slice_len;
     params.fh = fh;
-    // LOG(INFO) << "params " << "base " << request.source << " offset " <<
-    // request.target_offset << " length " << request.length;
     desc_pool_->pushParams(desc_id, params);
 }
+#endif
+
+#ifdef USE_NDS
+void NVMeoFTransport::initializeNdsThreadPool() {
+    nds_running_ = true;
+    nds_workers_.reserve(nds_thread_pool_size_);
+    for (size_t i = 0; i < nds_thread_pool_size_; ++i) {
+        nds_workers_.emplace_back(&NVMeoFTransport::ndsWorkerThread, this);
+    }
+    LOG(INFO) << "NVMeoFTransport: NDS thread pool initialized with "
+              << nds_thread_pool_size_ << " threads";
+}
+
+void NVMeoFTransport::stopNdsThreadPool() {
+    bool expected = true;
+    if (!nds_running_.compare_exchange_strong(expected, false)) {
+        return;
+    }
+    nds_queue_cv_.notify_all();
+    for (auto &worker : nds_workers_) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+    nds_workers_.clear();
+    while (!nds_task_queue_.empty()) {
+        nds_task_queue_.pop();
+    }
+    LOG(INFO) << "NVMeoFTransport: NDS thread pool stopped";
+}
+
+void NVMeoFTransport::ndsWorkerThread() {
+    while (nds_running_) {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lock(nds_queue_mutex_);
+            nds_queue_cv_.wait(
+                lock, [this] { return !nds_running_ || !nds_task_queue_.empty(); });
+
+            if (!nds_running_ && nds_task_queue_.empty()) {
+                return;
+            }
+
+            if (!nds_task_queue_.empty()) {
+                task = std::move(nds_task_queue_.front());
+                nds_task_queue_.pop();
+            }
+        }
+
+        if (task) {
+            try {
+                task();
+            } catch (...) {
+                LOG(ERROR) << "NVMeoFTransport: NDS worker thread caught "
+                              "unknown exception";
+            }
+        }
+    }
+}
+
+void NVMeoFTransport::submitNdsSlice(Slice *slice) {
+    auto source_addr = slice->source_addr;
+    auto slice_len = slice->length;
+    auto file_offset = slice->nvmeof.start;
+    auto op = slice->opcode;
+    auto target_id = slice->task->request->target_id;
+
+    {
+        std::unique_lock<std::mutex> lock(nds_queue_mutex_);
+        if (!nds_running_) {
+            slice->markFailed();
+            return;
+        }
+        nds_task_queue_.emplace(
+            [slice, source_addr, slice_len, file_offset, op, target_id,
+             device_id = nds_device_id_, this]() {
+                nds_Handle nds_handle = nullptr;
+                {
+                    RWSpinlock::ReadGuard guard(nds_context_lock_);
+                    for (auto &[buf_key, ctx] : nds_segment_to_context_) {
+                        if (buf_key.first == target_id) {
+                            nds_handle = ctx->getHandle();
+                            break;
+                        }
+                    }
+                }
+
+                if (!nds_handle) {
+                    LOG(ERROR) << "NDS: No nds_handle found for target_id="
+                               << target_id;
+                    slice->markFailed();
+                    return;
+                }
+
+                ssize_t result = -1;
+                if (op == Transport::TransferRequest::READ) {
+                    result = nds_read(nds_handle, device_id, source_addr,
+                                      slice_len, file_offset);
+                } else {
+                    result = nds_write(nds_handle, source_addr, slice_len,
+                                       file_offset);
+                }
+
+                if (result < 0) {
+                    LOG(ERROR) << "NDS: "
+                               << (op == Transport::TransferRequest::READ
+                                       ? "nds_read"
+                                       : "nds_write")
+                               << " failed for offset=" << file_offset
+                               << " len=" << slice_len;
+                    slice->markFailed();
+                } else {
+                    slice->markSuccess();
+                }
+            });
+    }
+    nds_queue_cv_.notify_one();
+}
+#endif
+
 }  // namespace mooncake

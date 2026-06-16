@@ -803,6 +803,22 @@ ErrorCode Client::InitTransferEngine(
                               "devices";
                 return ErrorCode::INTERNAL_ERROR;
             }
+        } else if (protocol == "nvmeof") {
+            if (device_names.has_value()) {
+                LOG(WARNING)
+                    << "NVMeoF protocol does not use device names, ignoring";
+            }
+            try {
+                transport = transfer_engine_->installTransport("nvmeof", nullptr);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "nvmeof_transport_install_failed error_message=\""
+                           << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            if (!transport) {
+                LOG(ERROR) << "Failed to install NVMeoF transport";
+                return ErrorCode::INTERNAL_ERROR;
+            }
         } else {
             LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
             return ErrorCode::INVALID_PARAMS;
@@ -2585,19 +2601,22 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
         return tl::unexpected(err);
     }
 
-    int rc = transfer_engine_->unregisterLocalMemory(
-        reinterpret_cast<void*>(it->second.base));
-    if (rc != 0) {
-        LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
-                      "engine ret is "
-                   << rc;
-        if (rc != ERR_ADDRESS_NOT_REGISTERED) {
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    // Skip unregisterLocalMemory for nvmeof protocol
+    if (it->second.protocol != "nvmeof") {
+        int rc = transfer_engine_->unregisterLocalMemory(
+            reinterpret_cast<void*>(it->second.base));
+        if (rc != 0) {
+            LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
+                        "engine ret is "
+                    << rc;
+            if (rc != ERR_ADDRESS_NOT_REGISTERED) {
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            // Otherwise, the segment is already unregistered from transfer
+            // engine, we can continue
         }
-        // Otherwise, the segment is already unregistered from transfer
-        // engine, we can continue
     }
-
+    
     mounted_segments_.erase(it);
     return {};
 }
@@ -2650,12 +2669,16 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             }
         }
 
-        int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
+        int rc = 0;
+        // Skip register local memory if protocol is nvmeof
+        if (protocol != "nvmeof") {
+            rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
                                                        location, true, true);
-        if (rc != 0) {
-            LOG(ERROR) << "register_local_memory_failed base=" << buffer
-                       << " size=" << size << ", error=" << rc;
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            if (rc != 0) {
+                LOG(ERROR) << "register_local_memory_failed base=" << buffer
+                           << " size=" << size << ", error=" << rc;
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
         }
 
         Segment segment;
