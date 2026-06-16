@@ -29,7 +29,7 @@ if __name__ == "__main__":
     os.environ.pop("http_proxy", None)
     os.environ.pop("https_proxy", None)
     etcd_host = sys.argv[1]
-    segment_name = "mooncake/ram/" + sys.argv[2]
+    segment_name = "mooncake/nvmeof/" + sys.argv[2]
     files = sys.argv[3:]
     local_server_name = socket.gethostname()
 
@@ -45,7 +45,7 @@ if __name__ == "__main__":
       buffer['length'] = os.path.getsize(file)
       buffer['file_path'] = file
       local_path_map = {}
-      local_path_map[sys.argv[2]] = file
+      local_path_map[server_name] = file
       buffer['local_path_map'] = local_path_map
       value['buffers'].append(buffer)
     
