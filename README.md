@@ -151,6 +151,7 @@ Mooncake supports heterogeneous accelerators, NICs, and specialized transport pa
 | Barex transport | Supported | Enabled by `-DUSE_BAREX=ON`; documented as the `barex` advanced transport |
 | Sunrise Transport | Supported | Included here as an additional specialized transport path to reflect current hardware support positioning |
 | T-Head PPU / Barex | Supported | Barex-based transport coverage is available for T-Head PPU deployments |
+| NDS (NPU Direct Storage) | Supported | Enabled by `-DUSE_NDS=ON` (requires `-DUSE_NVMEOF=ON`); NVMe-oF transport path for Huawei Ascend NPU HBM direct storage I/O |
 
 <h2 id="show-cases">🔥 Show Cases</h2>
 
