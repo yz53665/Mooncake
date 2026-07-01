@@ -17,3 +17,16 @@ if(USE_CUDA)
     target_include_directories(nvmeof_transport PUBLIC "/usr/local/cuda/include")
 endif()
 
+# NDS (NPU Data Service) support
+if(USE_NDS)
+    # Link to actual libnds.so from CCDK output
+    find_library(NDS_LIB nds HINTS "/home/ssu/code/CCDK/output" NO_DEFAULT_PATH)
+    if(NDS_LIB)
+        message(STATUS "Found NDS library: ${NDS_LIB}")
+        target_link_libraries(nvmeof_transport PUBLIC ${NDS_LIB} ascendcl)
+    else()
+        message(WARNING "NDS library not found at /home/ssu/code/CCDK/output/libnds.so. NDS support will be limited.")
+    endif()
+endif()
+
+
