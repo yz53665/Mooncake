@@ -24,22 +24,16 @@ extern "C" {
  */
 typedef struct nds_file_ctx_t* nds_Handle;
 
-/* 假句柄结构体 */
-typedef struct nds_file_ctx_t {
-    int fd;
-    int dummy;
-} nds_file_ctx_t;
-
 /**
  * @brief nds read/write 输入参数
  */
 typedef struct {
-    nds_Handle nds_handle;  // nds 句柄
-    void* buf;              // HBM内存数据缓冲区
-    size_t nbyte;           // 期望读取长度
-    off_t offset;           // 待读取的文件偏移
-    ssize_t result_len;     // 返回结果，实际读取长度
-} read_parameter;
+    nds_Handle nds_handle;    // nds 句柄
+    int32_t device_id;        // HBM buf 注册时使用的deivce_id
+    void* buf;                // HBM内存数据缓冲区
+    size_t nbyte;             // 期望读写长度
+    off_t offset;             // nds_handle 中的文件/块设备偏移
+} nds_io_parameter;
 
 /**
  * @brief Initialize NDS user-space library
@@ -50,7 +44,7 @@ typedef struct {
  * @warning This function must be called before any other NDS interfaces.
  * @see nds_deinit
  */
-static inline int nds_init(int32_t device_id) { return 0; }
+int nds_init(int32_t device_id);
 
 /**
  * @brief Release NDS user-space library resources
@@ -60,7 +54,7 @@ static inline int nds_init(int32_t device_id) { return 0; }
  * @warning Must be called after all buffers are deregistered, otherwise resource leaks may occur.
  * @see nds_init
  */
-static inline void nds_deinit(int32_t device_id) {}
+void nds_deinit(int32_t device_id);
 
 /**
  * @brief Register HBM memory buffer
@@ -74,7 +68,7 @@ static inline void nds_deinit(int32_t device_id) {}
  * @warning The same buffer cannot be registered multiple times. Memory must not be freed before deregistration.
  * @see nds_buf_deregister
  */
-static inline int nds_buf_register(int32_t device_id, void *buf, size_t len) { return 0; }
+int nds_buf_register(int32_t device_id, void *buf, size_t len);
 
 /**
  * @brief Deregister HBM memory buffer
@@ -87,30 +81,23 @@ static inline int nds_buf_register(int32_t device_id, void *buf, size_t len) { r
  * @warning After deregistration, the buffer should not be used for RDMA operations.
  * @see nds_buf_register
  */
-static inline int nds_buf_deregister(int32_t device_id, void *buf) { return 0; }
+int nds_buf_deregister(int32_t device_id, void *buf);
 
 /**
  * @brief 注册文件信息
  * @param fd 文件fd
  * @return nds_handle NDS句柄
  */
-static inline nds_Handle nds_file_register(int fd) {
-    static nds_file_ctx_t dummy_handle = {0};
-    dummy_handle.fd = fd;
-    dummy_handle.dummy = 1;
-    return &dummy_handle;
-}
+nds_Handle nds_file_register(int fd);
 
 /**
  * @brief 取消文件注册，并释放文件fd对应NDS句柄nds_handle资源
  * @param fd 文件fd
  * @return 0 on success, -1 on failure
  */
-static inline int nds_file_deregister(int fd) { return 0; }
+int nds_file_deregister(int fd);
 
-static inline ssize_t nds_read(nds_Handle nds_handle, int32_t device_id, void *buf, size_t nbyte, off_t offset) {
-    return (ssize_t)nbyte;
-}
+ssize_t nds_read(nds_Handle nds_handle, int32_t device_id, void *buf, size_t nbyte, off_t offset);
 
 /*
  * @brief Write data from NPU device memory to a file or block device
@@ -129,13 +116,11 @@ static inline ssize_t nds_read(nds_Handle nds_handle, int32_t device_id, void *b
  *          Use nds_buf_register() to register the buffer first.
  * @see nds_buf_register, nds_buf_deregister
  */
-static inline ssize_t nds_write(nds_Handle handle, void *buf, size_t nbyte, off_t offset) {
-    return (ssize_t)nbyte;
-}
+ssize_t nds_write(nds_Handle nds_handle, int32_t device_id, void *buf, size_t nbyte, off_t offset);
 
 
 #ifdef __cplusplus
 }
 #endif
- 
+
 #endif /* NDS_H */
