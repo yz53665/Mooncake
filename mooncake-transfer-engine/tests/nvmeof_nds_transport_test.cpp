@@ -16,6 +16,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <cstdlib>
 #include <fstream>
@@ -251,6 +252,18 @@ TEST_F(NVMeoFNdsTransportTest, SingleRead) {
     // Read from NVMe to NPU via NDS
     batch_id = xport->allocateBatchID(1);
     void *npu_read_addr = (uint8_t *)npu_addr + kDataLength;
+
+    // Print address information
+    LOG(INFO) << "=== SingleRead Address Information ===";
+    LOG(INFO) << "Original npu_addr:           " << npu_addr << " (0x" << std::hex << npu_addr << std::dec << ")";
+    LOG(INFO) << "Calculated npu_read_addr:     " << npu_read_addr << " (0x" << std::hex << npu_read_addr << std::dec << ")";
+    LOG(INFO) << "Data length (kDataLength):   " << kDataLength << " bytes (0x" << std::hex << kDataLength << std::dec << ")";
+    LOG(INFO) << "Offset from npu_addr:        " << kDataLength << " bytes";
+
+    LOG(INFO) << "Allocated NPU memory region: " << npu_addr << " (size: " << ram_buffer_size << " bytes)";
+    LOG(INFO) << "Write data location:         " << npu_addr << " (first " << kDataLength << " bytes)";
+    LOG(INFO) << "Read data location:          " << npu_read_addr << " (next " << kDataLength << " bytes)";
+
     TransferRequest read_entry;
     read_entry.opcode = TransferRequest::READ;
     read_entry.length = kDataLength;
@@ -271,13 +284,86 @@ TEST_F(NVMeoFNdsTransportTest, SingleRead) {
 
     // Copy read data back to host for verification
     std::vector<uint8_t> read_back_data(kDataLength);
-    ASSERT_EQ(copyFromNpu(read_back_data.data(), npu_read_addr, kDataLength), 0);
 
-    // 注释：由于 NDS 实现还未有真实语义，暂时注释掉数据校验
-    // int ret = memcmp(host_data.data(), read_back_data.data(), kDataLength);
-    // EXPECT_EQ(ret, 0);
-    LOG(INFO) << "SingleRead test completed (data verification skipped)";
+    // Print host buffer address for verification
+    LOG(INFO) << "=== CopyFromNpu Operation ===";
+    LOG(INFO) << "Destination (host_buffer):      " << static_cast<void*>(read_back_data.data());
+    LOG(INFO) << "Source (npu_read_addr):         " << npu_read_addr << " (0x" << std::hex << npu_read_addr << std::dec << ")";
+    LOG(INFO) << "Copy size:                      " << kDataLength << " bytes";
+    LOG(INFO) << "Copy direction:                 NPU -> Host (DEVICE_TO_HOST)";
+
+    ASSERT_EQ(copyFromNpu(read_back_data.data(), npu_read_addr, kDataLength), 0);
+    LOG(INFO) << "CopyFromNpu completed successfully";
+
+    // Print first few bytes of original data and read back data for comparison
+    LOG(INFO) << "=== SingleRead Data Comparison ===";
+    LOG(INFO) << "Data length: " << kDataLength << " bytes";
+
+    // Print first 32 bytes
+    LOG(INFO) << "Original host_data (first 32 bytes):";
+    std::string host_str, read_str;
+    for (int i = 0; i < 32 && i < static_cast<int>(kDataLength); ++i) {
+        host_str += std::to_string(static_cast<int>(host_data[i])) + " ";
+    }
+    LOG(INFO) << host_str;
+
+    LOG(INFO) << "Read back read_back_data (first 32 bytes):";
+    for (int i = 0; i < 32 && i < static_cast<int>(kDataLength); ++i) {
+        read_str += std::to_string(static_cast<int>(read_back_data[i])) + " ";
+    }
+    LOG(INFO) << read_str;
+
+    // Find first mismatch and print context
+    size_t first_mismatch = 0;
+    bool has_mismatch = false;
+    for (size_t i = 0; i < kDataLength; ++i) {
+        if (host_data[i] != read_back_data[i]) {
+            first_mismatch = i;
+            has_mismatch = true;
+            break;
+        }
+    }
+
+    if (has_mismatch) {
+        LOG(ERROR) << "First mismatch at offset " << first_mismatch;
+
+        // Print context around mismatch (10 bytes before and after)
+        size_t start = std::max(static_cast<size_t>(0), first_mismatch - 10);
+        size_t end = std::min(kDataLength, first_mismatch + 11);
+
+        LOG(INFO) << "Context around mismatch (host_data):";
+        std::string context_str;
+        for (size_t i = start; i < end; ++i) {
+            std::string prefix = (i == first_mismatch) ? "[MISMATCH]" : "";
+            context_str += prefix + std::to_string(static_cast<int>(host_data[i])) + " ";
+        }
+        LOG(INFO) << context_str;
+
+        LOG(INFO) << "Context around mismatch (read_back_data):";
+        context_str.clear();
+        for (size_t i = start; i < end; ++i) {
+            std::string prefix = (i == first_mismatch) ? "[MISMATCH]" : "";
+            context_str += prefix + std::to_string(static_cast<int>(read_back_data[i])) + " ";
+        }
+        LOG(INFO) << context_str;
+
+        // Count total mismatches
+        int mismatch_count = 0;
+        for (size_t i = 0; i < kDataLength; ++i) {
+            if (host_data[i] != read_back_data[i]) {
+                mismatch_count++;
+            }
+        }
+        LOG(ERROR) << "Total mismatches: " << mismatch_count << " out of " << kDataLength << " bytes";
+    } else {
+        LOG(INFO) << "No mismatches found! Data matches perfectly.";
+    }
+
+    int ret = memcmp(host_data.data(), read_back_data.data(), kDataLength);
+    EXPECT_EQ(ret, 0);
+    LOG(INFO) << "SingleRead test completed (data verification completed)";
 }
+
 
 TEST_F(NVMeoFNdsTransportTest, MultiWrite) {
     const size_t kDataLength = 4096000;
@@ -378,7 +464,7 @@ TEST_F(NVMeoFNdsTransportTest, BatchWriteAndRead) {
     for (size_t i = 0; i < kBatchSize; ++i) {
         host_data[i].resize(kDataLength);
         for (size_t j = 0; j < kDataLength; ++j) {
-            host_data[i][j] = 'A' + ((i + j) % 26);
+            host_data[i][j] = 'a' + (lrand48() % 26);
         }
     }
 
@@ -444,23 +530,85 @@ TEST_F(NVMeoFNdsTransportTest, BatchWriteAndRead) {
     s = xport->freeBatchID(batch_id);
     ASSERT_EQ(s, Status::OK());
 
-    // 注释：由于 NDS 实现还未有真实语义，暂时注释掉数据校验
     // Verify data
-    // for (size_t i = 0; i < kBatchSize; ++i) {
-    //     void *npu_src = (uint8_t *)npu_addr + (kBatchSize + i) * kDataLength;
-    //     std::vector<uint8_t> read_back_data(kDataLength);
-    //     ASSERT_EQ(copyFromNpu(read_back_data.data(), npu_src, kDataLength), 0);
-    //
-    //     int ret = memcmp(host_data[i].data(), read_back_data.data(), kDataLength);
-    //     EXPECT_EQ(ret, 0);
-    // }
-    LOG(INFO) << "BatchWriteAndRead test completed (data verification skipped)";
+    for (size_t i = 0; i < kBatchSize; ++i) {
+        void *npu_src = (uint8_t *)npu_addr + (kBatchSize + i) * kDataLength;
+        std::vector<uint8_t> read_back_data(kDataLength);
+        ASSERT_EQ(copyFromNpu(read_back_data.data(), npu_src, kDataLength), 0);
+
+        LOG(INFO) << "=== BatchWriteAndRead - Batch " << i << " ===";
+        LOG(INFO) << "host_data (first 32 bytes):";
+        std::string host_str;
+        for (size_t j = 0; j < 32 && j < kDataLength; ++j) {
+            host_str += std::to_string(static_cast<int>(host_data[i][j])) + " ";
+        }
+        LOG(INFO) << host_str;
+
+        LOG(INFO) << "read_back_data (first 32 bytes):";
+        std::string read_str;
+        for (size_t j = 0; j < 32 && j < kDataLength; ++j) {
+            read_str += std::to_string(static_cast<int>(read_back_data[j])) + " ";
+        }
+        LOG(INFO) << read_str;
+
+        // Find first mismatch
+        size_t first_mismatch = kDataLength;
+        for (size_t j = 0; j < kDataLength; ++j) {
+            if (host_data[i][j] != read_back_data[j]) {
+                first_mismatch = j;
+                break;
+            }
+        }
+
+        if (first_mismatch < kDataLength) {
+            LOG(INFO) << "First mismatch at byte " << first_mismatch;
+            LOG(INFO) << "  host_data[" << first_mismatch << "] = " << static_cast<int>(host_data[i][first_mismatch]);
+            LOG(INFO) << "  read_back_data[" << first_mismatch << "] = " << static_cast<int>(read_back_data[first_mismatch]);
+
+            // Print context around mismatch
+            size_t start = std::max(static_cast<size_t>(0), first_mismatch - 10);
+            size_t end = std::min(kDataLength, first_mismatch + 11);
+
+            LOG(INFO) << "Context around mismatch (host_data):";
+            std::string context_str;
+            for (size_t j = start; j < end; ++j) {
+                std::string prefix = (j == first_mismatch) ? "[MISMATCH]" : "";
+                context_str += prefix + std::to_string(static_cast<int>(host_data[i][j])) + " ";
+            }
+            LOG(INFO) << context_str;
+
+            LOG(INFO) << "Context around mismatch (read_back_data):";
+            context_str.clear();
+            for (size_t j = start; j < end; ++j) {
+                std::string prefix = (j == first_mismatch) ? "[MISMATCH]" : "";
+                context_str += prefix + std::to_string(static_cast<int>(read_back_data[j])) + " ";
+            }
+            LOG(INFO) << context_str;
+
+            // Count total mismatches
+            int mismatch_count = 0;
+            for (size_t j = 0; j < kDataLength; ++j) {
+                if (host_data[i][j] != read_back_data[j]) {
+                    mismatch_count++;
+                }
+            }
+            LOG(ERROR) << "Total mismatches: " << mismatch_count << " out of " << kDataLength << " bytes";
+        } else {
+            LOG(INFO) << "No mismatches found! Data matches perfectly.";
+        }
+
+        int ret = memcmp(host_data[i].data(), read_back_data.data(), kDataLength);
+        EXPECT_EQ(ret, 0);
+    }
+    LOG(INFO) << "BatchWriteAndRead test completed (data verification completed)";
 }
 
 }  // namespace mooncake
 
 int main(int argc, char **argv) {
-    gflags::ParseCommandLineFlags(&argc, &argv, false);
+    // Allow gflags to ignore unrecognized flags (like gtest flags)
+    gflags::AllowCommandLineReparsing();
+    gflags::ParseCommandLineNonHelpFlags(&argc, &argv, false);
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }
