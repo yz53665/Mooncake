@@ -37,6 +37,7 @@
 
 #ifdef USE_NDS
 #include "transport/nvmeof_transport/nds.h"
+#include "acl/acl.h"
 #endif
 
 namespace mooncake {
@@ -503,6 +504,10 @@ void NVMeoFTransport::stopNdsThreadPool() {
 }
 
 void NVMeoFTransport::ndsWorkerThread() {
+    int ret = aclrtSetDevice(nds_device_id_);
+    if (ret != ACL_SUCCESS) {
+        LOG(ERROR) << "Failed to set NPU device " << nds_device_id_ << ", ret=" << ret;
+    }
     while (nds_running_) {
         std::function<void()> task;
         {
@@ -570,8 +575,8 @@ void NVMeoFTransport::submitNdsSlice(Slice *slice) {
                     result = nds_read(nds_handle, device_id, source_addr,
                                       slice_len, file_offset);
                 } else {
-                    result = nds_write(nds_handle, source_addr, slice_len,
-                                       file_offset);
+                    result = nds_write(nds_handle, device_id, source_addr,
+                                       slice_len, file_offset);
                 }
 
                 if (result < 0) {
