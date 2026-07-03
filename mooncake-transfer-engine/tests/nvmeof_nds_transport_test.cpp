@@ -455,6 +455,105 @@ TEST_F(NVMeoFNdsTransportTest, MultipleRead) {
     LOG(INFO) << "MultipleRead test completed (data verification skipped)";
 }
 
+// Test with non-zero remote_base offset
+TEST_F(NVMeoFNdsTransportTest, SingleReadWithOffset) {
+    const size_t kDataLength = 4096000;
+    const uint64_t kRemoteBaseOffset = 2;
+
+    // Prepare data on host
+    std::vector<uint8_t> host_data(kDataLength);
+    for (size_t i = 0; i < kDataLength; ++i) {
+        host_data[i] = 'a' + (lrand48() % 26);
+    }
+
+    // Copy data to NPU memory
+    ASSERT_EQ(copyToNpu(npu_addr, host_data.data(), kDataLength), 0);
+
+    // Write from NPU to NVMe via NDS with offset
+    auto batch_id = xport->allocateBatchID(1);
+    TransferRequest write_entry;
+    write_entry.opcode = TransferRequest::WRITE;
+    write_entry.length = kDataLength;
+    write_entry.source = (uint8_t *)(npu_addr);
+    write_entry.target_id = segment_id;
+    write_entry.target_offset = kRemoteBaseOffset;
+
+    LOG(INFO) << "=== SingleReadWithOffset - Write Phase ===";
+    LOG(INFO) << "Writing with remote_base offset: " << kRemoteBaseOffset << " (0x" << std::hex << kRemoteBaseOffset << std::dec << ")";
+
+    Status s = xport->submitTransfer(batch_id, {write_entry});
+    ASSERT_EQ(s, Status::OK());
+    waitForCompletion(batch_id);
+    s = xport->freeBatchID(batch_id);
+    ASSERT_EQ(s, Status::OK());
+
+    // Read from NVMe to NPU via NDS with same offset
+    batch_id = xport->allocateBatchID(1);
+    void *npu_read_addr = (uint8_t *)npu_addr + kDataLength;
+
+    LOG(INFO) << "=== SingleReadWithOffset - Read Phase ===";
+    LOG(INFO) << "Reading with remote_base offset: " << remote_base << " (0x" << std::hex << remote_base << std::dec << ")";
+    LOG(INFO) << "Original npu_addr:        " << npu_addr << " (0x" << std::hex << npu_addr << std::dec << ")";
+    LOG(INFO) << "Read dest npu_read_addr:  " << npu_read_addr << " (0x" << std::hex << npu_read_addr << std::dec << ")";
+
+    TransferRequest read_entry;
+    read_entry.opcode = TransferRequest::READ;
+    read_entry.length = kDataLength;
+    read_entry.source = (uint8_t *)npu_read_addr;
+    read_entry.target_id = segment_id;
+    read_entry.target_offset = kRemoteBaseOffset;
+
+    s = xport->submitTransfer(batch_id, {read_entry});
+    ASSERT_EQ(s, Status::OK());
+    waitForCompletion(batch_id);
+
+    TransferStatus status;
+    xport->getTransferStatus(batch_id, 0, status);
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+
+    s = xport->freeBatchID(batch_id);
+    ASSERT_EQ(s, Status::OK());
+
+    // Copy read data back to host for verification
+    std::vector<uint8_t> read_back_data(kDataLength);
+    ASSERT_EQ(copyFromNpu(read_back_data.data(), npu_read_addr, kDataLength), 0);
+
+    // Verify data matches
+    int ret = memcmp(host_data.data(), read_back_data.data(), kDataLength);
+    EXPECT_EQ(ret, 0);
+
+    if (ret != 0) {
+        LOG(ERROR) << "=== SingleReadWithOffset - Data Mismatch ===";
+        size_t first_mismatch = 0;
+        bool has_mismatch = false;
+        for (size_t i = 0; i < kDataLength; ++i) {
+            if (host_data[i] != read_back_data[i]) {
+                first_mismatch = i;
+                has_mismatch = true;
+                break;
+            }
+        }
+
+        if (has_mismatch) {
+            LOG(ERROR) << "First mismatch at offset " << first_mismatch;
+            LOG(ERROR) << "  host_data[" << first_mismatch << "] = " << static_cast<int>(host_data[first_mismatch]);
+            LOG(ERROR) << "  read_back_data[" << first_mismatch << "] = " << static_cast<int>(read_back_data[first_mismatch]);
+
+            // Count total mismatches
+            int mismatch_count = 0;
+            for (size_t i = 0; i < kDataLength; ++i) {
+                if (host_data[i] != read_back_data[i]) {
+                    mismatch_count++;
+                }
+            }
+            LOG(ERROR) << "Total mismatches: " << mismatch_count << " out of " << kDataLength;
+        }
+    } else {
+        LOG(INFO) << "=== SingleReadWithOffset - SUCCESS ===";
+        LOG(INFO) << "Data verified successfully with remote_base offset: " << kRemoteBaseOffset;
+    }
+}
+
 TEST_F(NVMeoFNdsTransportTest, BatchWriteAndRead) {
     const size_t kDataLength = 1024 * 1024;
     const size_t kBatchSize = 4;
