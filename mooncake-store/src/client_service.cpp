@@ -3187,43 +3187,64 @@ void Client::PutToLocalFile(const std::string& key,
 
     std::string path = disk_descriptor.file_path;
 
-    // Synchronous D2H staging + copy into std::string.
-    // Done on the calling thread to guarantee GPU buffers are still valid
-    // (BatchPut has not yet returned to Python, so blocks are not reused).
-    std::string value;
-    value.reserve(total_size);
-
-    for (const auto& slice : slices) {
-        int device_id = -1;
-        if (IsDevicePointer(slice.ptr, &device_id)) {
-            SetDevice(device_id);
-            auto buf = pinned_buffer_pool_->Acquire(slice.size);
-            if (!CopyDeviceToHost(buf.data, slice.ptr, slice.size)) {
-                LOG(ERROR) << "D2H copy failed for key: " << key
-                           << ", triggering PutRevoke for disk replica";
-                pinned_buffer_pool_->Release(buf);
-                // Must revoke to avoid phantom replica in master
-                auto revoke_result =
-                    master_client_.PutRevoke(key, ReplicaType::DISK);
-                if (!revoke_result) {
-                    LOG(ERROR)
-                        << "Failed to revoke put operation for key: " << key;
-                }
-                return;
+    // Determine if we can use NDS direct path (skip D2H copy)
+    bool use_nds_direct = false;
+#ifdef USE_NDS
+    if (storage_backend_->Is3fsDir()) {
+        bool all_hbm = true;
+        for (const auto& slice : slices) {
+            int device_id = -1;
+            if (!IsDevicePointer(slice.ptr, &device_id)) {
+                all_hbm = false;
+                break;
             }
-            value.append(buf.data, slice.size);
-            pinned_buffer_pool_->Release(buf);
-        } else {
-            value.append(static_cast<char*>(slice.ptr), slice.size);
+        }
+        use_nds_direct = all_hbm;
+    }
+#endif
+
+    std::string value;
+    if (!use_nds_direct) {
+        // Synchronous D2H staging + copy into std::string.
+        // Done on the calling thread to guarantee GPU buffers are still valid
+        // (BatchPut has not yet returned to Python, so blocks are not reused).
+        value.reserve(total_size);
+
+        for (const auto& slice : slices) {
+            int device_id = -1;
+            if (IsDevicePointer(slice.ptr, &device_id)) {
+                SetDevice(device_id);
+                auto buf = pinned_buffer_pool_->Acquire(slice.size);
+                if (!CopyDeviceToHost(buf.data, slice.ptr, slice.size)) {
+                    LOG(ERROR) << "D2H copy failed for key: " << key
+                               << ", triggering PutRevoke for disk replica";
+                    pinned_buffer_pool_->Release(buf);
+                    // Must revoke to avoid phantom replica in master
+                    auto revoke_result =
+                        master_client_.PutRevoke(key, ReplicaType::DISK);
+                    if (!revoke_result) {
+                        LOG(ERROR) << "Failed to revoke put operation for "
+                                      "key: "
+                                   << key;
+                    }
+                    return;
+                }
+                value.append(buf.data, slice.size);
+                pinned_buffer_pool_->Release(buf);
+            } else {
+                value.append(static_cast<char*>(slice.ptr), slice.size);
+            }
         }
     }
 
-    // Async StoreObject + PutEnd (unchanged from original)
+    // Async StoreObject + PutEnd
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
-                                value = std::move(value), path] {
-        // Store the object
-        auto store_result = backend->StoreObject(path, value, key);
+                                value = std::move(value), slices, path,
+                                use_nds_direct] {
         ReplicaType replica_type = ReplicaType::DISK;
+        auto store_result = use_nds_direct
+                                ? backend->StoreObject(path, slices, key)
+                                : backend->StoreObject(path, value, key);
 
         if (!store_result) {
             // If storage failed, revoke the put operation

@@ -621,6 +621,12 @@ class Client {
 
     bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
 
+#ifdef USE_3FS
+    bool IsStorage3fs() const {
+        return storage_backend_ && storage_backend_->Is3fsDir();
+    }
+#endif
+
    protected:
     /**
      * @brief Constructor exposed to subclasses for testing only; production

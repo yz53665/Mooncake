@@ -480,6 +480,8 @@ class StorageBackend {
     bool is_3fs_dir_{false};  // Flag to indicate if the storage is using 3FS
                               // directory structure
     std::unique_ptr<USRBIOResourceManager> resource_manager_;
+
+    bool Is3fsDir() const { return is_3fs_dir_; }
 #endif
 
    private:

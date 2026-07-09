@@ -5,6 +5,10 @@
 #include <unistd.h>
 #include <sys/file.h>
 
+#ifdef USE_NDS
+#include "gpu_staging_utils.h"
+#endif
+
 namespace mooncake {
 
 ThreeFSFile::ThreeFSFile(const std::string& filename, int fd,
@@ -61,6 +65,41 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::write(std::span<const char> data,
         // Calculate current chunk size
         size_t chunk_size =
             std::min(length - total_bytes_written, max_chunk_size);
+
+#ifdef USE_NDS
+        if (gpu_staging::IsDevicePointer(
+                const_cast<char*>(data_ptr + total_bytes_written), nullptr)) {
+            // HBM direct write: skip memcpy, use hf3fs_prep_npu
+            int ret = hf3fs_prep_npu(
+                &ior_write, false,
+                reinterpret_cast<uint64_t>(data_ptr + total_bytes_written),
+                0 /* device_eid */, 0 /* ib_dev_id */, fd_, current_offset,
+                chunk_size, nullptr);
+            if (ret < 0) {
+                return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+            }
+
+            ret = hf3fs_submit_ios(&ior_write);
+            if (ret < 0) {
+                return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+            }
+
+            struct hf3fs_cqe cqe;
+            ret = hf3fs_wait_for_ios(&ior_write, &cqe, 1, 1, nullptr);
+            if (ret < 0 || cqe.result < 0) {
+                return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+            }
+
+            size_t bytes_written = cqe.result;
+            total_bytes_written += bytes_written;
+            current_offset += bytes_written;
+
+            if (bytes_written < chunk_size) {
+                break;
+            }
+            continue;
+        }
+#endif
 
         // Copy data to shared buffer
         memcpy(threefs_iov.base, data_ptr + total_bytes_written, chunk_size);
@@ -194,7 +233,55 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov,
     int current_iov_index = 0;
     size_t current_iov_offset = 0;
 
-    while (bytes_remaining > 0) {
+    // TODO NDS: 没有iov，直接将HBM地址传入，改为使用hf3fs_prep_npu_direct_io，也不需要bytes_remaining
+    while (bytes_remaining > 0 && current_iov_index < iovcnt) {
+        const iovec* current_iov = &iov[current_iov_index];
+        size_t avail_in_iov = current_iov->iov_len - current_iov_offset;
+
+#ifdef USE_NDS
+        if (gpu_staging::IsDevicePointer(current_iov->iov_base, nullptr)) {
+            // HBM direct write: entire iov segment in one hf3fs_prep_npu call
+            // TODO NDS: NDS场景下直传，无需iov拷贝动作
+            uint64_t hbm_addr = reinterpret_cast<uint64_t>(
+                static_cast<char*>(current_iov->iov_base) +
+                current_iov_offset);
+
+            int ret = hf3fs_prep_npu(&ior_write, false, hbm_addr,
+                                     0 /* device_eid */, 0 /* ib_dev_id */,
+                                     fd_, current_offset, avail_in_iov,
+                                     nullptr);
+            if (ret < 0) {
+                return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+            }
+
+            ret = hf3fs_submit_ios(&ior_write);
+            if (ret < 0) {
+                return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+            }
+
+            struct hf3fs_cqe cqe;
+            ret = hf3fs_wait_for_ios(&ior_write, &cqe, 1, 1, nullptr);
+            if (ret < 0 || cqe.result < 0) {
+                return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+            }
+
+            size_t bytes_written = cqe.result;
+            total_bytes_written += bytes_written;
+            bytes_remaining -= bytes_written;
+            current_offset += bytes_written;
+
+            // Advance to next iov segment
+            current_iov_index++;
+            current_iov_offset = 0;
+
+            if (bytes_written < avail_in_iov) {
+                break;  // Short write
+            }
+            continue;
+        }
+#endif
+
+        // --- DDR path: chunked write via shared buffer ---
         // 2. Determine current write chunk size (not exceeding shared buffer
         // size)
         size_t current_chunk_size =
@@ -211,6 +298,7 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov,
                 std::min(current_chunk_size - bytes_copied,
                          current_iov->iov_len - current_iov_offset);
 
+            // TODO NDS: NDS场景下直传，无需iov拷贝动作
             memcpy(dest_ptr + bytes_copied,
                    reinterpret_cast<char*>(current_iov->iov_base) +
                        current_iov_offset,
@@ -281,7 +369,53 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_read(const iovec* iov,
     int current_iov_index = 0;
     size_t current_iov_offset = 0;
 
-    while (bytes_remaining > 0) {
+    while (bytes_remaining > 0 && current_iov_index < iovcnt) {
+        const iovec* current_iov = &iov[current_iov_index];
+        size_t avail_in_iov = current_iov->iov_len - current_iov_offset;
+
+#ifdef USE_NDS
+        if (gpu_staging::IsDevicePointer(current_iov->iov_base, nullptr)) {
+            // HBM direct read: entire iov segment in one hf3fs_prep_npu call
+            uint64_t hbm_addr = reinterpret_cast<uint64_t>(
+                static_cast<char*>(current_iov->iov_base) +
+                current_iov_offset);
+
+            int ret = hf3fs_prep_npu(&ior_read, true, hbm_addr,
+                                     0 /* device_eid */, 0 /* ib_dev_id */,
+                                     fd_, current_offset, avail_in_iov,
+                                     nullptr);
+            if (ret < 0) {
+                return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
+            }
+
+            ret = hf3fs_submit_ios(&ior_read);
+            if (ret < 0) {
+                return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
+            }
+
+            struct hf3fs_cqe cqe;
+            ret = hf3fs_wait_for_ios(&ior_read, &cqe, 1, 1, nullptr);
+            size_t bytes_read = cqe.result;
+            if (ret < 0) {
+                return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
+            }
+
+            total_bytes_read += bytes_read;
+            bytes_remaining -= bytes_read;
+            current_offset += bytes_read;
+
+            // Advance to next iov segment
+            current_iov_index++;
+            current_iov_offset = 0;
+
+            if (bytes_read < avail_in_iov) {
+                break;  // Short read / EOF
+            }
+            continue;
+        }
+#endif
+
+        // --- DDR path: chunked read via shared buffer ---
         // Determine current block size
         size_t current_chunk_size =
             std::min<size_t>(bytes_remaining, resource->config_.iov_size);

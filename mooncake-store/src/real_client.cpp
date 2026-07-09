@@ -3165,30 +3165,49 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         }
 
         if (replica.is_disk_replica()) {
-            // DISK full read: local file I/O (vector_read) cannot write to
-            // GPU memory. Use temp CPU buffer, then scatter to dst.
-            auto alloc_result = client_buffer_allocator_->allocate(total_size);
-            if (!alloc_result) {
-                LOG(ERROR) << "Failed to allocate temp buffer for DISK full "
-                           << "read, key: " << key << ", size: " << total_size;
-                return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            void *dst = static_cast<char *>(buffer) + dst_offset;
+#ifdef USE_NDS
+            bool use_nds = client_->IsStorage3fs() &&
+                           gpu_staging::IsDevicePointer(dst, nullptr);
+#else
+            constexpr bool use_nds = false;
+#endif
+            // Determine the read target: HBM direct or CPU temp buffer
+            std::unique_ptr<BufferHandle> tmp_handle;
+            void *read_ptr;
+            if (use_nds) {
+                read_ptr = dst;
+            } else {
+                auto alloc_result =
+                    client_buffer_allocator_->allocate(total_size);
+                if (!alloc_result) {
+                    LOG(ERROR)
+                        << "Failed to allocate temp buffer for DISK full "
+                        << "read, key: " << key << ", size: " << total_size;
+                    return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                }
+                tmp_handle = std::make_unique<BufferHandle>(
+                    std::move(*alloc_result));
+                read_ptr = tmp_handle->ptr();
             }
-            BufferHandle tmp_handle(std::move(*alloc_result));
-            std::vector<mooncake::Slice> tmp_slices;
-            allocateSlices(tmp_slices, replica, tmp_handle.ptr());
+
+            std::vector<mooncake::Slice> slices;
+            allocateSlices(slices, replica, read_ptr);
             auto filtered_qr = FilterQueryResult(query_result, replica);
-            auto get_result = client_->Get(key, filtered_qr, tmp_slices);
+            auto get_result = client_->Get(key, filtered_qr, slices);
             if (!get_result) {
                 LOG(ERROR) << "DISK Get failed for key: " << key
                            << " with error: " << toString(get_result.error());
                 return tl::unexpected(get_result.error());
             }
-            void *dst = static_cast<char *>(buffer) + dst_offset;
-            const void *src = tmp_handle.ptr();
-            if (auto r = scatter_host_to_maybe_device(
-                    dst, src, total_size, "DISK full read, key: " + key);
-                !r) {
-                return tl::unexpected(r.error());
+
+            if (!use_nds) {
+                if (auto r = scatter_host_to_maybe_device(
+                        dst, read_ptr, total_size,
+                        "DISK full read, key: " + key);
+                    !r) {
+                    return tl::unexpected(r.error());
+                }
             }
             return static_cast<int64_t>(total_size);
         }
@@ -4486,26 +4505,44 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                     tl::unexpected(ErrorCode::INVALID_REPLICA);
                 continue;
             }
-            auto alloc_result =
-                client_buffer_allocator_->allocate(op.total_size);
-            if (!alloc_result) {
-                LOG(ERROR) << "Failed to allocate temp buffer for DISK "
-                           << "read, key: " << op.key
-                           << ", size: " << op.total_size;
-                results[op.original_index] =
-                    tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-                continue;
+
+#ifdef USE_NDS
+            bool use_nds = client_->IsStorage3fs() &&
+                           gpu_staging::IsDevicePointer(op.dst_buffer, nullptr);
+#else
+            constexpr bool use_nds = false;
+#endif
+            // Determine the read target: HBM direct or CPU temp buffer
+            std::unique_ptr<BufferHandle> handle;
+            void *read_ptr;
+            if (use_nds) {
+                read_ptr = op.dst_buffer;
+            } else {
+                auto alloc_result =
+                    client_buffer_allocator_->allocate(op.total_size);
+                if (!alloc_result) {
+                    LOG(ERROR) << "Failed to allocate temp buffer for DISK "
+                               << "read, key: " << op.key
+                               << ", size: " << op.total_size;
+                    results[op.original_index] =
+                        tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                    continue;
+                }
+                handle = std::make_unique<BufferHandle>(
+                    std::move(*alloc_result));
+                read_ptr = handle->ptr();
             }
-            auto handle =
-                std::make_unique<BufferHandle>(std::move(*alloc_result));
+
             std::vector<Slice> disk_slices;
-            allocateSlices(disk_slices, *replica_ptr, handle->ptr());
+            allocateSlices(disk_slices, *replica_ptr, read_ptr);
             disk_batch_keys.push_back(op.key);
             disk_batch_qrs.push_back(
                 FilterQueryResult(op.query_result, *replica_ptr));
             disk_batch_slices[op.key] = std::move(disk_slices);
             disk_batch_indices.push_back(di);
-            disk_temp_handles.emplace(op.key, std::move(handle));
+            if (!use_nds) {
+                disk_temp_handles.emplace(op.key, std::move(handle));
+            }
         }
 
         if (!disk_batch_keys.empty()) {
@@ -4516,6 +4553,18 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 const auto &key = disk_batch_keys[di];
                 auto &op = disk_operations[disk_batch_indices[di]];
                 auto handle_it = disk_temp_handles.find(key);
+                if (handle_it == disk_temp_handles.end()) {
+                    // NDS op: data already written directly to HBM by
+                    // vector_read via hf3fs_prep_npu; no scatter needed.
+                    if (!disk_results[di]) {
+                        LOG(ERROR)
+                            << "DISK (NDS) BatchGet failed for key '" << key
+                            << "': " << toString(disk_results[di].error());
+                        results[op.original_index] =
+                            tl::unexpected(disk_results[di].error());
+                    }
+                    continue;
+                }
                 if (!disk_results[di]) {
                     LOG(ERROR) << "DISK BatchGet failed for key '" << key
                                << "': " << toString(disk_results[di].error());
@@ -5043,18 +5092,7 @@ RealClient::batch_get_into_multi_buffers_internal(
 
             for (auto &[key, op] : valid_local_disk_ops) {
                 if (op.is_local_disk) continue;
-                auto alloc_result =
-                    client_buffer_allocator_->allocate(op.total_size);
-                if (!alloc_result) {
-                    LOG(ERROR)
-                        << "Failed to allocate temp buffer for DISK "
-                        << "read, key: " << key << ", size: " << op.total_size;
-                    results[op.original_index] =
-                        tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-                    continue;
-                }
-                auto handle =
-                    std::make_unique<BufferHandle>(std::move(*alloc_result));
+
                 // Find the correct DISK replica — Master may return
                 // replicas in any order (e.g. [LOCAL_DISK, DISK]).
                 const Replica::Descriptor *replica_ptr = nullptr;
@@ -5070,15 +5108,58 @@ RealClient::batch_get_into_multi_buffers_internal(
                         tl::make_unexpected(ErrorCode::INVALID_REPLICA);
                     continue;
                 }
-                const auto &replica = *replica_ptr;
+
+#ifdef USE_NDS
+                bool use_nds = client_->IsStorage3fs();
+                if (use_nds) {
+                    for (size_t j = 0; j < op.buffers.size(); ++j) {
+                        if (!gpu_staging::IsDevicePointer(op.buffers[j],
+                                                          nullptr)) {
+                            use_nds = false;
+                            break;
+                        }
+                    }
+                }
+#else
+                constexpr bool use_nds = false;
+#endif
+
+                std::unique_ptr<BufferHandle> handle;
                 std::vector<Slice> disk_slices;
-                allocateSlices(disk_slices, replica, handle->ptr());
+
+                if (use_nds) {
+                    // Build slices directly from HBM buffers
+                    disk_slices.reserve(op.buffers.size());
+                    for (size_t j = 0; j < op.buffers.size(); ++j) {
+                        disk_slices.push_back(
+                            Slice{op.buffers[j], op.sizes[j]});
+                    }
+                } else {
+                    auto alloc_result =
+                        client_buffer_allocator_->allocate(op.total_size);
+                    if (!alloc_result) {
+                        LOG(ERROR)
+                            << "Failed to allocate temp buffer for DISK "
+                            << "read, key: " << key
+                            << ", size: " << op.total_size;
+                        results[op.original_index] =
+                            tl::make_unexpected(
+                                ErrorCode::NO_AVAILABLE_HANDLE);
+                        continue;
+                    }
+                    handle = std::make_unique<BufferHandle>(
+                        std::move(*alloc_result));
+                    allocateSlices(disk_slices, *replica_ptr, handle->ptr());
+                }
+
                 disk_batch_keys.push_back(key);
                 disk_batch_qrs.push_back(
                     FilterQueryResult(op.query_result, *replica_ptr));
                 disk_batch_slices[key] = std::move(disk_slices);
                 disk_key_order.push_back(key);
-                temp_handles.emplace(key, std::move(handle));
+                if (!use_nds) {
+                    temp_handles.emplace(key, std::move(handle));
+                }
             }
 
             if (!disk_batch_keys.empty()) {
@@ -5090,6 +5171,19 @@ RealClient::batch_get_into_multi_buffers_internal(
                     const auto &key = disk_key_order[di];
                     auto &op = valid_local_disk_ops.at(key);
                     auto handle_it = temp_handles.find(key);
+                    if (handle_it == temp_handles.end()) {
+                        // NDS op: data already written directly to HBM by
+                        // vector_read via hf3fs_prep_npu; no scatter needed.
+                        if (!disk_results[di]) {
+                            LOG(ERROR)
+                                << "DISK (NDS) BatchGet failed for key '"
+                                << key << "': "
+                                << toString(disk_results[di].error());
+                            results[op.original_index] =
+                                tl::make_unexpected(disk_results[di].error());
+                        }
+                        continue;
+                    }
                     if (!disk_results[di]) {
                         LOG(ERROR)
                             << "DISK BatchGet failed for key '" << key
