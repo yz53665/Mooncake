@@ -104,6 +104,11 @@ class RealClient : public PyClient {
 
     int unregister_buffer(void *buffer);
 
+#ifdef USE_NDS
+    int register_nds_buffer(void *buffer, size_t size);
+    int unregister_nds_buffer(void *buffer);
+#endif
+
     struct RegisteredBufferRegion {
         void *base{nullptr};
         size_t size{0};
@@ -516,6 +521,12 @@ class RealClient : public PyClient {
 
     tl::expected<void, ErrorCode> unregister_buffer_internal(void *buffer);
 
+#ifdef USE_NDS
+    tl::expected<void, ErrorCode> register_nds_buffer_internal(void *buffer,
+                                                               size_t size);
+    tl::expected<void, ErrorCode> unregister_nds_buffer_internal(void *buffer);
+#endif
+
     tl::expected<void, ErrorCode> put_internal(
         const std::string &key, std::span<const char> value,
         const ReplicateConfig &config = ReplicateConfig{},
@@ -821,6 +832,17 @@ class RealClient : public PyClient {
 
     mutable std::shared_mutex registered_buffer_mutex_;
     std::unordered_map<void *, size_t> registered_buffer_sizes_;
+
+#ifdef USE_NDS
+    struct NdsBufferInfo {
+        void *addr;
+        size_t size;
+        int32_t device_id;
+    };
+    std::mutex nds_mutex_;
+    std::unordered_map<void *, NdsBufferInfo> nds_registered_buffers_;
+    std::unordered_set<int32_t> nds_initialized_devices_;
+#endif
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,

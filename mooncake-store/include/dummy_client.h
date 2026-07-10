@@ -54,6 +54,11 @@ class DummyClient : public PyClient {
 
     int unregister_buffer(void *buffer);
 
+#ifdef USE_NDS
+    int register_nds_buffer(void *buffer, size_t size) { return 0; }
+    int unregister_nds_buffer(void *buffer) { return 0; }
+#endif
+
     int64_t get_into(const std::string &key, void *buffer, size_t size);
 
     std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(

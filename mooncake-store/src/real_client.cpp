@@ -40,6 +40,10 @@
 #include "acl/acl_rt.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
 #endif
+#ifdef USE_NDS
+#include "hf3fs/nds.h"
+#include <acl/acl.h>
+#endif
 
 DEFINE_bool(enable_http_server, false,
             "Enable embedded HTTP server for health check and metrics.");
@@ -3063,6 +3067,72 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
 int RealClient::unregister_buffer(void *buffer) {
     return to_py_ret(unregister_buffer_internal(buffer));
 }
+
+#ifdef USE_NDS
+tl::expected<void, ErrorCode> RealClient::register_nds_buffer_internal(
+    void *buffer, size_t size) {
+    int32_t device_id = 0;
+    if (aclrtGetDevice(&device_id) != ACL_ERROR_NONE) {
+        LOG(ERROR) << "aclrtGetDevice failed for NDS buffer registration";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::lock_guard<std::mutex> lock(nds_mutex_);
+
+    // Lazy init NDS for this device
+    if (nds_initialized_devices_.find(device_id) ==
+        nds_initialized_devices_.end()) {
+        if (nds_init(device_id) != 0) {
+            LOG(ERROR) << "nds_init failed for device " << device_id;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        nds_initialized_devices_.insert(device_id);
+    }
+
+    // Avoid duplicate registration
+    if (nds_registered_buffers_.find(buffer) !=
+        nds_registered_buffers_.end()) {
+        return {};
+    }
+
+    if (nds_buf_register(device_id, buffer, size) != 0) {
+        LOG(ERROR) << "nds_buf_register failed, addr=" << buffer
+                   << " size=" << size << " device=" << device_id;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    nds_registered_buffers_[buffer] = {buffer, size, device_id};
+    LOG(INFO) << "NDS buffer registered: addr=" << buffer
+              << " size=" << size << " device=" << device_id;
+    return {};
+}
+
+tl::expected<void, ErrorCode> RealClient::unregister_nds_buffer_internal(
+    void *buffer) {
+    std::lock_guard<std::mutex> lock(nds_mutex_);
+
+    auto it = nds_registered_buffers_.find(buffer);
+    if (it == nds_registered_buffers_.end()) {
+        return {};
+    }
+
+    int32_t device_id = it->second.device_id;
+    if (nds_buf_deregister(device_id, buffer) != 0) {
+        LOG(WARNING) << "nds_buf_deregister failed, addr=" << buffer
+                     << " device=" << device_id;
+    }
+    nds_registered_buffers_.erase(it);
+    return {};
+}
+
+int RealClient::register_nds_buffer(void *buffer, size_t size) {
+    return to_py_ret(register_nds_buffer_internal(buffer, size));
+}
+
+int RealClient::unregister_nds_buffer(void *buffer) {
+    return to_py_ret(unregister_nds_buffer_internal(buffer));
+}
+#endif
 
 std::optional<RealClient::RegisteredBufferRegion>
 RealClient::resolve_registered_buffer(void *buffer) const {

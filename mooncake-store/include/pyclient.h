@@ -235,6 +235,11 @@ class PyClient {
 
     virtual int unregister_buffer(void *buffer) = 0;
 
+#ifdef USE_NDS
+    virtual int register_nds_buffer(void *buffer, size_t size) = 0;
+    virtual int unregister_nds_buffer(void *buffer) = 0;
+#endif
+
     virtual int64_t get_into(const std::string &key, void *buffer,
                              size_t size) = 0;
 

@@ -2496,6 +2496,27 @@ PYBIND11_MODULE(store, m) {
             py::arg("buffer_ptr"),
             "Unregister a previously registered memory "
             "buffer for direct access operations")
+#ifdef USE_NDS
+        .def(
+            "register_nds_buffer",
+            [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr,
+               size_t size) {
+                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                py::gil_scoped_release release;
+                return self.store_->register_nds_buffer(buffer, size);
+            },
+            py::arg("buffer_ptr"), py::arg("size"),
+            "Register an HBM buffer for NPU Direct Storage (NDS) operations")
+        .def(
+            "unregister_nds_buffer",
+            [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr) {
+                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                py::gil_scoped_release release;
+                return self.store_->unregister_nds_buffer(buffer);
+            },
+            py::arg("buffer_ptr"),
+            "Unregister a previously registered NDS buffer")
+#endif
         .def(
             "get_into",
             [](MooncakeStorePyWrapper &self, const std::string &key,
