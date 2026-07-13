@@ -72,6 +72,10 @@ if (USE_UBSHMEM)
   add_subdirectory(ubshmem-allocator)
 endif()
 
+if(USE_NDS)
+  target_link_libraries(transfer_engine PUBLIC nvmeof_transport)
+endif()
+
 if (USE_TENT)
   add_subdirectory(tent)
   if (BUILD_BENCHMARK)
