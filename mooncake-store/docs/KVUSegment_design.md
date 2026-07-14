@@ -4,7 +4,7 @@
 
 KVSegment 是为 KVTransferEngine 设计的新型 Segment，特点是硬件自行管理地址空间，只需传入 key/value 即可完成存取，无需基于内存地址的空间管理。
 
-KVSegment 有独立的 `KVSegmentManager`。segment分配策略沿用现有的 `AllocationStrategyType` 配置（RANDOM / FREE\_RATIO\_FIRST）。
+KVSegment 有独立的 `KVSegmentManager`，与 `SegmentManager`、`NoFSegmentManager` 平级。分配策略沿用现有的 `AllocationStrategyType` 配置（RANDOM / FREE\_RATIO\_FIRST），但逻辑内聚在 Manager 中直接操作 `remaining_size`，不经过 `BufferAllocator`。
 
 ### 1.1 与现有 Segment 的架构关系
 
@@ -50,18 +50,19 @@ graph TB
 
 ### 1.2 新增/修改文件清单
 
-| 文件                                | 操作 | 说明                                                                      |
-| ----------------------------------- | ---- | ------------------------------------------------------------------------- |
-| `include/types.h`                 | 修改 | 新增`KVSegment`、`ReplicaType::KVS`                                   |
-| `include/segment.h`               | 修改 | 新增`MountedKVSegment`、`KVSegmentManager`、`ScopedKVSegmentAccess` |
-| `src/segment.cpp`                 | 修改 | 实现 KVSegment 管理逻辑                                                   |
-| `include/replica.h`               | 修改 | 新增`KVReplicaData`、`KVDescriptor`                                   |
-| `include/rpc_types.h`             | 修改 | 新增 KVSegment 相关 RPC 消息                                              |
-| `include/master_service.h`        | 修改 | 新增`kvs_segment_manager_`、RPC 处理方法                                |
-| `src/master_service.cpp`          | 修改 | 实现 KVS RPC、PutStart 分配分支、客户端过期清理                           |
-| `include/client_service.h`        | 修改 | 新增客户端挂载方法                                                        |
-| `src/client_service.cpp`          | 修改 | 实现客户端 KVS 段挂载                                                     |
-| `include/master_metric_manager.h` | 修改 | 新增 KVS 容量指标                                                         |
+| 文件                                | 操作 | 说明                                                                                      |
+| ----------------------------------- | ---- | ----------------------------------------------------------------------------------------- |
+| `include/types.h`                 | 修改 | 新增 `KVSegment`、`ReplicaType::KVS`、KVS 心跳默认常量                                |
+| `include/segment.h`               | 修改 | 新增 `MountedKVSegment`、`KVSegmentManager`、`ScopedKVSegmentAccess`                  |
+| `src/segment.cpp`                 | 修改 | 实现 KVSegment 管理逻辑                                                                   |
+| `include/replica.h`               | 修改 | 新增 `KVReplicaData`、`KVDescriptor`                                                  |
+| `include/rpc_types.h`             | 修改 | 新增 KVSegment 相关 RPC 消息                                                              |
+| `include/master_config.h`         | 修改 | 新增 KVS 心跳配置字段                                                                     |
+| `include/master_service.h`        | 修改 | 新增 `kvs_segment_manager_`、RPC 处理方法、心跳线程成员、`KVSProbeFn`、`KVSHeartbeatState` |
+| `src/master_service.cpp`          | 修改 | 实现 KVS RPC、PutStart 分配分支、客户端过期清理、KVS 心跳线程与故障处理                   |
+| `include/client_service.h`        | 修改 | 新增客户端挂载方法                                                                        |
+| `src/client_service.cpp`          | 修改 | 实现客户端 KVS 段挂载                                                                     |
+| `include/master_metric_manager.h` | 修改 | 新增 KVS 容量与心跳指标                                                                   |
 
 **不修改：** `allocator.h`、`allocator.cpp`、`allocation_strategy.h`、`allocation_strategy.cpp`
 
@@ -97,6 +98,7 @@ classDiagram
         +ReMountSegment(vector~KVSegment~, client_id) ErrorCode
         +PrepareUnmountSegment(device_name, client_id, &dec_capacity) ErrorCode
         +CommitUnmountSegment(device_name, dec_capacity) ErrorCode
+        +ForceUnmountSegment(device_name, &dec_capacity) ErrorCode
         +Allocate(size, count, preferred, excluded, strategy) vector~AllocResult~
         +Deallocate(device_name, size) void
         +GetClientSegments(client_id, &segments) ErrorCode
@@ -130,7 +132,9 @@ classDiagram
     Replica ..> KVDescriptor : 序列化为
 ```
 
-ScopedKVSegmentAccess中方法入参的client_id都需要保留，用于client_refs元素增删改查。
+ScopedKVSegmentAccess 中方法入参的 `client_id` 用于 `client_refs` 元素增删。`ForceUnmountSegment` 为心跳故障专用，绕过 `client_refs` 检查直接强制卸载。
+
+---
 
 ## 二、数据结构定义
 
@@ -140,12 +144,12 @@ ScopedKVSegmentAccess中方法入参的client_id都需要保留，用于client_r
 | --------------- | --------------- | ----------------------------------------------------------------------- |
 | `id`          | `UUID`        | 辅助标识，每次挂载时随机生成，仅用于日志/追踪，不参与去重和索引         |
 | `name`        | `std::string` | 逻辑段名，用于 preferred allocation 路由                                |
-| `device_name` | `std::string` | KVS 硬件设备名称（如`/dev/kvu0`），**全局唯一标识，作为主索引** |
+| `device_name` | `std::string` | KVS 硬件设备名称（如 `/dev/kvu0`），**全局唯一标识，作为主索引** |
 | `size`        | `size_t`      | KVS 设备总容量（字节）                                                  |
 
 对比普通 `Segment`：**不需要** `base`（无地址概念）、`protocol`（使用专用协议）。
 
-**`id` 字段说明**：Client 端在挂载时调用 `generate_uuid()` 生成随机 v4 UUID。由于每次挂载生成不同的 UUID，`id` 不适合做去重或索引。KVSegment 的去重和索引统一以 `device_name` 为准。
+`id` 字段说明：Client 端在挂载时调用 `generate_uuid()` 生成随机 v4 UUID。由于每次挂载生成不同的 UUID，`id` 不适合做去重或索引。KVSegment 的去重和索引统一以 `device_name` 为准。
 
 ### 2.2 枚举扩展（types.h）
 
@@ -160,30 +164,33 @@ ScopedKVSegmentAccess中方法入参的client_id都需要保留，用于client_r
 | `segment`        | `KVSegment`      | 段元数据                                              |
 | `status`         | `SegmentStatus`  | 复用现有状态机                                        |
 | `remaining_size` | `size_t`         | 剩余容量，直接跟踪，替代 BufferAllocator              |
-| `client_refs`    | `std::set<UUID>` | **新增**：当前正在使用该 segment 的 client 集合 |
+| `client_refs`    | `std::set<UUID>` | 当前正在使用该 segment 的 client 集合                 |
 
-**`client_refs` 的核心作用**：
+`client_refs` 的核心作用：
 
 - 挂载时：若 `device_name` 已存在，仅将 `client_id` 加入 `client_refs`，`remaining_size` 不变
 - 卸载时：从 `client_refs` 移除 `client_id`，仅当集合为空时才真正销毁 segment
 - 过期清理时：从 `client_refs` 移除过期 client，归零才销毁
+- 心跳故障时：`ForceUnmountSegment` 绕过 `client_refs`，直接强制销毁
 
 ### 2.4 KVSegmentManager（segment.h）
 
 内部数据结构：
 
-| 成员                  | 类型                              | 说明                                                                     |
-| --------------------- | --------------------------------- | ------------------------------------------------------------------------ |
-| `segment_mutex_`    | `shared_mutex`                  | 读写锁                                                                   |
+| 成员                  | 类型                              | 说明                                                       |
+| --------------------- | --------------------------------- | ---------------------------------------------------------- |
+| `segment_mutex_`    | `shared_mutex`                  | 读写锁                                                     |
 | `mounted_segments_` | `map<string, MountedKVSegment>` | **`device_name` → 已挂载段**（key 从 `UUID` 改为 `string`） |
-| `client_segments_`  | `map<UUID, set<string>>`        | `client_id` → 其引用过的 device_name 集合（**天然去重**）          |
+| `client_segments_`  | `map<UUID, set<string>>`        | `client_id` → 其引用过的 device_name 集合（天然去重）      |
 
-**相比原设计移除的成员**：
+相比 SegmentManager 移除的成员：
 
-- ~~`client_by_name_`（`map<string, UUID>`）~~ — 1:1 映射不成立，一个 segment 可被多个 client 共享
-- ~~`segment_id_by_name_`（`map<string, UUID>`）~~ — 同上，且 `id` 随机生成不具确定性
+- ~~`client_by_name_`~~ — 一个 segment 可被多个 client 共享，1:1 映射不成立
+- ~~`segment_id_by_name_`~~ — `id` 随机生成不具确定性，不适合做索引
+- ~~`AllocatorManager`~~ — KVS 无 BufferAllocator
+- ~~`memory_allocator_`~~ — 同上
 
-**没有** `AllocatorManager`、`memory_allocator_`。分配策略通过 `Allocate()` 方法的 `strategy` 参数控制，逻辑内聚在 `ScopedKVSegmentAccess` 中直接操作 `remaining_size`。
+分配策略通过 `Allocate()` 方法的 `strategy` 参数控制，逻辑内聚在 `ScopedKVSegmentAccess` 中直接操作 `remaining_size`。
 
 ### 2.5 Replica 扩展（replica.h）
 
@@ -196,14 +203,32 @@ ScopedKVSegmentAccess中方法入参的client_id都需要保留，用于client_r
 
 ### 2.6 key 到 hash_key 的映射
 
-Master 在 `AllocateAndInsertMetadata` 时为 KVS 副本计算 `hash_key = hash(原始 key)`，先存入 `KVReplicaData`，再通过 `get_descriptor()` 拷贝到 `KVDescriptor`，随 `Replica::Descriptor` 一起持久化到 `ObjectMetadata` 中。
+Master 在 `AllocateAndInsertMetadata` 时为 KVS 副本计算 `hash_key = hash(原始 key)`，存入 `KVReplicaData`，通过 `get_descriptor()` 拷贝到 `KVDescriptor`，随 `ObjectMetadata` 一起持久化。
+
+**传递链路**：
+
+```mermaid
+flowchart TD
+    subgraph PutStart
+        A1[Master 计算 hash_key] --> A2[KVReplicaData]
+        A2 --> A3[get_descriptor 拷贝]
+        A3 --> A4[KVDescriptor]
+        A4 --> A5[随 Descriptor 返回 Client]
+    end
+
+    subgraph Get
+        B1[Client 用原始 key 查元数据] --> B2[ObjectMetadata]
+        B2 --> B3[KVReplicaData]
+        B3 --> A3
+    end
+
+    A5 --> C[Client 用 hash_key 访问 KVS 硬件]
+```
 
 - **Put 路径**：Client 从 `PutStart` 返回的 `KVDescriptor` 中获取 `hash_key`，将其传入 KV 硬件驱动替代原始 key。
 - **Get 路径**：Client 用原始 key 调用 `GetReplicaList` 查询元数据，从返回的 `KVDescriptor` 中取出 `hash_key`，再用 `hash_key` 从 KV 硬件读取数据。
 
-**映射关系由现有的 key→ObjectMetadata 机制自然完成，无需额外存储映射表。** 每次 Get 时用原始 key 查元数据即可获得对应的 `hash_key`。
-
-`hash_key` 采用确定性哈希（如 SHA-256 截断），相同 key 始终产生相同 hash，因此不需要维护随机映射。
+`hash_key` 采用确定性哈希（如 SHA-256 截断），相同 key 始终产生相同 hash。映射关系由现有 key→ObjectMetadata 机制自然完成，无需额外存储映射表。
 
 ### 2.7 ReplicateConfig 扩展
 
@@ -222,8 +247,10 @@ sequenceDiagram
     MS->>MS: 创建 segment_manager_
     MS->>MS: 创建 nof_segment_manager_
     MS->>MS: 创建 kvs_segment_manager_
+    MS->>MS: 注入 kvs_probe_fn_
+    MS->>MS: 启动 kvs_heartbeat_thread_
     MS->>MS: 注册 RPC 服务
-    Note over MS: MountKVSegment<br/>UnmountKVSegment
+    Note over MS: MountKVSegment / UnmountKVSegment
 ```
 
 ---
@@ -263,10 +290,10 @@ sequenceDiagram
 | 步骤                  | 普通 Segment                                                 | KVSegment                                                         |
 | --------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------- |
 | 地址校验              | `base != 0`、对齐校验                                      | 无（无地址概念）                                                  |
-| 创建分配器            | 创建`CachelibBufferAllocator` 或 `OffsetBufferAllocator` | 不创建，直接记录`remaining_size`                                |
+| 创建分配器            | 创建 `CachelibBufferAllocator` 或 `OffsetBufferAllocator` | 不创建，直接记录 `remaining_size`                                |
 | 加入 AllocatorManager | `addAllocator()`                                           | 无此步骤                                                          |
-| 去重检查              | 按`segment.id`                                             | **按 `device_name`**（`segment.id` 随机生成，不做去重） |
-| 重复挂载              | 返回`SEGMENT_ALREADY_EXISTS`                               | **增加引用计数，返回 OK**                                   |
+| 去重检查              | 按 `segment.id`                                             | **按 `device_name`**（`segment.id` 随机生成，不做去重） |
+| 重复挂载              | 返回 `SEGMENT_ALREADY_EXISTS`                               | **增加引用计数，返回 OK**                                   |
 
 ---
 
@@ -307,9 +334,9 @@ flowchart TD
 
 ### 5.2 分配策略
 
-`ScopedKVSegmentAccess::Allocate()` 接收 `AllocationStrategyType` 参数，与现有 `AllocationStrategy` 类使用相同的枚举值。策略逻辑直接在 Manager 中实现，不经过 `BufferAllocatorBase`。
+`ScopedKVSegmentAccess::Allocate()` 接收 `AllocationStrategyType` 参数，策略逻辑直接在 Manager 中实现，不经过 `BufferAllocatorBase`。
 
-**关键差异**：分配时**不区分** segment 由哪个 client 挂载，所有状态为 `OK` 的 segment 都是候选。这是因为 KVSegment 对应物理 SSD 设备，所有 client 共享同一设备。
+分配时**不区分** segment 由哪个 client 挂载，所有状态为 `OK` 的 segment 都是候选。这是因为 KVSegment 对应物理 SSD 设备，所有 client 共享同一设备。
 
 **分两轮分配**，每轮内部根据策略类型选择：
 
@@ -326,7 +353,9 @@ flowchart TD
 
 ---
 
-## 六、Client 端 Put 流程
+## 六、Client 端读写流程
+
+### 6.1 Put 流程
 
 ```mermaid
 sequenceDiagram
@@ -353,9 +382,7 @@ sequenceDiagram
     MS-->>Client: OK
 ```
 
----
-
-## 七、Client 端 Get 流程
+### 6.2 Get 流程
 
 ```mermaid
 sequenceDiagram
@@ -386,7 +413,11 @@ Get 流程说明：
 
 **key→hash_key 的映射无需额外存储**：Master 在 PutStart 时已将 `hash_key` 存入 `KVDescriptor`，并随 `ObjectMetadata` 一起持久化（快照 + OpLog）。Get 时通过原始 key 查元数据即可获得。
 
-## 八、Unmount 流程
+---
+
+## 七、Segment 卸载流程
+
+### 7.1 正常卸载（Client 主动调用）
 
 ```mermaid
 sequenceDiagram
@@ -419,19 +450,51 @@ sequenceDiagram
     MS-->>Client: OK
 ```
 
-与普通 Segment 的差异：
+### 7.2 强制卸载（心跳故障触发）
 
-| 步骤           | 普通 Segment                                      | KVSegment                                   |
-| -------------- | ------------------------------------------------- | ------------------------------------------- |
-| 查找 key       | `segment_id`（UUID）                            | `device_name`（string）                   |
-| Prepare 参数   | `(segment_id, &dec_capacity)`                   | `(device_name, client_id, &dec_capacity)` |
-| 引用语义       | 直接卸载                                          | 引用计数 -1，归零才卸载                     |
-| Commit 时机    | 总是执行                                          | 仅当`client_refs` 为空时执行              |
-| 移除 allocator | `removeAllocator()` + `buf_allocator.reset()` | 无此步骤                                    |
+心跳连续失败超阈值后，设备已不可达，无法读取数据迁移，直接强制卸载：
+
+```mermaid
+flowchart TD
+    A["心跳连续失败 >= threshold"] --> B["ForceUnmountSegment(device_name)"]
+    B --> C["绕过 client_refs 检查"]
+    C --> D["清空 client_refs"]
+    D --> E["status = UNMOUNTING"]
+    E --> F["dec_capacity = segment.size"]
+    F --> G["ClearInvalidHandles"]
+    G --> H["遍历所有 ObjectMetadata"]
+    H --> I["删除 device_name 匹配的 KVS 副本"]
+    I --> J{"对象还有其他有效副本?"}
+    J -->|是| K["保留对象，降级存活"]
+    J -->|否| L["删除整个 key（数据丢失）"]
+    K --> M["CommitUnmountSegment"]
+    L --> M
+    M --> N["mounted_segments_.erase"]
+    N --> O["更新 Metrics"]
+```
+
+**为何不 Drain？** Drain 机制的前提是源段仍可读（DRAINING = 可读不可写）。KVS 硬件故障后设备不可达，读操作直接失败，数据无法迁移。强制卸载是硬件故障场景下的唯一正确选择。
+
+### 7.3 卸载对 Client 的影响
+
+| 影响项 | 正常卸载 | 强制卸载 |
+|--------|---------|---------|
+| Client OK 状态 | 不影响 | 不影响 |
+| Client 其他段 | 不影响 | 不影响 |
+| Client 需重新 Mount？ | 不需要 | 不需要 |
+| 新 PutStart | 自动分配到其他健康段 | 自动分配到其他健康段 |
+| 已有 GetReplicaList | 返回剩余健康副本 | 返回剩余健康副本或 OBJECT_NOT_FOUND |
+| 在途读操作 | DRAINING 段仍可读 | 设备不可达，返回传输错误 |
+
+Client **不需要**感知 KVSegment 的卸载。原因：
+
+1. Client 每次操作都向 Master 请求 descriptor，Master 返回什么就用什么
+2. Client 的 KVTransport 只认 `device_name`，死设备的 descriptor 会被 `ClearInvalidHandles` 清理掉
+3. 与内存段不同，Client 不需要为 KVSegment 做 `registerLocalMemory`，无本地映射需清理
 
 ---
 
-## 九、Client 过期清理流程
+## 八、Client 过期清理流程
 
 ```mermaid
 flowchart TD
@@ -464,7 +527,7 @@ KVS 段清理的关键差异：**不是直接销毁过期 client 的所有段，
 
 ---
 
-## 十、生命周期状态机
+## 九、生命周期状态机
 
 ```mermaid
 stateDiagram-v2
@@ -472,7 +535,7 @@ stateDiagram-v2
     UNDEFINED --> OK: MountKVSegment（首次挂载）
     OK --> OK: MountKVSegment（重复挂载，client_refs +1）
 
-    OK --> DRAINING: CreateDrainJob
+    OK --> DRAINING: CreateDrainJob（手动维护）
     DRAINING --> DRAINED: 排空完成（所有数据已迁移）
     DRAINING --> OK: 取消排空（回滚）
 
@@ -484,6 +547,8 @@ stateDiagram-v2
     DRAINED --> UNMOUNTING: PrepareUnmountSegment（client_refs 归零）
     GRACEFULLY_UNMOUNTING --> UNMOUNTING: PrepareUnmountSegment（client_refs 归零）
 
+    OK --> UNMOUNTING: ForceUnmountSegment（心跳故障，绕过 client_refs）
+
     UNMOUNTING --> [*]: CommitUnmountSegment
 
     note right of OK: 可接受新分配，remaining_size > 0<br/>client_refs 记录使用中的 client
@@ -491,36 +556,200 @@ stateDiagram-v2
     note right of GRACEFULLY_UNMOUNTING: 不接受新分配，等待排空定时器<br/>client_refs 可能仍不为空
 ```
 
-**状态机关键说明**：
+状态机关键说明：
 
 - `PrepareUnmountSegment` 仅在 `client_refs` 归零后才推进状态到 `UNMOUNTING`
 - `client_refs > 0` 时，`PrepareUnmountSegment` 仅移除调用者的 client_id，不改变状态
+- `ForceUnmountSegment` 为心跳故障专用，绕过 `client_refs` 检查直接进入 `UNMOUNTING`
 - 完全复用现有 `SegmentStatus` 枚举，无需新增状态
 
 ### DRAINING / DRAINED 状态说明
 
-**DRAINING** 用于**安全下线**场景（设备维护、负载均衡、优雅关闭）：
+**DRAINING** 用于**手动安全下线**场景（设备维护、负载均衡、优雅关闭）：
 
 | 行为 | 说明 |
 |------|------|
 | 新分配 | **拒绝** — `Allocate()` 中跳过非 `OK` 状态的 segment |
 | 已有对象 | **可读** — 已分配的对象不受影响 |
-| 触发方式 | Master 收到 `CreateDrainJob` RPC 后调用 `SetSegmentStatusByName(segment_name, DRAINING)` |
+| 触发方式 | Master 收到 `CreateDrainJob` RPC 后将段状态设为 `DRAINING` |
 | 回滚 | 排空取消时回退到 `OK` |
 
-**DRAINED** 表示排空完成，所有数据已迁移到其他 segment，等待最终卸载：
+**DRAINED** 表示排空完成，所有数据已迁移到其他 segment，等待最终卸载。
 
-| 行为 | 说明 |
-|------|------|
-| 触发时机 | DrainJob 确认该 segment 上所有活跃对象已迁移完毕 |
-| 后续操作 | 等待 `client_refs` 归零后由 `PrepareUnmountSegment` 进入 `UNMOUNTING` |
+**注意**：DRAINING 路径不适用于心跳故障场景。心跳故障意味着设备不可达，数据无法读取也就无法迁移，必须走 `ForceUnmountSegment` 直接强制卸载。
 
 ### 与普通 Segment 的差异
 
 | 维度 | 普通 Segment | KVSegment |
 |------|-------------|-----------|
 | **分配控制** | `SetSegmentStatusByName` 中通过 `HasAllocator` 的 add/remove 控制 | `Allocate()` 中检查 `status == OK` 时跳过非 OK 段 |
-| **排空完成判定** | 通过 `BufferAllocator::size() == 0` 判断是否还有活跃对象 | 需依赖 KVS 硬件驱动或心跳确认设备上无活跃对象（Master 不追踪单对象分配） |
+| **排空完成判定** | 通过 `BufferAllocator::size() == 0` 判断是否还有活跃对象 | 扫描所有 `ObjectMetadata`，确认无 KVS 副本的 `device_name` 匹配 |
+| **故障处理** | 无独立心跳机制 | 心跳连续失败超阈值后 `ForceUnmountSegment` 强制卸载 |
+
+---
+
+## 十、心跳与健康检查机制
+
+### 10.1 设计思路
+
+KVSegment 对应物理 KVS 设备，设备故障会导致所有读写操作失败。需要后台心跳线程定期探测设备健康状态，故障后快速隔离异常段，使新写入自动流向健康段。
+
+设计参考现有 `NofHeartbeatThreadFunc` 模式：后台线程 + 探测函数注入 + 连续失败计数 + 阈值触发强制卸载。
+
+### 10.2 配置项（types.h）
+
+```cpp
+static constexpr int64_t DEFAULT_KVS_HEARTBEAT_INTERVAL_SEC = 10;
+static constexpr uint32_t DEFAULT_KVS_HEARTBEAT_PROBE_TIMEOUT_MS = 2000;
+static constexpr uint32_t DEFAULT_KVS_HEARTBEAT_FAILURES_THRESHOLD = 3;
+```
+
+通过 `MasterServiceConfig`（`master_config.h`）注入，支持运行时配置。
+
+### 10.3 数据结构（master_service.h）
+
+```mermaid
+classDiagram
+    direction TB
+
+    class KVSProbeFn {
+        <<typedef>>
+        +operator()(device_name: string, timeout_ms: uint32, error_reason: string*) bool
+    }
+
+    class KVSHeartbeatState {
+        +string device_name
+        +string segment_name
+        +time_point next_probe_at
+        +time_point last_success_at
+        +uint32 consecutive_failures
+        +string last_error_reason
+    }
+
+    class MasterService新增成员 {
+        +mutex kvs_heartbeat_mutex_
+        +unordered_map~string, KVSHeartbeatState~ kvs_heartbeat_states_
+        +thread kvs_heartbeat_thread_
+        +atomic~bool~ kvs_heartbeat_running_
+        +mutex kvs_probe_fn_mutex_
+        +KVSProbeFn kvs_probe_fn_
+    }
+
+    MasterService新增成员 o-- KVSHeartbeatState : kvs_heartbeat_states_
+    MasterService新增成员 ..> KVSProbeFn : kvs_probe_fn_
+```
+
+`KVSProbeFn` 为探针函数类型，签名为 `bool(const string& device_name, uint32_t timeout_ms, string* error_reason)`。`kvs_heartbeat_states_` 以 `device_name` 为 key，`kvs_heartbeat_mutex_` 保护其访问，`kvs_probe_fn_mutex_` 保护 `kvs_probe_fn_` 的读写。
+
+### 10.4 心跳线程主循环
+
+```mermaid
+flowchart TD
+    A["KVSHeartbeatThreadFunc (每 100ms 醒来)"] --> B[获取所有 OK 状态的 KVSegment 快照]
+    B --> C[同步心跳状态表<br/>新增段加入、已卸载段移除]
+    C --> D[筛选 next_probe_at <= now 的段]
+    D --> E{有段需探测?}
+    E -->|否| F["sleep 100ms"]
+    E -->|是| G[对每个待探测段调用 ProbeKVSegment]
+    G --> H{探测结果}
+    H -->|成功| I["consecutive_failures = 0<br/>更新 last_success_at"]
+    H -->|失败| J["consecutive_failures++"]
+    J --> K{"now - last_success_at >= alive_timeout?"}
+    K -->|否| L[记录失败，等待下次探测]
+    K -->|是| M["调用 HandleKVSegmentFailure<br/>触发强制卸载"]
+    I --> N[更新 next_probe_at = now + interval]
+    L --> N
+    M --> N
+    N --> F
+```
+
+其中 `alive_timeout = interval * threshold`（默认 10s × 3 = 30s）。
+
+### 10.5 探针函数
+
+```mermaid
+sequenceDiagram
+    participant T as 心跳线程
+    participant M as MasterService
+    participant P as KVSProbeFn
+    participant KVS as KVS 硬件
+
+    T->>M: ProbeKVSegment(device_name, &error_reason)
+    M->>M: 加 kvs_probe_fn_mutex_ 取出 probe_fn
+    M->>P: probe_fn(device_name, timeout_ms, &error_reason)
+    P->>KVS: 轻量级请求<br/>(读设备统计 / tiny put+get)
+
+    alt 硬件正常响应
+        KVS-->>P: 成功
+        P-->>M: true
+        M-->>T: true (健康)
+    else 硬件无响应或超时
+        KVS--xP: 失败/超时
+        P-->>M: false + error_reason
+        M-->>T: false (不健康)
+    end
+```
+
+探针函数通过 `KVSProbeFn` 注入，Master 不依赖具体驱动实现。超时控制由 `kvs_heartbeat_probe_timeout_ms_` 保证，探针实现由 KVTransport 层提供。
+
+### 10.6 故障处理
+
+```mermaid
+flowchart TD
+    A["HandleKVSegmentFailure(device_name)"] --> B["ForceUnmountSegment(device_name)"]
+    B --> B1["绕过 client_refs 检查"]
+    B1 --> B2["清空 client_refs"]
+    B2 --> B3["清理 client_segments_ 中所有引用"]
+    B3 --> B4["status = UNMOUNTING"]
+
+    B4 --> C["ClearInvalidHandles"]
+    C --> C1["遍历所有 ObjectMetadata"]
+    C1 --> C2["删除 device_name 匹配的 KVS 副本"]
+    C2 --> C3{"对象还有其他有效副本?"}
+    C3 -->|是| C4["保留对象，降级存活"]
+    C3 -->|否| C5["删除整个 key（数据丢失）"]
+
+    C4 --> D["CommitUnmountSegment"]
+    C5 --> D
+    D --> D1["从 mounted_segments_ 移除"]
+    D1 --> D2["扣减容量指标"]
+    D2 --> E["清理 kvs_heartbeat_states_ 中的条目"]
+```
+
+**为何不 Drain？** 故障设备不可达，读操作直接失败，数据无法迁移。强制卸载是硬件故障场景下的唯一正确选择。数据丢失是硬件故障的必然结果，系统能做的是：
+- 新写入不受影响（Master 自动分配到其他健康 KVS 段）
+- 有冗余的对象自动降级（清理失效副本，保留健康副本）
+- 无冗余的对象返回 `OBJECT_NOT_FOUND`
+
+### 10.7 故障后的自动恢复
+
+Client **不需要**显式处理 KVSegment 故障，通过现有机制自然切换：
+
+```mermaid
+flowchart TD
+    subgraph 场景1_新写入
+        A1["Client → PutStart(key, config)"] --> A2["Master: AllocateAndInsertMetadata"]
+        A2 --> A3["Allocate() 跳过非 OK 段"]
+        A3 --> A4["分配到其他健康 KVS 段"]
+        A4 --> A5["返回新 KVDescriptor<br/>{device_name=健康段, hash_key}"]
+    end
+
+    subgraph 场景2_读取已有数据
+        B1["Client → GetReplicaList(key)"] --> B2["Master 返回 ObjectMetadata<br/>中所有副本的 Descriptor"]
+        B2 --> B3{"故障段副本是否已清理?"}
+        B3 -->|已清理| B4{"对象有其他健康副本?"}
+        B3 -->|清理中| B5["返回含故障段的 Descriptor"]
+        B4 -->|有| B6["返回剩余健康副本"]
+        B4 -->|无| B7["返回 OBJECT_NOT_FOUND"]
+        B5 --> B8["Client 用 hash_key 读 KVS<br/>可能失败，可重试 GetReplicaList"]
+    end
+
+    subgraph 场景3_在途读操作
+        C1["Client 已拿到指向故障段的 descriptor"] --> C2["KVTransport.get() 硬件报错"]
+        C2 --> C3["Client 收到传输错误"]
+        C3 --> C4["重试 GetReplicaList 获取新副本"]
+    end
+```
 
 ---
 
@@ -531,7 +760,7 @@ stateDiagram-v2
 | `MountKVSegment`   | `KVSegment segment`                  | `int32_t error_code` |
 | `UnmountKVSegment` | `string device_name, UUID client_id` | `int32_t error_code` |
 
-**UnmountKVSegment 参数从 `UUID segment_id` 改为 `string device_name + UUID client_id`**，对应引用计数语义。
+`UnmountKVSegment` 参数从 `UUID segment_id` 改为 `string device_name + UUID client_id`，对应引用计数语义。
 
 ---
 
@@ -540,7 +769,12 @@ stateDiagram-v2
 | 指标                                               | 触发时机                             |
 | -------------------------------------------------- | ------------------------------------ |
 | `inc_total_kvs_capacity(segment_name, capacity)` | 首次挂载成功后                       |
-| `dec_total_kvs_capacity(segment_name, capacity)` | CommitUnmount 后（client_refs 归零） |
+| `dec_total_kvs_capacity(segment_name, capacity)` | CommitUnmount 后（client_refs 归零或强制卸载） |
+| `inc_kvs_heartbeat_success_total()`              | 心跳探测成功                         |
+| `inc_kvs_heartbeat_failure_total()`              | 心跳探测失败                         |
+| `inc_kvs_heartbeat_timeout_total()`              | 心跳超阈值，触发强制卸载             |
+| `observe_kvs_heartbeat_probe_latency_ms(ms)`    | 每次探测的延迟直方图                 |
+| `inc_kvs_segments_unmounted_by_heartbeat_total()` | 心跳故障导致强制卸载               |
 
 ---
 
@@ -550,17 +784,19 @@ stateDiagram-v2
 | --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | **不引入 BufferAllocator**                                      | KVS 硬件自行管理空间，master 只需跟踪容量，无需 slab/offset 分配器                                                      |
 | **复用 AllocationStrategyType 配置**                            | 策略语义一致（RANDOM / FREE\_RATIO\_FIRST），但逻辑直接操作 `remaining_size`，不经过 `BufferAllocatorBase`          |
-| **容量记录在 remaining_size**                                   | 省去中间抽象层，操作直接                                                                                                |
-| **Allocate() 内聚在 KVSegmentManager**                          | 分配逻辑简单，无需通过`AllocatorManager` 中转                                                                         |
+| **Allocate() 内聚在 KVSegmentManager**                          | 分配逻辑简单，无需通过 `AllocatorManager` 中转                                                                         |
 | **KVReplicaData 直接持有 device_name + object_size + hash_key** | Master 分配时计算 hash_key 存入，`get_descriptor()` 拷贝到 KVDescriptor。不需要 AllocatedBuffer 包装                  |
 | **独立 KVSegmentManager**                                       | 与 SegmentManager/NoFSegmentManager 平级，架构一致                                                                      |
-| **新增独立 RPC**                                                | 接口清晰，不与现有 RPC 耦合                                                                                             |
 | **不修改 allocator.h / allocation_strategy.h**                  | KVS 不经过这些组件，改动范围最小                                                                                        |
-| **hash_key 存入 KVDescriptor**                                  | 确定性哈希，映射关系由现有 key→ObjectMetadata 机制自然完成，无需额外映射表。Get 时用原始 key 查元数据即可获得 hash_key |
-| **mounted_segments_ 以 device_name 为 key**                     | `device_name` 是物理设备的唯一标识，`segment.id` 随机生成不具确定性，不适合做索引                                   |
+| **hash_key 存入 KVDescriptor**                                  | 确定性哈希，映射关系由现有 key→ObjectMetadata 机制自然完成，无需额外映射表                                              |
+| **mounted_segments_ 以 device_name 为 key**                     | `device_name` 是物理设备的唯一标识，`segment.id` 随机生成不具确定性，不适合做索引                                      |
 | **引入 client_refs 引用计数**                                   | 一个物理 SSD 设备可被多个 client 共享，使用引用计数管理生命周期                                                         |
 | **分配不过滤 client**                                           | 所有 client 共享同一组物理设备，任何 OK 状态的段都可分配                                                                |
 | **Unmount 参数改为 device_name + client_id**                    | 对应引用计数语义：卸载 = 减引用，而非直接销毁                                                                           |
+| **心跳故障直接强制卸载，不 Drain**                              | 故障设备不可达，数据无法读取也就无法迁移。强制卸载是硬件故障的唯一正确选择                                              |
+| **ForceUnmountSegment 绕过 client_refs**                        | 设备故障时所有 client 的在途操作都会失败，等待引用归零无意义。直接清空引用、卸载段、清理元数据，让新写入流向健康段      |
+| **探针函数用注入而非硬编码**                                    | KVS 硬件探针方式取决于具体驱动实现，Master 不应依赖具体驱动。通过 `KVSProbeFn` 注入，与 NoF 的 `NoFProbeFn` 模式一致   |
+| **Client 不感知 KVSegment 卸载**                                | Client 每次操作向 Master 请求 descriptor，死设备的 descriptor 会被 `ClearInvalidHandles` 清理。无需额外通知机制        |
 
 ---
 
@@ -568,22 +804,21 @@ stateDiagram-v2
 
 ### 14.1 方法总览
 
-| 方法                      | 与`ScopedSegmentAccess` 的差异                                                                                                      |
+| 方法                      | 与 `ScopedSegmentAccess` 的差异                                                                                                      |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `MountSegment`          | 参数类型不同（`KVSegment` vs `Segment`）；去重 key 不同（`device_name` vs `segment.id`）；支持引用计数语义（重复挂载返回 OK） |
-| `ReMountSegment`        | 同上，内部调用`MountSegment`                                                                                                        |
+| `ReMountSegment`        | 同上，内部调用 `MountSegment`                                                                                                        |
 | `PrepareUnmountSegment` | 参数不同（`device_name + client_id` vs `segment_id`）；引用计数语义；无 allocator 清理                                            |
 | `CommitUnmountSegment`  | 参数不同（`device_name` vs `segment_id + client_id`）；无 `client_by_name_`/`segment_id_by_name_` 清理                        |
-| `Allocate`              | **新增**，`ScopedSegmentAccess` 无此方法（普通 Segment 通过 `AllocatorManager` 分配）                                       |
+| `ForceUnmountSegment`   | **新增**，心跳故障专用：绕过 `client_refs` 检查，清空引用集合，直接置 `UNMOUNTING`                                              |
+| `Allocate`              | **新增**，普通 Segment 通过 `AllocatorManager` 分配                                                                       |
 | `Deallocate`            | **新增**，归还容量到 `remaining_size`                                                                                         |
 | `GetClientSegments`     | 返回类型不同（`vector<KVSegment>` vs `vector<Segment>`）                                                                          |
-| `GetAllSegments`        | 功能合并：返回所有`device_name`（不区分状态），不再区分 `GetAllSegments`/`GetAllSegmentNames`                                   |
-| `QuerySegments`         | 实现不同：通过`remaining_size` 计算，而非 `allocator_manager_`                                                                    |
+| `GetAllSegments`        | 功能合并：返回所有 `device_name`（不区分状态），不再区分 `GetAllSegments`/`GetAllSegmentNames`                                   |
+| `QuerySegments`         | 实现不同：通过 `remaining_size` 计算，而非 `allocator_manager_`                                                                    |
 | `GetRefCount`           | **新增**，查询 `client_refs` 大小                                                                                             |
 
 ### 14.2 方法详细说明
-
----
 
 #### `MountSegment`
 
@@ -591,19 +826,10 @@ stateDiagram-v2
 ErrorCode MountSegment(const KVSegment& segment, const UUID& client_id);
 ```
 
-**功能**：挂载一个 KVSegment。以 `device_name` 为唯一键查找是否已存在：
+挂载一个 KVSegment。以 `device_name` 为唯一键查找是否已存在：
 
 - 已存在 → 将 `client_id` 加入 `client_refs`，`remaining_size` 不变，返回 OK
 - 不存在 → 创建 `MountedKVSegment`，`client_refs = {client_id}`，`remaining_size = segment.size`，更新容量指标
-
-**与 `ScopedSegmentAccess::MountSegment` 差异**：
-
-- 参数类型 `KVSegment` 而非 `Segment`，无 `base`/`protocol`/`te_endpoint` 字段
-- 去重 key 为 `device_name`（string），而非 `segment.id`（UUID）
-- 不创建 `BufferAllocator`，不操作 `AllocatorManager`
-- 重复挂载不报错，而是增加引用计数
-
----
 
 #### `ReMountSegment`
 
@@ -611,11 +837,7 @@ ErrorCode MountSegment(const KVSegment& segment, const UUID& client_id);
 ErrorCode ReMountSegment(const std::vector<KVSegment>& segments, const UUID& client_id);
 ```
 
-**功能**：批量重新挂载 KVSegment，遍历 `segments` 逐个调用 `MountSegment`，忽略 `SEGMENT_ALREADY_EXISTS` 等非致命错误。
-
-**与 `ScopedSegmentAccess::ReMountSegment` 差异**：参数类型不同，内部调用的是 `ScopedKVSegmentAccess::MountSegment`。
-
----
+批量重新挂载 KVSegment，遍历 `segments` 逐个调用 `MountSegment`，忽略 `SEGMENT_ALREADY_EXISTS` 等非致命错误。
 
 #### `PrepareUnmountSegment`
 
@@ -623,18 +845,9 @@ ErrorCode ReMountSegment(const std::vector<KVSegment>& segments, const UUID& cli
 ErrorCode PrepareUnmountSegment(const std::string& device_name, const UUID& client_id, size_t& metrics_dec_capacity);
 ```
 
-**功能**：准备卸载一个 KVSegment。从 `client_refs` 中移除 `client_id`，同时清理 `client_segments_[client_id]` 中的记录：
+准备卸载一个 KVSegment。从 `client_refs` 中移除 `client_id`，同时清理 `client_segments_[client_id]` 中的记录：
 - `client_refs` 仍不为空 → 仅减引用，返回 OK（`metrics_dec_capacity = 0`）
 - `client_refs` 为空 → 设置 `status = UNMOUNTING`，`metrics_dec_capacity = segment.size`，返回 OK
-
-**与 `ScopedSegmentAccess::PrepareUnmountSegment` 差异**：
-
-- 查找 key 为 `device_name`（string），而非 `segment_id`（UUID）
-- 多一个 `client_id` 参数，用于引用计数减一
-- 不需要 `removeAllocator()` 和 `buf_allocator.reset()`
-- 不一定推进状态到 `UNMOUNTING`，取决于 `client_refs` 是否归零
-
----
 
 #### `CommitUnmountSegment`
 
@@ -642,15 +855,20 @@ ErrorCode PrepareUnmountSegment(const std::string& device_name, const UUID& clie
 ErrorCode CommitUnmountSegment(const std::string& device_name, const size_t& metrics_dec_capacity);
 ```
 
-**功能**：提交卸载，完成清理。从 `mounted_segments_` 中删除该 entry，扣减容量指标。**注意：`client_segments_` 已在 `PrepareUnmountSegment` 中清理完毕，此处不再需要遍历。**
+提交卸载，完成清理。从 `mounted_segments_` 中删除该 entry，扣减容量指标。`client_segments_` 已在 `PrepareUnmountSegment` 中清理完毕。
 
-**与 `ScopedSegmentAccess::CommitUnmountSegment` 差异**：
-- 查找 key 为 `device_name`（string），而非 `segment_id`（UUID）
-- 不需要 `client_id` 参数（此时 `client_refs` 已空）
-- 不需要清理 `client_by_name_`、`segment_id_by_name_`（已移除）
-- 不需要遍历 `client_segments_`（已在 `PrepareUnmountSegment` 中清理）
+#### `ForceUnmountSegment`
 
----
+```cpp
+ErrorCode ForceUnmountSegment(const std::string& device_name, size_t& metrics_dec_capacity);
+```
+
+强制卸载，心跳故障专用。绕过 `client_refs` 检查：
+1. 清空 `client_refs` 中的所有 client_id
+2. 清理 `client_segments_` 中所有引用该 `device_name` 的记录
+3. 设置 `status = UNMOUNTING`，`metrics_dec_capacity = segment.size`
+
+调用后需继续执行 `ClearInvalidHandles` + `CommitUnmountSegment` 完成清理。
 
 #### `Allocate`
 
@@ -666,11 +884,7 @@ std::vector<AllocResult> Allocate(size_t size, size_t count,
     AllocationStrategyType strategy);
 ```
 
-**功能**：在 KVS 段上分配空间。遍历所有 `status == OK` 的 segment，按策略选择，扣减 `remaining_size`。分配不限 client，所有 OK 段都是候选。
-
-**与 `ScopedSegmentAccess` 差异**：**新增方法**，原 `ScopedSegmentAccess` 无此方法。普通 Segment 的分配通过 `AllocatorManager` → `AllocationStrategy` → `BufferAllocator` 链路完成，不暴露在 `ScopedSegmentAccess` 中。
-
----
+在 KVS 段上分配空间。遍历所有 `status == OK` 的 segment，按策略选择，扣减 `remaining_size`。分配不限 client，所有 OK 段都是候选。
 
 #### `Deallocate`
 
@@ -678,11 +892,7 @@ std::vector<AllocResult> Allocate(size_t size, size_t count,
 void Deallocate(const std::string& device_name, size_t size);
 ```
 
-**功能**：归还空间，增加对应 segment 的 `remaining_size`。
-
-**与 `ScopedSegmentAccess` 差异**：**新增方法**。普通 Segment 通过 `BufferAllocator::Free()` 归还空间，KVS 无 `BufferAllocator`，直接在 `remaining_size` 上加回。
-
----
+归还空间，增加对应 segment 的 `remaining_size`。
 
 #### `GetClientSegments`
 
@@ -690,14 +900,7 @@ void Deallocate(const std::string& device_name, size_t size);
 ErrorCode GetClientSegments(const UUID& client_id, std::vector<KVSegment>& segments) const;
 ```
 
-**功能**：查询指定 client 引用了哪些 KVSegment，通过 `client_segments_` 找到 `device_name` 的 `set`，再在 `mounted_segments_` 中查找对应信息。
-
-**与 `ScopedSegmentAccess::GetClientSegments` 差异**：
-
-- 返回类型为 `vector<KVSegment>` 而非 `vector<Segment>`
-- 内部通过 `device_name`（string）查找，而非 `segment_id`（UUID）
-
----
+查询指定 client 引用了哪些 KVSegment，通过 `client_segments_` 找到 `device_name` 的 `set`，再在 `mounted_segments_` 中查找对应信息。
 
 #### `GetAllSegments`
 
@@ -705,15 +908,7 @@ ErrorCode GetClientSegments(const UUID& client_id, std::vector<KVSegment>& segme
 ErrorCode GetAllSegments(std::vector<std::string>& all_segments) const;
 ```
 
-**功能**：返回所有已挂载 KVSegment 的 `device_name` 列表（不区分状态）。**合并了原 `ScopedSegmentAccess` 中 `GetAllSegments`（过滤 OK）和 `GetAllSegmentNames`（不过滤）两个方法的功能，统一为返回全部。**
-
-**与 `ScopedSegmentAccess` 差异**：
-
-- 原版有两个重载：`GetAllSegments(vector<string>&)`（过滤 status==OK）和 `GetAllSegments(vector<pair<Segment, UUID>>&)`（不过滤，带 client_id）
-- 原版还有 `GetAllSegmentNames(vector<string>&)`（不过滤）
-- KVS 版简化为一个：返回所有 `device_name`，由调用方按需过滤
-
----
+返回所有已挂载 KVSegment 的 `device_name` 列表（不区分状态）。合并了原 `ScopedSegmentAccess` 中 `GetAllSegments`（过滤 OK）和 `GetAllSegmentNames`（不过滤）两个方法的功能。
 
 #### `QuerySegments`
 
@@ -721,14 +916,7 @@ ErrorCode GetAllSegments(std::vector<std::string>& all_segments) const;
 ErrorCode QuerySegments(const std::string& segment_name, size_t& used, size_t& capacity) const;
 ```
 
-**功能**：通过 `segment_name` 查询 KVSegment 的已用空间和总容量。`capacity = segment.size`，`used = capacity - remaining_size`。
-
-**与 `ScopedSegmentAccess::QuerySegments` 差异**：
-
-- 原版通过 `allocator_manager_` 获取所有 `<BufferAllocatorBase>`，累加 `size()` 和 `capacity()`
-- KVS 版直接通过 `segment.size` 和 `remaining_size` 计算，无需经过 allocator 层
-
----
+通过 `segment_name` 查询 KVSegment 的已用空间和总容量。`capacity = segment.size`，`used = capacity - remaining_size`。
 
 #### `GetRefCount`
 
@@ -736,6 +924,4 @@ ErrorCode QuerySegments(const std::string& segment_name, size_t& used, size_t& c
 size_t GetRefCount(const std::string& device_name) const;
 ```
 
-**功能**：查询指定 KVSegment 当前的引用计数（`client_refs` 大小）。
-
-**与 `ScopedSegmentAccess` 差异**：**新增方法**。原 `ScopedSegmentAccess` 中 segment 与 client 是 1:1 绑定，无需引用计数概念。
+查询指定 KVSegment 当前的引用计数（`client_refs` 大小）。
