@@ -619,7 +619,6 @@ classDiagram
 
     class KVSHeartbeatState {
         +string device_name
-        +string segment_name
         +time_point next_probe_at
         +time_point last_success_at
         +uint32 consecutive_failures
