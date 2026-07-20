@@ -6,6 +6,7 @@
 #include <sys/file.h>
 
 #ifdef USE_NDS
+#include <hf3fs/nds.h>
 #include "gpu_staging_utils.h"
 #endif
 
