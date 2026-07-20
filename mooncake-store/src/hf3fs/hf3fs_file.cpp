@@ -74,6 +74,10 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::write(std::span<const char> data,
             uint64_t hbm_buf = reinterpret_cast<uint64_t>(
                 data_ptr + total_bytes_written);
             nds_segment_info_t segment_info;
+            char eid_hex[33] = {0};
+            for (int i = 0; i < 16; ++i) {
+                snprintf(eid_hex + i * 2, 3, "%02x", segment_info.eid[i]);
+            }
             if (nds_get_segment_info(reinterpret_cast<void*>(hbm_buf),
                                     &segment_info) != 0) {
                 LOG(ERROR) << "nds_get_segment_info failed" << hbm_buf;
@@ -87,10 +91,6 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::write(std::span<const char> data,
                 return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
             }
 
-            char eid_hex[33] = {0};
-            for (int i = 0; i < 16; ++i) {
-                snprintf(eid_hex + i * 2, 3, "%02x", segment_info.eid[i]);
-            }
             LOG(INFO) << "NDS segment_info: eid=0x" << eid_hex
                       << " uasid=" << segment_info.uasid
                       << " jetty_id=" << segment_info.jetty_id
@@ -274,6 +274,10 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov,
                 static_cast<char*>(current_iov->iov_base) +
                 current_iov_offset);
             nds_segment_info_t segment_info;
+            char eid_hex[33] = {0};
+            for (int i = 0; i < 16; ++i) {
+                snprintf(eid_hex + i * 2, 3, "%02x", segment_info.eid[i]);
+            }
             if (nds_get_segment_info(reinterpret_cast<void*>(hbm_buf),
                                     &segment_info) != 0) {
                 LOG(ERROR) << "nds_get_segment_info failed, addr=" << hbm_buf;
@@ -282,15 +286,10 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov,
                     << " jetty_id=" << segment_info.jetty_id
                     << " token_id=" << segment_info.token_id
                     << " addr=0x" << std::hex << hbm_buf << std::dec
-                    << " offset=" << current_offset
-                    << " chunk_size=" << chunk_size;
+                    << " offset=" << current_offset;
                 return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
             }
 
-            char eid_hex[33] = {0};
-            for (int i = 0; i < 16; ++i) {
-                snprintf(eid_hex + i * 2, 3, "%02x", segment_info.eid[i]);
-            }
             LOG(INFO) << "NDS segment_info: eid=0x" << eid_hex
                       << " uasid=" << segment_info.uasid
                       << " jetty_id=" << segment_info.jetty_id
@@ -432,6 +431,10 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_read(const iovec* iov,
                 static_cast<char*>(current_iov->iov_base) +
                 current_iov_offset);
             nds_segment_info_t segment_info;
+            char eid_hex[33] = {0};
+            for (int i = 0; i < 16; ++i) {
+                snprintf(eid_hex + i * 2, 3, "%02x", segment_info.eid[i]);
+            }
             if (nds_get_segment_info(reinterpret_cast<void*>(hbm_buf),
                                     &segment_info) != 0) {
                 LOG(ERROR) << "nds_get_segment_info failed, addr=" << hbm_buf;
@@ -440,14 +443,8 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_read(const iovec* iov,
                     << " jetty_id=" << segment_info.jetty_id
                     << " token_id=" << segment_info.token_id
                     << " addr=0x" << std::hex << hbm_buf << std::dec
-                    << " offset=" << current_offset
-                    << " chunk_size=" << chunk_size;
+                    << " offset=" << current_offset;
                 return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
-            }
-
-            char eid_hex[33] = {0};
-            for (int i = 0; i < 16; ++i) {
-                snprintf(eid_hex + i * 2, 3, "%02x", segment_info.eid[i]);
             }
             LOG(INFO) << "NDS segment_info: eid=0x" << eid_hex
                       << " uasid=" << segment_info.uasid
