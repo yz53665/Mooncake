@@ -4,6 +4,8 @@
 
 This RFC proposes adding a **NDS (NPU Direct Storage) branch** parallel to the existing GDS (GPU Direct Storage) path inside `nvmeof_transport`. With this branch, inference/training workloads running on Ascend NPU (HBM) can directly access remote SSD pools over NVMe-oF, just as NVIDIA GPUs do via GDS, thereby extending the capacity ceiling of KV Cache.
 
+It should be noted up front that **the current GDS reference implementation in the repository is itself incomplete**: it provides only the minimal runnable transport-layer path (`CuFileContext` handle registration, `CUFileDescPool` batch submission, `CUfileIOEvents_t`-based status query) and expects users to discover and mount remote NVMe-oF targets manually. It lacks automated segment lifecycle management, heartbeat detection, replica placement policies, and other higher-level capabilities. Accordingly, this proposal introduces the NDS branch at the same "reference implementation" level as the existing GDS path; the two coexist in parallel, and the upper-layer capabilities can be filled in by the community later.
+
 This proposal is complementary to, but does not overlap with, two existing community efforts:
 
 - [#1940 SSD pool over NVMe-oF (SPDK path)](https://github.com/kvcache-ai/Mooncake/issues/1940): routes the storage backend through an in-house SPDK wrapper on the host side, and reworks LMCache memory into huge pages + `cudaHostRegister` to achieve zero-copy.
@@ -281,53 +283,111 @@ flowchart TD
 
 ### 5.4 End-to-End Data Flow (NDS path)
 
+This subsection describes the end-to-end data flow of a single read/write request on the NDS path, in order to clarify the responsibility boundaries of each component and the "direct access" semantics.
+
+**Participants**
+
+- **NPU (Ascend)**: the physical NPU card; its HBM is where KV Cache data actually resides. The HBM buffer is registered with the NDS library via `nds_buf_register` during initialization, after which NDS can issue DMA directly against that address.
+- **Host Process**: the user-space process running `mooncake-transfer-engine`, containing three components:
+  - `NVMeoFTransport`: decomposes upper-layer `TransferRequest`s into a number of `Slice`s, each describing a (HBM address, file offset, length) mapping;
+  - `NdsWorkerThreadPool`: an asynchronous executor that maintains a task queue and a set of worker threads, converting Slices into `nds_read / nds_write` calls;
+  - `NdsFileContext`: holds the target file `fd` and the NDS handle `nds_Handle`, the context required by workers when invoking the NDS API.
+- **Storage Backend**: the remote NVMe-oF target / SSD Pool, exposed to the host as a block-device file path.
+
+**Key points of the data flow**
+
+1. **Control flow goes through the host; data flow does not.** `NVMeoFTransport` and `NdsWorkerThreadPool` both run on the host CPU, but they only perform "task decomposition" and "NDS API invocation". The actual data-carrying DMA is performed by the NDS library directly between NPU HBM and the NVMe-oF target, **bypassing host memory**, achieving zero-copy semantics symmetric with GDS.
+2. **File handles are opened by the host.** `NdsFileContext` obtains a host-side `fd` via `open(filename, O_RDWR)`, then converts it to an NDS handle via `nds_file_register(fd)`. This is a control-plane operation and involves no data copy.
+3. **Who executes the NDS API.** Once a worker thread holds the `nds_Handle` and the registered HBM address, it calls `nds_read / nds_write`. The returned `ssize_t` indicates the number of bytes actually transferred; the worker uses it to update the Slice state.
+4. **Symmetry with the GDS path.** In the GDS path, `cuFileBatchIOSubmit` performs DMA directly between GPU memory and the NVMe-oF target; in the NDS path, `nds_read / nds_write` performs DMA directly between HBM and the NVMe-oF target. Both bypass host DRAM; the only differences are the underlying library and the target device.
+
 ```mermaid
 flowchart LR
     subgraph NPU["NPU (Ascend)"]
-        HBM[HBM memory<br/>nds_buf_register]
+        HBM[HBM memory<br/>registered via nds_buf_register]
     end
-    subgraph Host["Host Process"]
-        NVT[NVMeoFTransport]
-        TP[NdsWorkerThreadPool]
+    subgraph Host["Host Process (control plane)"]
+        NVT[NVMeoFTransport<br/>decompose TransferRequest → Slice]
+        TP[NdsWorkerThreadPool<br/>async nds_read/nds_write]
         Ctx[NdsFileContext<br/>fd + nds_Handle]
     end
-    subgraph Backend["Storage Backend"]
-        NVME[(NVMe-oF Target)]
+    subgraph Backend["Storage Backend (data plane)"]
+        NVME[(NVMe-oF Target / SSD Pool)]
     end
 
-    HBM -->|nds_read/nds_write| NVME
-    NVT --> TP
-    TP --> Ctx
-    Ctx -. open file .-> NVME
-    TP -. HBM direct transfer .-> NVME
+    App[Application<br/>submitTransfer] --> NVT
+    NVT -->|Slice| TP
+    NVT -->|open + register| Ctx
+    Ctx -->|provides nds_Handle| TP
+    Ctx -. open(fd) .-> NVME
+    TP -->|calls nds_read/nds_write| NDS_API[NDS Lib<br/>drives DMA]
+    HBM ==>|direct DMA<br/>no host DRAM detour| NVME
 ```
 
-## 6. File Structure
+**Comparison with the GDS path**
+
+| Stage | GDS path | NDS path |
+| --- | --- | --- |
+| Memory registration | `cuFileBufRegister` registers GPU memory | `nds_buf_register` registers HBM |
+| File handle | `cuFileHandleRegister` registers fd | `nds_file_register` registers fd |
+| Data transfer | `cuFileBatchIOSubmit` batched DMA | `nds_read / nds_write` single DMA |
+| Control flow location | host CPU | host CPU |
+| Data flow path | GPU memory ↔ NVMe-oF target | NPU HBM ↔ NVMe-oF target |
+
+## 6. Core API Comparison: GDS vs. NDS
+
+This section compares the key APIs used by the two paths at the transport layer, explaining their functional correspondences and differences, so that reviewers can quickly grasp what "parallel" means for the NDS branch.
+
+### 6.1 API Mapping Table
+
+| Stage | GDS API (NVIDIA) | NDS API (Ascend) | Notes |
+| --- | --- | --- | --- |
+| Driver init | `cuFileDriverOpen()` | `nds_init(device_id)` | NDS takes an explicit `device_id`, aligned with multi-card scenarios |
+| Driver deinit | `cuFileDriverClose()` | `nds_deinit(device_id)` | — |
+| Device memory register | `cuFileBufRegister(addr, len, flags)` | `nds_buf_register(device_id, buf, len)` | NDS also takes the HBM address as input |
+| Device memory deregister | `cuFileBufDeregister(addr)` | `nds_buf_deregister(device_id, buf)` | — |
+| File handle register | `cuFileHandleRegister(&handle, &desc)` | `nds_file_register(fd)` | NDS takes fd directly and returns `nds_Handle` |
+| File handle deregister | `cuFileHandleDeregister(handle)` | `nds_file_deregister(fd)` | NDS uses fd as the key |
+| Single read | `cuFileRead(handle, buf, len, offset, ...)` | `nds_read(handle, device_id, buf, len, offset)` | NDS requires explicit `device_id` |
+| Single write | `cuFileWrite(handle, buf, len, offset, ...)` | `nds_write(handle, buf, len, offset)` | — |
+| Batch submit | `cuFileBatchIOSetUp / cuFileBatchIOSubmit` | (not yet provided) | NDS currently has no batch API; replaced by thread pool + task queue |
+| Batch status query | `cuFileBatchIOGetStatus` | (not yet provided) | NDS path aggregates via `task.success/failed_slice_count` |
+
+### 6.2 Correspondence Diagram
 
 ```mermaid
 graph LR
-    subgraph "include/transport/nvmeof_transport/"
-        H1[nds.h<br/>NDS C API declaration]
-        H2[nds_context.h<br/>NdsFileContext]
-        H3[cufile_context.h<br/>existing GDS]
-        H4[cufile_desc_pool.h<br/>existing GDS]
-        H5[nvmeof_transport.h<br/>compile-time branch]
+    subgraph GDS["GDS path"]
+        G1[cuFileDriverOpen]
+        G2[cuFileBufRegister]
+        G3[cuFileHandleRegister]
+        G4[cuFileBatchIOSetUp]
+        G5[cuFileBatchIOSubmit]
+        G6[cuFileBatchIOGetStatus]
+        G1 --> G2 --> G3 --> G4 --> G5 --> G6
     end
-    subgraph "src/transport/nvmeof_transport/"
-        S1[nvmeof_transport.cpp<br/>dual-branch impl]
-        S2[cufile_context.cpp<br/>existing GDS]
-        S3[cufile_desc_pool.cpp<br/>existing GDS]
-        S4[CMakeLists.txt<br/>USE_NDS switch]
+    subgraph NDS["NDS path"]
+        N1[nds_init]
+        N2[nds_buf_register]
+        N3[nds_file_register]
+        N4[WorkerThreadPool<br/>task queue]
+        N5[nds_read/nds_write]
+        N6[success/failed_slice_count<br/>aggregation]
+        N1 --> N2 --> N3 --> N4 --> N5 --> N6
     end
-    H5 --> H3
-    H5 --> H4
-    H5 --> H2
-    H2 --> H1
-    S1 --> H5
-    S1 --> S2
-    S1 --> S3
-    S4 --> S1
+    G1 -. corresponds .-> N1
+    G2 -. corresponds .-> N2
+    G3 -. corresponds .-> N3
+    G4 -. replaced by .-> N4
+    G5 -. replaced by .-> N5
+    G6 -. replaced by .-> N6
 ```
+
+### 6.3 Design Differences
+
+- **Device identification**: GDS determines the device implicitly via the CUDA context; NDS takes an explicit `device_id` on every API, which is convenient for precise routing in multi-NPU configurations.
+- **Batch capability**: GDS provides a full batch submit/query API, allowing multiple IO segments to be completed in a single syscall. NDS currently provides only single-shot read/write; this proposal compensates with a thread-pool concurrency model. Once NDS exposes a batch API, the switch can be made smoothly (see Section 9, Future Work).
+- **Handle semantics**: GDS's `CUfileHandle_t` is an opaque pointer; NDS's `nds_Handle` is also opaque, but its lifetime is bound to the fd, and deregistration is keyed by fd.
 
 ## 7. Configuration and Observability
 
@@ -345,7 +405,7 @@ On the NDS path, status queries directly aggregate `task.success_slice_count / f
 
 - Complementary to #1940 / #2084: this proposal focuses on NPU direct access at the transport layer and does not touch the store-layer NoF segment management, heartbeat, or SSD registration scripts. Those capabilities can be provided by #1940 / #2084 and stacked with this work.
 - No changes to the existing GDS branch: `CuFileContext` and `CUFileDescPool` remain as-is; existing users see no behavioral or compilation changes.
-- No replacement of LMCache pinned memory: we avoid the `cudaHostAlloc` → SPDK huge page + `cudaHostRegister` rework from #1940, reducing cross-component coupling.
+- No replacement of LMCache pinned memory: to meet SPDK's huge-page requirement, #1940 reworks LMCache's `cudaHostAlloc()` into "SPDK allocates huge pages + `cudaHostRegister()`". On the NDS path, data is DMA'd directly between NPU HBM and the NVMe-oF target without touching host CPU memory, so LMCache's existing allocation logic does not need to be modified, reducing cross-component coupling.
 
 ## 9. Future Work
 

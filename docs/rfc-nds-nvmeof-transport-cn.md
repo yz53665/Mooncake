@@ -4,6 +4,8 @@
 
 本 RFC 提议在现有的 `nvmeof_transport` 中增加一条与 GDS（GPU Direct Storage）平行的 **NDS（NPU Direct Storage）分支**，使得基于昇腾 NPU（HBM）的推理/训练场景也能像 NVIDIA GPU + GDS 一样，直接通过 NVMe-oF 访问远端 SSD Pool，从而扩展 KV Cache 的容量上限。
 
+需要先指出的是，**当前仓库中的 GDS 参考实现本身并不完善**：它仅提供 transport 层的最小可运行路径（`CuFileContext` 句柄注册、`CUFileDescPool` 批量提交、基于 `CUfileIOEvents_t` 的状态查询），要求用户自行发现并挂载远端 NVMe-oF target，缺少自动化的 segment 生命周期管理、心跳检测、副本放置策略等上层能力。因此，本提案以"参考实现"的同等定位引入 NDS 分支，与既有 GDS 路径并列共存，后续可由社区共同补齐上层能力。
+
 本提案与社区已有的两条相关工作互补但不重叠：
 
 - [#1940 SSD pool over NVMe-oF (SPDK 路线)](https://github.com/kvcache-ai/Mooncake/issues/1940)：在 host 侧通过 SPDK wrapper 走存储后端，并改造 LMCache 内存为 huge page + `cudaHostRegister` 以实现 zero-copy。
@@ -36,15 +38,15 @@
 
 ### 2.3 与 #1940 / #2084 的对比
 
-| 维度 | #1940 / #2084 (SPDK 路线) | 本提案 (NDS 路线) |
-| --- | --- | --- |
-| 适用硬件 | NVIDIA GPU（仍依赖 CUDA） | 昇腾 NPU（基于 NDS 用户态库） |
-| 存储后端接入方式 | 自研 `SpdkWrapper` + `SpdkNofWorkerPool` | 复用 NDS C API，无 SPDK 依赖 |
-| Host 内存改造 | 需把 LMCache pinned memory 改为 SPDK huge page + `cudaHostRegister` | 不改动，NPU HBM 直接经 NDS 落盘 |
-| Segment 管理 | 新增 `NoFSegmentManager`、心跳、注册脚本等 | 复用既有 `nvmeof_buffers` 与 `SegmentDesc` |
-| Transport 改动 | 新增 store 层模块 | 仅在 `nvmeof_transport` 内部新增平行分支 |
-| 与 GDS 关系 | 替代/并行于既有 transport | 与 GDS 完全平行，编译宏切换 |
-| 风险面 | 较大（内存管理 + SPDK 部署） | 较小（仅 transport 内部分支） |
+| 维度             | #1940 / #2084 (SPDK 路线)                                            | 本提案 (NDS 路线)                             |
+| ---------------- | -------------------------------------------------------------------- | --------------------------------------------- |
+| 适用硬件         | NVIDIA GPU（仍依赖 CUDA）                                            | 昇腾 NPU（基于 NDS 用户态库）                 |
+| 存储后端接入方式 | 自研`SpdkWrapper` + `SpdkNofWorkerPool`                          | 复用 NDS C API，无 SPDK 依赖                  |
+| Host 内存改造    | 需把 LMCache pinned memory 改为 SPDK huge page +`cudaHostRegister` | 不改动，NPU HBM 直接经 NDS 落盘               |
+| Segment 管理     | 新增`NoFSegmentManager`、心跳、注册脚本等                          | 复用既有`nvmeof_buffers` 与 `SegmentDesc` |
+| Transport 改动   | 新增 store 层模块                                                    | 仅在`nvmeof_transport` 内部新增平行分支     |
+| 与 GDS 关系      | 替代/并行于既有 transport                                            | 与 GDS 完全平行，编译宏切换                   |
+| 风险面           | 较大（内存管理 + SPDK 部署）                                         | 较小（仅 transport 内部分支）                 |
 
 ## 3. 总体架构
 
@@ -281,62 +283,90 @@ flowchart TD
 
 ### 5.4 NDS 路径整体数据流
 
+本节描述一次完整的 read/write 请求在 NDS 路径下的端到端数据流向，用于说明各组件的职责边界与"直连"语义。
+
+**参与角色**
+
+- **NPU (Ascend)**：物理 NPU 卡，其 HBM 是 KV Cache 数据的实际驻留位置。HBM 缓冲区在初始化阶段通过 `nds_buf_register` 注册到 NDS 库，NDS 后续可直接对该地址发起 DMA。
+- **Host Process**：运行 `mooncake-transfer-engine` 的用户态进程，包含三个组件：
+  - `NVMeoFTransport`：负责将上层 `TransferRequest` 分解为若干 `Slice`，每个 Slice 描述一段 (HBM 地址, 文件偏移, 长度) 的映射；
+  - `NdsWorkerThreadPool`：异步执行器，维护一个任务队列与一组 worker 线程，把 Slice 转化为 `nds_read / nds_write` 调用；
+  - `NdsFileContext`：持有目标文件 `fd` 与 NDS 句柄 `nds_Handle`，是 worker 调用 NDS API 时必须的上下文。
+- **Storage Backend**：远端 NVMe-oF target / SSD Pool，对 host 表现为一个块设备文件路径。
+
+**数据流要点**
+
+1. **控制流经 host，数据流不经过 host**：`NVMeoFTransport` 与 `NdsWorkerThreadPool` 都运行在 host CPU 上，但它们只负责"任务分解"和"调用 NDS API"；真正搬运数据的 DMA 由 NDS 库在 NPU HBM 与 NVMe-oF target 之间直接完成，**不经过 host 内存中转**，从而实现与 GDS 对称的 zero-copy 语义。
+2. **文件句柄由 host 打开**：`NdsFileContext` 通过 `open(filename, O_RDWR)` 获得宿主机视角的 `fd`，再经 `nds_file_register(fd)` 转换为 NDS 句柄。这一步是控制面操作，不涉及数据拷贝。
+3. **NDS API 的执行者**：worker 线程在持有 `nds_Handle` 与已注册的 HBM 地址后，调用 `nds_read / nds_write`；返回 `ssize_t` 表示实际传输字节数，worker 据此更新 Slice 状态。
+4. **与 GDS 路径的对称性**：GDS 路径下 `cuFileBatchIOSubmit` 在 GPU 显存与 NVMe-oF target 间直接 DMA；NDS 路径下 `nds_read / nds_write` 在 HBM 与 NVMe-oF target 间直接 DMA。两者都绕过 host DRAM，差别仅在底层库与目标设备。
+
 ```mermaid
 flowchart LR
     subgraph NPU["NPU (Ascend)"]
-        HBM[HBM 显存<br/>nds_buf_register]
+        HBM[HBM 显存<br/>nds_buf_register 注册]
     end
-    subgraph Host["Host Process"]
-        NVT[NVMeoFTransport]
-        TP[NdsWorkerThreadPool]
+    subgraph Host["Host Process (控制面)"]
+        NVT[NVMeoFTransport<br/>分解 TransferRequest → Slice]
+        TP[NdsWorkerThreadPool<br/>异步执行 nds_read/nds_write]
         Ctx[NdsFileContext<br/>fd + nds_Handle]
     end
-    subgraph Backend["Storage Backend"]
-        NVME[(NVMe-oF Target)]
+    subgraph Backend["Storage Backend (数据面)"]
+        NVME[(NVMe-oF Target / SSD Pool)]
     end
 
-    HBM -->|nds_read/nds_write| NVME
-    NVT --> TP
-    TP --> Ctx
-    Ctx -. 打开文件 .-> NVME
-    TP -. HBM 直传 .-> NVME
+    App[Application<br/>submitTransfer] --> NVT
+    NVT -->|Slice| TP
+    NVT -->|open + register| Ctx
+    Ctx -->|提供 nds_Handle| TP
+    Ctx -. open(fd) .-> NVME
+    TP -->|调用 nds_read/nds_write| NDS_API[NDS Lib<br/>驱动 DMA]
+    HBM ==>|DMA 直传<br/>不经过 host DRAM| NVME
 ```
 
-## 6. 文件结构
+**与 GDS 路径的对照**
 
-```mermaid
-graph LR
-    subgraph "include/transport/nvmeof_transport/"
-        H1[nds.h<br/>NDS C API 声明]
-        H2[nds_context.h<br/>NdsFileContext]
-        H3[cufile_context.h<br/>既有 GDS]
-        H4[cufile_desc_pool.h<br/>既有 GDS]
-        H5[nvmeof_transport.h<br/>编译宏分支]
-    end
-    subgraph "src/transport/nvmeof_transport/"
-        S1[nvmeof_transport.cpp<br/>双分支实现]
-        S2[cufile_context.cpp<br/>既有 GDS]
-        S3[cufile_desc_pool.cpp<br/>既有 GDS]
-        S4[CMakeLists.txt<br/>USE_NDS 开关]
-    end
-    H5 --> H3
-    H5 --> H4
-    H5 --> H2
-    H2 --> H1
-    S1 --> H5
-    S1 --> S2
-    S1 --> S3
-    S4 --> S1
-```
+| 阶段       | GDS 路径                            | NDS 路径                          |
+| ---------- | ----------------------------------- | --------------------------------- |
+| 内存注册   | `cuFileBufRegister` 注册 GPU 显存 | `nds_buf_register` 注册 HBM     |
+| 文件句柄   | `cuFileHandleRegister` 注册 fd    | `nds_file_register` 注册 fd     |
+| 数据搬运   | `cuFileBatchIOSubmit` 批量 DMA    | `nds_read / nds_write` 单次 DMA |
+| 控制流位置 | host CPU                            | host CPU                          |
+| 数据流路径 | GPU 显存 ↔ NVMe-oF target          | NPU HBM ↔ NVMe-oF target         |
+
+## 6. GDS 与 NDS 核心 API 对比
+
+本节对照两条路径在 transport 层使用的关键 API，说明其在功能上的对应关系与差异，便于评审者快速理解 NDS 分支的"平行"含义。
+
+### 6.1 API 对照表
+
+| 阶段         | GDS API (NVIDIA)                               | NDS API (Ascend)                                  | 说明                                                 |
+| ------------ | ---------------------------------------------- | ------------------------------------------------- | ---------------------------------------------------- |
+| 驱动初始化   | `cuFileDriverOpen()`                         | `nds_init(device_id)`                           | NDS 显式接收`device_id`，与多卡场景对齐            |
+| 驱动释放     | `cuFileDriverClose()`                        | `nds_deinit(device_id)`                         | —                                                   |
+| 设备内存注册 | `cuFileBufRegister(addr, len, flags)`        | `nds_buf_register(device_id, buf, len)`         | NDS 同样以 HBM 地址为输入                            |
+| 设备内存注销 | `cuFileBufDeregister(addr)`                  | `nds_buf_deregister(device_id, buf)`            | —                                                   |
+| 文件句柄注册 | `cuFileHandleRegister(&handle, &desc)`       | `nds_file_register(fd)`                         | NDS 直接接收 fd，返回`nds_Handle`                  |
+| 文件句柄注销 | `cuFileHandleDeregister(handle)`             | `nds_file_deregister(fd)`                       | NDS 以 fd 为索引                                     |
+| 单次读       | `cuFileRead(handle, buf, len, offset, ...)`  | `nds_read(handle, device_id, buf, len, offset)` | NDS 显式传入`device_id`                            |
+| 单次写       | `cuFileWrite(handle, buf, len, offset, ...)` | `nds_write(handle, buf, len, offset)`           | —                                                   |
+| 批量提交     | `cuFileBatchIOSetUp / cuFileBatchIOSubmit`   | (暂未提供)                                        | NDS 当前无 batch API，由线程池+任务队列替代          |
+| 批量状态查询 | `cuFileBatchIOGetStatus`                     | (暂未提供)                                        | NDS 路径通过`task.success/failed_slice_count` 聚合 |
+
+### 6.2 设计差异说明
+
+- **设备标识**：GDS 通过 CUDA context 隐式确定设备；NDS 在每个 API 显式传入 `device_id`，便于在多 NPU 卡场景下精确路由。
+- **批量能力**：GDS 提供完整的 batch 提交/查询 API，可在一次 syscall 内完成多段 IO；NDS 当前仅提供单次 read/write，本提案以线程池并发弥补，待 NDS 后续提供 batch API 后可平滑切换（见第 9 节后续工作）。
+- **句柄语义**：GDS 的 `CUfileHandle_t` 是不透明指针；NDS 的 `nds_Handle` 同样为不透明指针，但其生命周期与 fd 绑定，注销时以 fd 为索引。
 
 ## 7. 配置与可观测性
 
 通过环境变量进行运行时配置（无需改代码）：
 
-| 环境变量 | 含义 | 默认值 |
-| --- | --- | --- |
-| `USE_NDS`（编译期） | 启用 NDS 分支 | `OFF` |
-| `MC_NDS_DEVICE_ID` | NPU device id | `-1`（不初始化） |
+| 环境变量                    | 含义              | 默认值              |
+| --------------------------- | ----------------- | ------------------- |
+| `USE_NDS`（编译期）       | 启用 NDS 分支     | `OFF`             |
+| `MC_NDS_DEVICE_ID`        | NPU device id     | `-1`（不初始化）  |
 | `MC_NDS_THREAD_POOL_SIZE` | NDS worker 线程数 | `8`（范围 1–64） |
 
 状态查询在 NDS 路径下直接基于 `task.success_slice_count / failed_slice_count` 聚合，与 GDS 路径基于 `CUfileIOEvents_t` 的查询语义保持一致（参见 5.3）。
@@ -345,7 +375,7 @@ graph LR
 
 - 与 #1940 / #2084 互补：本提案聚焦 transport 层的 NPU 直连，不触及 store 层的 NoF segment 管理、心跳、SSD 注册脚本，这些能力可由 #1940 / #2084 提供，二者可叠加使用。
 - 不修改既有 GDS 分支：`CuFileContext`、`CUFileDescPool` 保持原样，存量用户编译/行为不变。
-- 不替换 LMCache pinned memory：避免 #1940 中 `cudaHostAlloc` → SPDK huge page + `cudaHostRegister` 的改造，降低跨组件耦合。
+- 不替换 LMCache pinned memory：#1940 为满足 SPDK 的 huge page 要求，将 LMCache 的 `cudaHostAlloc()` 改造为「SPDK 分配 huge page + `cudaHostRegister()`」。NDS 路径下数据直接在 NPU HBM 与 NVMe-oF target 间 DMA，不经过 host CPU 内存，因此无需触动 LMCache 的既有分配逻辑，降低跨组件耦合。
 
 ## 9. 后续工作
 
