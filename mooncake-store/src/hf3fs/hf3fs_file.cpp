@@ -7,7 +7,6 @@
 
 #ifdef USE_NDS
 #include "gpu_staging_utils.h"
-#include "nds.h"
 #endif
 
 namespace mooncake {
