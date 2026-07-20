@@ -100,8 +100,8 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::write(std::span<const char> data,
                       << " chunk_size=" << chunk_size;
 
             int ret = hf3fs_prep_npu_direct_io(
-                &ior_write, false, hbm_buf,
-                &segment_info, fd_, current_offset,
+                &ior_write, false, fd_, current_offset, chunk_size,
+                &segment_info, reinterpret_cast<void*>(hbm_buf),
                 chunk_size, nullptr);
             if (ret < 0) {
                 return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
@@ -298,9 +298,10 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov,
                       << " offset=" << current_offset
                       << " len=" << avail_in_iov;
 
-            int ret = hf3fs_prep_npu_direct_io(&ior_write, false, hbm_buf,
-                                     &segment_info, fd_, current_offset,
-                                     avail_in_iov, nullptr);
+            int ret = hf3fs_prep_npu_direct_io(
+                &ior_write, false, fd_, current_offset, avail_in_iov,
+                &segment_info, reinterpret_cast<void*>(hbm_buf),
+                avail_in_iov, nullptr);
             if (ret < 0) {
                 return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
             }
@@ -454,9 +455,10 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_read(const iovec* iov,
                       << " offset=" << current_offset
                       << " len=" << avail_in_iov;
 
-            int ret = hf3fs_prep_npu_direct_io(&ior_read, true, hbm_buf,
-                                     &segment_info, fd_, current_offset,
-                                     avail_in_iov, nullptr);
+            int ret = hf3fs_prep_npu_direct_io(
+                &ior_read, true, fd_, current_offset, avail_in_iov,
+                &segment_info, reinterpret_cast<void*>(hbm_buf),
+                avail_in_iov, nullptr);
             if (ret < 0) {
                 return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
             }
