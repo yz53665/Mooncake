@@ -7,6 +7,7 @@
 
 #ifdef USE_NDS
 #include "gpu_staging_utils.h"
+#include "nds.h"
 #endif
 
 namespace mooncake {
@@ -70,10 +71,37 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::write(std::span<const char> data,
         if (gpu_staging::IsDevicePointer(
                 const_cast<char*>(data_ptr + total_bytes_written), nullptr)) {
             // HBM direct write: skip memcpy, use hf3fs_prep_npu
+            uint64_t hbm_buf = reinterpret_cast<uint64_t>(
+                data_ptr + total_bytes_written);
+            nds_segment_info_t segment_info;
+            if (nds_get_segment_info(reinterpret_cast<void*>(hbm_buf),
+                                    &segment_info) != 0) {
+                LOG(ERROR) << "nds_get_segment_info failed" << hbm_buf;
+                LOG(ERROR) << "eid=0x" << eid_hex
+                    << " uasid=" << segment_info.uasid
+                    << " jetty_id=" << segment_info.jetty_id
+                    << " token_id=" << segment_info.token_id
+                    << " addr=0x" << std::hex << hbm_buf << std::dec
+                    << " offset=" << current_offset
+                    << " chunk_size=" << chunk_size;
+                return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+            }
+
+            char eid_hex[33] = {0};
+            for (int i = 0; i < 16; ++i) {
+                snprintf(eid_hex + i * 2, 3, "%02x", segment_info.eid[i]);
+            }
+            LOG(INFO) << "NDS segment_info: eid=0x" << eid_hex
+                      << " uasid=" << segment_info.uasid
+                      << " jetty_id=" << segment_info.jetty_id
+                      << " token_id=" << segment_info.token_id
+                      << " addr=0x" << std::hex << hbm_buf << std::dec
+                      << " offset=" << current_offset
+                      << " chunk_size=" << chunk_size;
+
             int ret = hf3fs_prep_npu(
-                &ior_write, false,
-                reinterpret_cast<uint64_t>(data_ptr + total_bytes_written),
-                0 /* device_eid */, 0 /* ib_dev_id */, fd_, current_offset,
+                &ior_write, false, hbm_buf,
+                &segment_info, fd_, current_offset,
                 chunk_size, nullptr);
             if (ret < 0) {
                 return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
@@ -242,14 +270,38 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov,
         if (gpu_staging::IsDevicePointer(current_iov->iov_base, nullptr)) {
             // HBM direct write: entire iov segment in one hf3fs_prep_npu call
             // TODO NDS: NDS场景下直传，无需iov拷贝动作
-            uint64_t hbm_addr = reinterpret_cast<uint64_t>(
+            uint64_t hbm_buf = reinterpret_cast<uint64_t>(
                 static_cast<char*>(current_iov->iov_base) +
                 current_iov_offset);
+            nds_segment_info_t segment_info;
+            if (nds_get_segment_info(reinterpret_cast<void*>(hbm_buf),
+                                    &segment_info) != 0) {
+                LOG(ERROR) << "nds_get_segment_info failed, addr=" << hbm_buf;
+                LOG(ERROR) << "eid=0x" << eid_hex
+                    << " uasid=" << segment_info.uasid
+                    << " jetty_id=" << segment_info.jetty_id
+                    << " token_id=" << segment_info.token_id
+                    << " addr=0x" << std::hex << hbm_buf << std::dec
+                    << " offset=" << current_offset
+                    << " chunk_size=" << chunk_size;
+                return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+            }
 
-            int ret = hf3fs_prep_npu(&ior_write, false, hbm_addr,
-                                     0 /* device_eid */, 0 /* ib_dev_id */,
-                                     fd_, current_offset, avail_in_iov,
-                                     nullptr);
+            char eid_hex[33] = {0};
+            for (int i = 0; i < 16; ++i) {
+                snprintf(eid_hex + i * 2, 3, "%02x", segment_info.eid[i]);
+            }
+            LOG(INFO) << "NDS segment_info: eid=0x" << eid_hex
+                      << " uasid=" << segment_info.uasid
+                      << " jetty_id=" << segment_info.jetty_id
+                      << " token_id=" << segment_info.token_id
+                      << " addr=0x" << std::hex << hbm_buf << std::dec
+                      << " offset=" << current_offset
+                      << " len=" << avail_in_iov;
+
+            int ret = hf3fs_prep_npu(&ior_write, false, hbm_buf,
+                                     &segment_info, fd_, current_offset,
+                                     avail_in_iov, nullptr);
             if (ret < 0) {
                 return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
             }
@@ -376,14 +428,38 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_read(const iovec* iov,
 #ifdef USE_NDS
         if (gpu_staging::IsDevicePointer(current_iov->iov_base, nullptr)) {
             // HBM direct read: entire iov segment in one hf3fs_prep_npu call
-            uint64_t hbm_addr = reinterpret_cast<uint64_t>(
+            uint64_t hbm_buf = reinterpret_cast<uint64_t>(
                 static_cast<char*>(current_iov->iov_base) +
                 current_iov_offset);
+            nds_segment_info_t segment_info;
+            if (nds_get_segment_info(reinterpret_cast<void*>(hbm_buf),
+                                    &segment_info) != 0) {
+                LOG(ERROR) << "nds_get_segment_info failed, addr=" << hbm_buf;
+                LOG(ERROR) << "eid=0x" << eid_hex
+                    << " uasid=" << segment_info.uasid
+                    << " jetty_id=" << segment_info.jetty_id
+                    << " token_id=" << segment_info.token_id
+                    << " addr=0x" << std::hex << hbm_buf << std::dec
+                    << " offset=" << current_offset
+                    << " chunk_size=" << chunk_size;
+                return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
+            }
 
-            int ret = hf3fs_prep_npu(&ior_read, true, hbm_addr,
-                                     0 /* device_eid */, 0 /* ib_dev_id */,
-                                     fd_, current_offset, avail_in_iov,
-                                     nullptr);
+            char eid_hex[33] = {0};
+            for (int i = 0; i < 16; ++i) {
+                snprintf(eid_hex + i * 2, 3, "%02x", segment_info.eid[i]);
+            }
+            LOG(INFO) << "NDS segment_info: eid=0x" << eid_hex
+                      << " uasid=" << segment_info.uasid
+                      << " jetty_id=" << segment_info.jetty_id
+                      << " token_id=" << segment_info.token_id
+                      << " addr=0x" << std::hex << hbm_buf << std::dec
+                      << " offset=" << current_offset
+                      << " len=" << avail_in_iov;
+
+            int ret = hf3fs_prep_npu(&ior_read, true, hbm_buf,
+                                     &segment_info, fd_, current_offset,
+                                     avail_in_iov, nullptr);
             if (ret < 0) {
                 return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
             }
