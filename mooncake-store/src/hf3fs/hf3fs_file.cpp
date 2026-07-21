@@ -78,9 +78,9 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::write(std::span<const char> data,
             for (int i = 0; i < 16; ++i) {
                 snprintf(eid_hex + i * 2, 3, "%02x", segment_info.eid[i]);
             }
-            if (nds_get_segment_info(reinterpret_cast<void*>(hbm_buf),
-                                    &segment_info) != 0) {
-                LOG(ERROR) << "nds_get_segment_info failed" << hbm_buf;
+            int ret = nds_get_segment_info(reinterpret_cast<void*>(hbm_buf), &segment_info);
+            if (ret != 0) {
+                LOG(ERROR) << "nds_get_segment_info failed, errno: " << ret;
                 LOG(ERROR) << "eid=0x" << eid_hex
                     << " uasid=" << segment_info.uasid
                     << " jetty_id=" << segment_info.jetty_id
@@ -278,9 +278,9 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov,
             for (int i = 0; i < 16; ++i) {
                 snprintf(eid_hex + i * 2, 3, "%02x", segment_info.eid[i]);
             }
-            if (nds_get_segment_info(reinterpret_cast<void*>(hbm_buf),
-                                    &segment_info) != 0) {
-                LOG(ERROR) << "nds_get_segment_info failed, addr=" << hbm_buf;
+            int ret = nds_get_segment_info(reinterpret_cast<void*>(hbm_buf), &segment_info);
+            if (ret != 0) {
+                LOG(ERROR) << "nds_get_segment_info failed, errno: " << ret;
                 LOG(ERROR) << "eid=0x" << eid_hex
                     << " uasid=" << segment_info.uasid
                     << " jetty_id=" << segment_info.jetty_id
@@ -436,9 +436,9 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_read(const iovec* iov,
             for (int i = 0; i < 16; ++i) {
                 snprintf(eid_hex + i * 2, 3, "%02x", segment_info.eid[i]);
             }
-            if (nds_get_segment_info(reinterpret_cast<void*>(hbm_buf),
-                                    &segment_info) != 0) {
-                LOG(ERROR) << "nds_get_segment_info failed, addr=" << hbm_buf;
+            int ret = nds_get_segment_info(reinterpret_cast<void*>(hbm_buf), &segment_info);
+            if (ret != 0) {
+                LOG(ERROR) << "nds_get_segment_info failed, errno: " << ret;
                 LOG(ERROR) << "eid=0x" << eid_hex
                     << " uasid=" << segment_info.uasid
                     << " jetty_id=" << segment_info.jetty_id
