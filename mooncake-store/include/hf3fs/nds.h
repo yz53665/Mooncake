@@ -25,6 +25,19 @@ extern "C" {
 typedef struct nds_file_ctx_t* nds_Handle;
 
 /**
+ * @brief Metadata required to access a remote registered NDS segment.
+ * @note The actual remote address and length are supplied by the imported
+ *       read/write arguments. The caller must guarantee that buf/nbyte is in
+ *       the exported registered segment.
+ */
+typedef struct nds_segment_info {
+    uint8_t eid[16];
+    uint32_t uasid;
+    uint32_t jetty_id;
+    uint32_t token_id;
+} nds_segment_info_t;
+
+/**
  * @brief nds read/write 输入参数
  */
 typedef struct {
@@ -65,7 +78,8 @@ void nds_deinit(int32_t device_id);
  * @param len Buffer length in bytes
  * @return 0 on success, -1 on failure
  * @note Must call nds_init to initialize the device first.
- * @warning The same buffer cannot be registered multiple times. Memory must not be freed before deregistration.
+ * @warning Re-registering the same device_id/buf/len is idempotent. Re-registering the same buf
+ *          with a different len is not supported. Memory must not be freed before deregistration.
  * @see nds_buf_deregister
  */
 int nds_buf_register(int32_t device_id, void *buf, size_t len);
@@ -84,6 +98,21 @@ int nds_buf_register(int32_t device_id, void *buf, size_t len);
 int nds_buf_deregister(int32_t device_id, void *buf);
 
 /**
+ * @brief Get the remote-access metadata for a registered HBM segment address.
+ * This function exports the minimum segment metadata required by imported NDS
+ * read/write operations. The caller can pass either the registered buffer base
+ * address or an address inside the registered range.
+ * @param buf Any address inside a registered HBM buffer.
+ * @param out Segment metadata used to import the registered remote segment.
+ * @return 0 on success, -1 on failure
+ * @note Must call nds_init and nds_buf_register before this function.
+ * @warning The exported metadata is valid only while the source process keeps
+ *          the corresponding NDS device and buffer registration alive.
+ * @see nds_buf_register, nds_read_imported, nds_write_imported
+ */
+int nds_get_segment_info(void *buf, nds_segment_info_t *out);
+
+/**
  * @brief 注册文件信息
  * @param fd 文件fd
  * @return nds_handle NDS句柄
@@ -97,7 +126,40 @@ nds_Handle nds_file_register(int fd);
  */
 int nds_file_deregister(int fd);
 
+/**
+ * @brief Read data from a file or block device into local registered NPU HBM.
+ * @param nds_handle NDS file handle returned by nds_file_register.
+ * @param device_id NPU device ID used when registering buf.
+ * @param buf Destination buffer address in local registered NPU HBM.
+ * @param nbyte Number of bytes to transfer.
+ * @param offset File or block device offset.
+ * @return Number of bytes read on success, -1 on failure.
+ * @note buf can be any address inside a registered buffer range.
+ * @see nds_buf_register, nds_file_register
+ */
 ssize_t nds_read(nds_Handle nds_handle, int32_t device_id, void *buf, size_t nbyte, off_t offset);
+
+/**
+ * @brief Read data from a file or block device into an imported remote NPU HBM segment.
+ * This function uses metadata returned by nds_get_segment_info in another
+ * process or node. The destination buffer address uses the same addressing
+ * semantic as nds_read: it is the actual remote NPU VA to be written and may
+ * point inside the exported registered segment.
+ * @param nds_handle NDS file handle returned by nds_file_register.
+ * @param segment Imported remote segment metadata returned by nds_get_segment_info.
+ * @param buf Destination remote NPU buffer address.
+ * @param nbyte Number of bytes to transfer.
+ * @param offset File or block device offset.
+ * @return Number of bytes read on success, -1 on failure.
+ * @note The process that produced segment must keep the corresponding NDS
+ *       device and buffer registration alive until this operation completes.
+ *       The caller must guarantee that buf/nbyte is inside that remote
+ *       registered segment.
+ * @warning Imported I/O is only supported for block-device NDS paths.
+ * @see nds_get_segment_info, nds_write_imported
+ */
+ssize_t nds_read_imported(nds_Handle nds_handle, const nds_segment_info_t *segment,
+    void *buf, size_t nbyte, off_t offset);
 
 /*
  * @brief Write data from NPU device memory to a file or block device
@@ -117,6 +179,28 @@ ssize_t nds_read(nds_Handle nds_handle, int32_t device_id, void *buf, size_t nby
  * @see nds_buf_register, nds_buf_deregister
  */
 ssize_t nds_write(nds_Handle nds_handle, int32_t device_id, void *buf, size_t nbyte, off_t offset);
+
+/**
+ * @brief Write data from an imported remote NPU HBM segment to a file or block device
+ * This function uses metadata returned by nds_get_segment_info in another
+ * process or node. The source buffer address uses the same addressing semantic
+ * as nds_write: it is the actual remote NPU VA to be read and may point inside
+ * the exported registered segment.
+ * @param nds_handle NDS file handle returned by nds_file_register.
+ * @param segment Imported remote segment metadata returned by nds_get_segment_info.
+ * @param buf Source remote NPU buffer address.
+ * @param nbyte Number of bytes to transfer.
+ * @param offset File or block device offset.
+ * @return Number of bytes written on success, -1 on failure.
+ * @note The process that produced segment must keep the corresponding NDS
+ *       device and buffer registration alive until this operation completes.
+ *       The caller must guarantee that buf/nbyte is inside that remote
+ *       registered segment.
+ * @warning Regular-file imported write uses a temporary user-space URMA transfer path.
+ * @see nds_get_segment_info, nds_read_imported
+ */
+ssize_t nds_write_imported(nds_Handle nds_handle, const nds_segment_info_t *segment,
+    void *buf, size_t nbyte, off_t offset);
 
 
 #ifdef __cplusplus
