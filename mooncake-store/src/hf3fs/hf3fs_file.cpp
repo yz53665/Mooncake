@@ -99,10 +99,19 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::write(std::span<const char> data,
                       << " offset=" << current_offset
                       << " chunk_size=" << chunk_size;
 
+            // Copy HBM data to DDR iov buffer before submission
+            if (!gpu_staging::CopyDeviceToHost(
+                    threefs_iov.base,
+                    reinterpret_cast<void*>(hbm_buf), chunk_size)) {
+                LOG(ERROR) << "CopyDeviceToHost failed, addr=0x" << std::hex
+                           << hbm_buf << std::dec << " size=" << chunk_size;
+                return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+            }
+
             ret = hf3fs_prep_npu_direct_io(
-                &ior_write, false, fd_, current_offset, chunk_size,
-                &segment_info, reinterpret_cast<void*>(hbm_buf),
-                chunk_size, nullptr);
+                &ior_write, &threefs_iov, false, fd_, current_offset,
+                chunk_size, &segment_info,
+                reinterpret_cast<void*>(hbm_buf), chunk_size, nullptr);
             if (ret < 0) {
                 return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
             }
@@ -298,10 +307,19 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov,
                       << " offset=" << current_offset
                       << " len=" << avail_in_iov;
 
+            // Copy HBM data to DDR iov buffer before submission
+            if (!gpu_staging::CopyDeviceToHost(
+                    threefs_iov.base,
+                    reinterpret_cast<void*>(hbm_buf), avail_in_iov)) {
+                LOG(ERROR) << "CopyDeviceToHost failed, addr=0x" << std::hex
+                           << hbm_buf << std::dec << " size=" << avail_in_iov;
+                return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+            }
+
             ret = hf3fs_prep_npu_direct_io(
-                &ior_write, false, fd_, current_offset, avail_in_iov,
-                &segment_info, reinterpret_cast<void*>(hbm_buf),
-                avail_in_iov, nullptr);
+                &ior_write, &threefs_iov, false, fd_, current_offset,
+                avail_in_iov, &segment_info,
+                reinterpret_cast<void*>(hbm_buf), avail_in_iov, nullptr);
             if (ret < 0) {
                 return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
             }
@@ -456,9 +474,9 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_read(const iovec* iov,
                       << " len=" << avail_in_iov;
 
             ret = hf3fs_prep_npu_direct_io(
-                &ior_read, true, fd_, current_offset, avail_in_iov,
-                &segment_info, reinterpret_cast<void*>(hbm_buf),
-                avail_in_iov, nullptr);
+                &ior_read, &threefs_iov, true, fd_, current_offset,
+                avail_in_iov, &segment_info,
+                reinterpret_cast<void*>(hbm_buf), avail_in_iov, nullptr);
             if (ret < 0) {
                 return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
             }
