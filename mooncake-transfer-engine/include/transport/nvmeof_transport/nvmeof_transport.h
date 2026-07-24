@@ -40,6 +40,7 @@
 
 #ifdef USE_NDS
 #include "nds_context.h"
+#include "nds_desc_pool.h"
 #endif
 
 namespace mooncake {
@@ -48,6 +49,8 @@ struct NVMeoFBatchDesc {
     int desc_idx_;
 #ifndef USE_NDS
     std::vector<TransferStatus> transfer_status;
+    std::vector<std::tuple<size_t, uint64_t>> task_to_slices;
+#else
     std::vector<std::tuple<size_t, uint64_t>> task_to_slices;
 #endif
 };
@@ -79,17 +82,15 @@ class NVMeoFTransport : public Transport {
     void addSliceToCUFileBatch(void *source_addr, uint64_t file_offset,
                                uint64_t slice_len, uint64_t desc_id,
                                TransferRequest::OpCode op, CUfileHandle_t fh);
+#else
+    void addSliceToNdsBatch(void *source_addr, uint64_t file_offset,
+                            uint64_t slice_len, int desc_id,
+                            TransferRequest::OpCode op, nds_Handle nds_handle,
+                            Slice *slice);
 #endif
 
    private:
     void startTransfer(Slice *slice);
-
-#ifdef USE_NDS
-    void initializeNdsThreadPool();
-    void stopNdsThreadPool();
-    void ndsWorkerThread();
-    void submitNdsSlice(Slice *slice);
-#endif
 
    private:
     struct pair_hash {
@@ -137,19 +138,12 @@ class NVMeoFTransport : public Transport {
 #endif
 
 #ifdef USE_NDS
-    static constexpr size_t kDefaultNdsThreadPoolSize = 8;
-
-    std::vector<std::thread> nds_workers_;
-    std::queue<std::function<void()>> nds_task_queue_;
-    std::mutex nds_queue_mutex_;
-    std::condition_variable nds_queue_cv_;
-    std::atomic<bool> nds_running_{false};
-    size_t nds_thread_pool_size_;
-
     std::unordered_map<std::pair<SegmentHandle, uint64_t>,
                        std::shared_ptr<NdsFileContext>, pair_hash>
         nds_segment_to_context_;
     RWSpinlock nds_context_lock_;
+
+    std::shared_ptr<NdsDescPool> nds_desc_pool_;
 
     int32_t nds_device_id_ = -1;
     bool nds_initialized_ = false;
