@@ -46,7 +46,7 @@ struct NdsBatchDesc {
 
 class NdsDescPool {
    public:
-    explicit NdsDescPool(size_t max_batch_size = 128);
+    explicit NdsDescPool(size_t max_batch_size = 512);
     ~NdsDescPool();
 
     NdsDescPool(const NdsDescPool &) = delete;

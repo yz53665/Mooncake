@@ -20,12 +20,15 @@ if(USE_NDS)
     option(NDS_USE_STUB "Use stub NDS implementation for testing without real hardware" OFF)
     if(NDS_USE_STUB)
         list(APPEND NVMEOF_SOURCES "nds_stub.cpp")
-        target_compile_definitions(nvmeof_transport PUBLIC NDS_USE_STUB)
-        message(STATUS "NDS stub mode enabled - no real NDS/ACL libraries required")
     endif()
 endif()
 
 add_library(nvmeof_transport OBJECT ${NVMEOF_SOURCES})
+
+if(USE_NDS AND NDS_USE_STUB)
+    target_compile_definitions(nvmeof_transport PUBLIC NDS_USE_STUB)
+    message(STATUS "NDS stub mode enabled - using nds_stub.cpp, no real libnds required")
+endif()
 
 if(USE_CUDA)
     target_include_directories(nvmeof_transport PUBLIC "/usr/local/cuda/include")
