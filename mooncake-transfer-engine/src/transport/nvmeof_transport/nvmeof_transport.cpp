@@ -44,13 +44,21 @@
 namespace mooncake {
 NVMeoFTransport::NVMeoFTransport() {
 #ifdef USE_NDS
-    const char *nds_device_env = getenv("MC_NDS_DEVICE_ID");
-    if (nds_device_env) {
-        auto opt = parseFromString<int32_t>(nds_device_env);
-        if (opt.has_value() && opt.value() >= 0) {
-            nds_device_id_ = opt.value();
-            LOG(INFO) << "NVMeoFTransport: NDS device_id set to "
-                      << nds_device_id_ << " from MC_NDS_DEVICE_ID";
+    int32_t dev_id = -1;
+    if (aclrtGetDevice(&dev_id) == ACL_SUCCESS && dev_id >= 0) {
+        nds_device_id_ = dev_id;
+        LOG(INFO) << "NVMeoFTransport: NDS device_id=" << nds_device_id_
+                  << " obtained from aclrtGetDevice";
+    } else {
+        const char *nds_device_env = getenv("MC_NDS_DEVICE_ID");
+        if (nds_device_env) {
+            auto opt = parseFromString<int32_t>(nds_device_env);
+            if (opt.has_value() && opt.value() >= 0) {
+                nds_device_id_ = opt.value();
+                LOG(INFO) << "NVMeoFTransport: NDS device_id set to "
+                          << nds_device_id_
+                          << " from MC_NDS_DEVICE_ID (fallback)";
+            }
         }
     }
     nds_desc_pool_ = std::make_shared<NdsDescPool>();
@@ -390,13 +398,8 @@ Status NVMeoFTransport::submitTransfer(
 
 Status NVMeoFTransport::freeBatchID(BatchID batch_id) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
-#ifdef USE_NDS
     auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
     int desc_idx = nvmeof_desc.desc_idx_;
-#else
-    auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
-    int desc_idx = nvmeof_desc.desc_idx_;
-#endif
     Status rc = Transport::freeBatchID(batch_id);
     if (rc != Status::OK()) {
         return rc;
