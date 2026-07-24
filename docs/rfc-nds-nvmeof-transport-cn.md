@@ -754,13 +754,14 @@ master 层 SSD segment 的心跳参数（探测间隔、超时、失败阈值）
 
 ## 9. 后续工作
 
-1. 在 NDS 提供 batch API 后，将 `NdsWorkerThreadPool` 替换为与 `CUFileDescPool` 对称的 batch 提交模型；
-2. 评估是否抽取公共 `NvmeOfFileContext` 抽象基类，统一 GDS/NDS 的句柄管理接口；
-3. 评估 master 层 `ScopedNoFSegmentAccess` 与既有 `ScopedSegmentAccess` 是否抽取公共基类，统一引用计数与心跳接口；
-4. 实现 `submitNdsNofOperation` 及 `TransferSubmitter` 中的 `USE_NDS` 路由分支（第 6.2 节）；
-5. 在 `NoFSegment` 中增加 `device_path` 字段，并在 `MountSegment` 时完成 `SegmentDesc` 的 metadata 注册（第 6.3 节）；
-6. 在 `MasterService` 构造中为 `USE_NDS` 绑定基于 `nds_read` 的默认 `NoFProbeFn`，替换当前仅 `USE_NOF` 的探针绑定（第 6.4 节）；
-7. 在 `NVMeoFTransport` 的 transport 层补齐 QoS 流控能力，使其达到与 SPDK 路径 `SpdkNofQos` 对等的水平。
+1. **合入 transport 层 NDS 分支**：将 `NdsFileContext`、`NdsWorkerThreadPool` 及 `NVMeoFTransport` 中的 NDS 编译分支（第 4 章）作为独立 PR 合入社区 `mooncake-transfer-engine`；
+2. 在 NDS 提供 batch API 后，将 `NdsWorkerThreadPool` 替换为与 `CUFileDescPool` 对称的 batch 提交模型；
+3. 评估是否抽取公共 `NvmeOfFileContext` 抽象基类，统一 GDS/NDS 的句柄管理接口；
+4. 评估 master 层 `ScopedNoFSegmentAccess` 与既有 `ScopedSegmentAccess` 是否抽取公共基类，统一引用计数与心跳接口；
+5. 实现 `submitNdsNofOperation` 及 `TransferSubmitter` 中的 `USE_NDS` 路由分支（第 6.2 节）；
+6. 在 `NoFSegment` 中增加 `device_path` 字段，并在 `MountSegment` 时完成 `SegmentDesc` 的 metadata 注册（第 6.3 节）；
+7. 在 `MasterService` 构造中为 `USE_NDS` 绑定基于 `nds_read` 的默认 `NoFProbeFn`，替换当前仅 `USE_NOF` 的探针绑定（第 6.4 节）；
+8. 在 `NVMeoFTransport` 的 transport 层补齐 QoS 流控能力，使其达到与 SPDK 路径 `SpdkNofQos` 对等的水平。
 
 ## 10. 参考文献
 
