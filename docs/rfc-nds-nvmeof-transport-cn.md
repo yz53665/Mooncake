@@ -1,52 +1,71 @@
-# RFC: 在 NVMe-oF Transport 中引入 NDS (NPU Direct Storage) 分支以支持昇腾 NPU 直连存储
+# RFC: 引入 NDS 分支并扩展 Master 层 SSD Segment 管理以支持昇腾 NPU 直连 NVMe-oF 存储
 
 ## 1. 引言
 
-本 RFC 提议在现有的 `nvmeof_transport` 中增加一条与 GDS（GPU Direct Storage）平行的 **NDS（NPU Direct Storage）分支**，使得基于昇腾 NPU（HBM）的推理/训练场景也能像 NVIDIA GPU + GDS 一样，直接通过 NVMe-oF 访问远端 SSD Pool，从而扩展 KV Cache 的容量上限。
+本 RFC 提议为昇腾 NPU 场景补齐 NVMe-oF 直连存储能力，包含两项紧密关联的改动：
 
-需要先指出的是，**当前仓库中的 GDS 参考实现本身并不完善**：它仅提供 transport 层的最小可运行路径（`CuFileContext` 句柄注册、`CUFileDescPool` 批量提交、基于 `CUfileIOEvents_t` 的状态查询），要求用户自行发现并挂载远端 NVMe-oF target，缺少自动化的 segment 生命周期管理、心跳检测、副本放置策略等上层能力。因此，本提案以"参考实现"的同等定位引入 NDS 分支，与既有 GDS 路径并列共存，后续可由社区共同补齐上层能力。
+1. **Transport 层 NDS 分支**：在 `nvmeof_transport` 中增加一条与 GDS（GPU Direct Storage）平行的 **NDS（NPU Direct Storage）分支**，使基于昇腾 NPU（HBM）的推理/训练场景能像 NVIDIA GPU + GDS 一样直接通过 NVMe-oF 访问远端 SSD Pool，扩展 KV Cache 容量上限。
+2. **Master 层 SSD Segment 管理扩展**：针对普通块设备地址偏移寻址 SSD 盘的共享与故障特点，在既有 `NoFSegmentManager` 基础上扩展多 client 共享 segment（`client_refs` 引用计数）、探针注入（`NoFProbeFn`），并复用既有故障强制卸载与副本清理链路，使 NDS 路径与既有 SPDK 路线共享同一套 segment 生命周期管理框架。
 
-本提案与社区已有的两条相关工作互补但不重叠：
+两项改动一脉相承：transport 层提供 NPU 直连数据面，master 层提供与存储后端解耦的 segment 管理控制面，共同构成完整的 NPU 直连 SSD 方案。
 
-- [#1940 SSD pool over NVMe-oF (SPDK 路线)](https://github.com/kvcache-ai/Mooncake/issues/1940)：在 host 侧通过 SPDK wrapper 走存储后端，并改造 LMCache 内存为 huge page + `cudaHostRegister` 以实现 zero-copy。
-- [#2084 SPDK 集成补充](https://github.com/kvcache-ai/Mooncake/pull/2084)：在 1940 基础上补齐了 SSD 注册脚本、NoF 心跳、多副本清理与监控指标等。
+需要指出的是，当前仓库中的 GDS 参考实现本身并不完善：它仅提供 transport 层的最小可运行路径（`CuFileContext` 句柄注册、`CUFileDescPool` 批量提交、基于 `CUfileIOEvents_t` 的状态查询），要求用户自行发现并挂载远端 NVMe-oF target，缺少自动化的 segment 生命周期管理、心跳检测、副本放置策略等上层能力。因此，本提案以"参考实现"的同等定位引入 NDS 分支，与既有 GDS 路径并列共存，后续可由社区共同补齐上层能力。
 
-我们的方案与上述两条路线的区别在于：**保留 transport 层的 GDS 抽象，平行引入 NDS 后端**，无需引入 SPDK、无需替换既有 CUDA pinned memory 分配逻辑，对存量 GDS 路径零侵入。
+本提案与社区已有的 SPDK NoF 路线互补但不重叠：
+
+- [#1940 SSD pool over NVMe-oF](https://github.com/kvcache-ai/Mooncake/issues/1940)：提出了基于 SPDK 的 NVMe-oF SSD Pool 整体架构方案。
+- [#2084 NVMe-oF SSD cache support](https://github.com/kvcache-ai/Mooncake/pull/2084)：在 #1940 基础上实现了 store 层基础设施（`SpdkWrapper`、`NoFSegmentManager`、NoF 心跳与自动卸载、多副本清理、监控指标等），是本仓库中 SPDK NoF 路线的实际代码基础。
+
+本提案通过编译宏 `USE_NDS` 与既有 GDS 路径共存。由于 NPU HBM 直接经 NDS 与 NVMe-oF target 间 DMA，数据面不经过 host 内存，因此无需像 SPDK 路径那样通过 `SpdkWrapper::Alloc` 分配 host 侧 DMA buffer。
 
 ## 2. 背景与动机
 
-### 2.1 现状
+本提案的两项改动分别源于两个独立的动机：transport 层源于"NPU 直连存储路径缺失"，master 层源于"SSD 共享与故障场景下生命周期管理不足"。本节分别展开。
 
-当前 `mooncake-transfer-engine/src/transport/nvmeof_transport/` 中存在一份 NVMe-oF transport 参考实现，但它强依赖于 NVIDIA GDS（`cufile.h`），只能在 NVIDIA GPU + CUDA 环境下使用：
+### 2.1 Transport 层：NPU 直连存储路径缺失
 
-- `CuFileContext` 通过 `cuFileHandleRegister` 注册文件句柄；
-- `CUFileDescPool` 通过 `cuFileBatchIOSetUp / cuFileBatchIOSubmit` 进行批量提交；
-- `NVMeoFTransport::registerLocalMemory` 调用 `cuFileBufRegister` 注册 GPU 显存。
+当前仓库中围绕 NVMe-oF 直连存储存在两条已实现的路径，但二者都面向 NVIDIA GPU：
 
-这导致以下问题：
+1. **GDS 参考实现（transport 层）**：`mooncake-transfer-engine/src/transport/nvmeof_transport/` 强依赖 NVIDIA GDS（`cufile.h`），通过 `cuFileHandleRegister` 注册句柄、`cuFileBatchIOSubmit` 批量提交。如引言所述，该实现仅为最小可运行路径。
+2. **SPDK 路线（#1940 / #2084，store 层）**：在 host 侧通过 SPDK 用户态驱动直接访问远端 NVMe-oF target，提供了独立的 NoF segment 管理、心跳与故障隔离、多副本支持等完整的 SSD Pool 能力。这是一条面向 NVIDIA GPU + CUDA 环境的完整工程化方案。
 
-1. **NPU（昇腾）用户无法使用该 transport**：`cufile.h` 不存在于昇腾环境，编译直接失败；
-2. **现有社区方案改造面较大**：#1940 / #2084 引入了 SPDK wrapper、NoF segment manager、心跳与脚本化注册，并且需要把 LMCache 的 pinned memory 由 `cudaHostAlloc` 改为 SPDK huge page + `cudaHostRegister`，对宿主内存管理改动较大；
-3. **缺少一条与 GDS 对称、最小侵入的 NPU 直连路径**：在已有 NDS（NPU Direct Storage，昇腾提供的用户态库，等价于 GDS 的角色）能力下，理论上可以复用 transport 层的绝大多数逻辑，仅替换底层 API。
+两条路径共同的问题在于：**昇腾 NPU 场景缺失**。GDS 依赖 `cufile.h` 与 CUDA 环境，SPDK 路线同样依赖 CUDA 环境，二者在昇腾环境下均不可用。换言之，NPU 用户目前没有任何一条可用的 NVMe-oF 直连存储路径。
 
-### 2.2 目标
+与此同时，昇腾侧已提供与 GDS 角色对等的 **NDS（NPU Direct Storage）用户态库**（`nds_init / nds_buf_register / nds_read / nds_write`），能够在 NPU HBM 与 NVMe-oF target 之间直接发起 DMA，具备构建对等直连路径的底层能力。因此本提案在 transport 层引入与 GDS 平行的 NDS 分支，使 NPU 用户获得对等的 NVMe-oF 直连能力。
 
-- **零侵入 GDS 路径**：通过编译宏 `USE_NDS` 切换，不破坏现有 NVIDIA + GDS 用户的使用。
-- **NPU HBM 与 NVMe-oF 直连**：通过 NDS 库（`nds_init / nds_buf_register / nds_read / nds_write`）实现 HBM ↔ NVMe-oF 的直接搬运，无需经过 host 内存中转。
-- **不引入 SPDK 依赖**：避免对 LMCache pinned memory 做替换，避免新增 SPDK wrapper、NoF segment manager 等模块。
+### 2.2 Master 层：SSD 共享与故障场景下生命周期管理不足
+
+无论上层是 GDS、SPDK 还是 NDS，transport 层只负责"在给定 fd + offset 上发起一次 DMA"，并不感知这块 SSD 是谁挂载的、是否还健康、还有多少容量、其他 client 是否也在使用。这些职责由 master 层的 `NoFSegmentManager` 承担。然而现有 `NoFSegmentManager` 的设计存在三处与 SSD 实际使用方式不匹配的缺口，本提案需要补齐：
+
+1. **1:1 挂载语义无法表达多 client 共享**。现有 `NoFSegmentManager` 假定一个 segment 由一个 client 独占使用，`Mount` / `Unmount` 一一对应。但在 NVMe-oF + SSD Pool 场景下，一块物理 SSD 经常被多个推理/训练 client 同时挂载使用（同一块 NVMe-oF target 对应多个 host 进程）。如果沿用 1:1 语义，则每个 client 各自挂载一份会产生重复的 segment 对象、重复的容量计数与重复的探针；若强制串行化则又限制并发。本提案引入 `client_refs` 引用计数：同一 `device_name` 的重复挂载仅增加引用，引用归零才真正销毁 segment，从而支持多 client 共享同一物理设备。
+2. **缺少与具体驱动解耦的健康探针**。既有心跳探测直接调用 `SpdkWrapper::ProbeNofSegment`，探针与 SPDK 强绑定。NDS 路径下不存在 SPDK wrapper，若沿用既有实现则心跳形同虚设。本提案将探针抽象为可注入的 `NoFProbeFn`（函数对象），master 不依赖任何具体驱动；NDS 路径下注入基于轻量 `nds_read` 的探针实现，SPDK 路径下保持原实现不变。这样 master 层的心跳、故障处理、副本清理链路可被两条路径共用，避免平行的故障处理逻辑。
+3. **SSD 故障的不可迁移性需要专门的强制卸载路径**。SSD/NVMe-oF target 一旦不可达，其上数据无法被读取，因此无法走"先迁移再卸载"的 Drain 路径。既有代码已为 SPDK 路线实现了 `ForceUnmountSegment`（绕过引用计数）→ `ClearInvalidHandles`（遍历 `ObjectMetadata` 删除匹配 `device_name` 的副本，有冗余则降级存活、无冗余则删除 key）→ `CommitUnmountSegment` 的强制卸载链路。本提案直接复用该链路，差异仅在探针实现。这样 SSD 故障语义在 NDS 与 SPDK 两条路径下保持一致，避免分叉。
+
+综上，master 层扩展的动机是：**让 NDS 路径能复用既有 SPDK 路线已验证的 segment 生命周期管理框架**（共享、心跳、故障隔离、副本清理），而不是为 NDS 另起一套平级 manager。这是本提案"零侵入"在控制面的体现。
+
+### 2.3 目标
+
+基于上述两项独立的动机，本提案的目标是：
+
+- **补齐 NPU 直连存储路径**：通过编译宏 `USE_NDS` 在 transport 层引入与 GDS 平行的 NDS 分支。
+- **NPU HBM 与 NVMe-oF 直连**：通过 NDS 库实现 HBM ↔ NVMe-oF 的直接搬运，数据面不经过 host 内存中转。
+- **零侵入既有路径**：不修改 GDS 分支，不引入 SPDK 依赖，不触动 host 侧 buffer 分配逻辑——这三者是 NDS 路径"数据面不经 host"的自然结果。
+- **扩展 master 层 SSD segment 管理**：在既有 `NoFSegmentManager` 基础上补齐多 client 共享（`client_refs`）、探针注入（`NoFProbeFn`）、复用强制卸载链路，使 NDS 路径与既有 SPDK 路线共享同一套 segment 生命周期管理框架。
 - **与现有 batch 提交模型解耦**：NDS 当前未提供 batch API，因此采用线程池 + 任务队列模型，保留后续切换为 batch API 的接口空间。
 
-### 2.3 与 #1940 / #2084 的对比
+### 2.4 与 SPDK 路线的定位差异
 
-| 维度             | #1940 / #2084 (SPDK 路线)                                            | 本提案 (NDS 路线)                             |
-| ---------------- | -------------------------------------------------------------------- | --------------------------------------------- |
-| 适用硬件         | NVIDIA GPU（仍依赖 CUDA）                                            | 昇腾 NPU（基于 NDS 用户态库）                 |
-| 存储后端接入方式 | 自研`SpdkWrapper` + `SpdkNofWorkerPool`                          | 复用 NDS C API，无 SPDK 依赖                  |
-| Host 内存改造    | 需把 LMCache pinned memory 改为 SPDK huge page +`cudaHostRegister` | 不改动，NPU HBM 直接经 NDS 落盘               |
-| Segment 管理     | 新增`NoFSegmentManager`、心跳、注册脚本等                          | 复用既有`nvmeof_buffers` 与 `SegmentDesc` |
-| Transport 改动   | 新增 store 层模块                                                    | 仅在`nvmeof_transport` 内部新增平行分支     |
-| 与 GDS 关系      | 替代/并行于既有 transport                                            | 与 GDS 完全平行，编译宏切换                   |
-| 风险面           | 较大（内存管理 + SPDK 部署）                                         | 较小（仅 transport 内部分支）                 |
+本节澄清本提案与 SPDK 路线（#1940 / #2084）的关系：二者**面向不同硬件、互不替代**，可叠加使用。下表列出二者在定位上的差异，便于评审者理解互补关系，而非做优劣对比。
+
+| 维度             | SPDK 路线 (#1940 / #2084)                                         | 本提案 (NDS 路线)                                         |
+| ---------------- | ------------------------------------------------------------------ | --------------------------------------------------------- |
+| 适用硬件         | NVIDIA GPU（依赖 CUDA）                                            | 昇腾 NPU（基于 NDS 用户态库）                             |
+| 存储后端接入方式 | SPDK 用户态驱动直连 NVMe-oF target                                 | 复用 NDS C API                                            |
+| Host 内存        | 通过 SPDK 分配 host 侧 DMA buffer                                  | 不涉及，NPU HBM 直接经 NDS 落盘                           |
+| Segment 管理     | 独立的 `NoFSegmentManager`、心跳、注册脚本                         | 在既有 NoFSegmentManager 基础上扩展共享/心跳/故障隔离     |
+| Transport 改动   | 新增 store 层模块                                                  | transport 层新增平行分支 + master 层扩展 NoF segment 管理 |
+| 与 GDS 关系      | 替代/并行于既有 transport                                          | 与 GDS 完全平行，编译宏切换                               |
+| 叠加使用         | 可与 NDS 路径叠加（NDS 负责 NPU 数据面，SPDK 路线负责 GPU 数据面） | 可与 SPDK 路线叠加                                        |
 
 ## 3. 总体架构
 
@@ -54,6 +73,13 @@
 
 ```mermaid
 graph TB
+    subgraph Store["Mooncake Store (Master 层)"]
+        MS[MasterService]
+        NSM[NoFSegmentManager<br/>本提案扩展]
+        MS --> NSM
+        NSM -->|挂载/卸载/心跳<br/>地址偏移寻址| SEG[(SSD Segment<br/>块设备)]
+    end
+
     subgraph Existing["既有 NVMe-oF Transport (GDS 路径)"]
         TE[TransferEngine]
         NVT[NVMeoFTransport]
@@ -76,9 +102,12 @@ graph TB
         NDS_API --> NDSL[(libnds.so / NPU Direct Storage)]
     end
 
-    NDSL -.HBM 直连.-> NVME[(NVMe-oF Target / SSD Pool)]
-    GDS -.GPU 显存直连.-> NVME
+    SEG -. fd + file_offset .-> NVT
+    NDSL -.HBM 直连.-> SEG
+    GDS -.GPU 显存直连.-> SEG
 ```
+
+本提案覆盖两个层面：transport 层的 NDS 分支（替代 GDS API 完成数据搬运）与 master 层的 SSD segment 管理（在既有 `NoFSegmentManager` 基础上扩展共享/心跳/故障隔离能力）。SSD segment 基于普通块设备地址偏移寻址（`base + offset`），由 master 通过 fd + offset 向 transport 层下发任务。
 
 ### 3.2 编译期分支
 
@@ -334,11 +363,178 @@ flowchart LR
 | 控制流位置 | host CPU                            | host CPU                          |
 | 数据流路径 | GPU 显存 ↔ NVMe-oF target          | NPU HBM ↔ NVMe-oF target         |
 
-## 6. GDS 与 NDS 核心 API 对比
+## 6. Master 层 SSD Segment 管理
+
+本节描述 master 层针对普通块设备地址偏移寻址 SSD 盘的 segment 管理设计，核心能力包括多 client 共享 segment、心跳健康检查、故障隔离。本提案面向基于块设备地址偏移寻址的普通 SSD 盘，segment 内空间由既有 `OffsetBufferAllocator` 管理，与现有 `NoFSegmentManager` 的寻址模型保持一致。
+
+### 6.1 设计要点
+
+| 要点                   | 说明                                                                                                                                           |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Segment 寻址模型       | 普通块设备地址偏移寻址（`base + offset`），复用既有 `OffsetBufferAllocator`                                                                |
+| 多 client 共享 segment | 一块物理 SSD 可被多个 client 同时挂载使用，通过`client_refs` 引用计数管理生命周期；重复挂载同一 `device_name` 仅增加引用，不创建新 segment |
+| 卸载语义               | `Unmount(device_name, client_id)`：引用计数减一；引用归零才真正销毁 segment。与既有 `NoFSegmentManager` 的 1:1 挂载语义不同                |
+| 心跳健康检查           | 后台线程定期探测每个 OK 状态的 SSD segment，连续失败超阈值（`interval × threshold`）触发强制卸载，使新写入自动流向健康 segment              |
+| 故障处理               | 设备不可达时直接`ForceUnmountSegment` 强制卸载（绕过 `client_refs`），**不走 Drain 路径**——故障设备无法读取也就无法迁移数据        |
+| Client 透明            | Client 每次操作向 master 请求 descriptor，故障段的 descriptor 会被`ClearInvalidHandles` 清理；Client 无需显式感知卸载                        |
+
+### 6.2 类图
+
+```mermaid
+classDiagram
+    direction TB
+
+    class MountedNoFSegment {
+        +NoFSegment segment
+        +SegmentStatus status
+        +size_t remaining_size
+        +set~UUID~ client_refs
+    }
+
+    class NoFSegmentManagerExt {
+        -shared_mutex segment_mutex_
+        -map~string,MountedNoFSegment~ mounted_segments_
+        -map~UUID,set~string~~ client_segments_
+        -mutex heartbeat_mutex_
+        -unordered_map~string,HeartbeatState~ heartbeat_states_
+        -thread heartbeat_thread_
+        -NoFProbeFn probe_fn_
+        +getNoFSegmentAccess() ScopedNoFSegmentAccess
+        +allocate(size, count, preferred, excluded, strategy) vector~AllocResult~
+    }
+
+    class ScopedNoFSegmentAccess {
+        +MountSegment(NoFSegment, client_id) ErrorCode
+        +PrepareUnmountSegment(device_name, client_id, &dec_capacity) ErrorCode
+        +CommitUnmountSegment(device_name, dec_capacity) ErrorCode
+        +ForceUnmountSegment(device_name, &dec_capacity) ErrorCode
+        +Allocate(...) vector~AllocResult~
+        +Deallocate(device_name, offset, size) void
+        +GetRefCount(device_name) size_t
+    }
+
+    class HeartbeatState {
+        +string device_name
+        +time_point next_probe_at
+        +time_point last_success_at
+        +uint32 consecutive_failures
+        +string last_error_reason
+    }
+
+    class NoFProbeFn {
+        <<typedef>>
+        +operator()(device_name, timeout_ms, error_reason*) bool
+    }
+
+    NoFSegmentManagerExt *-- MountedNoFSegment
+    NoFSegmentManagerExt --> ScopedNoFSegmentAccess
+    NoFSegmentManagerExt o-- HeartbeatState : heartbeat_states_
+    NoFSegmentManagerExt ..> NoFProbeFn : probe_fn_
+```
+
+### 6.3 挂载与卸载流程
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant MS as MasterService
+    participant SA as ScopedNoFSegmentAccess
+
+    Client->>MS: MountNoFSegment(NoFSegment, client_id)
+    MS->>SA: getNoFSegmentAccess().MountSegment()
+    Note over SA: 获取 segment_mutex_ 写锁
+
+    alt device_name 已存在（重复挂载）
+        SA->>SA: client_refs.insert(client_id)
+        SA->>SA: remaining_size 不变
+        SA-->>MS: OK
+    else device_name 不存在（首次挂载）
+        SA->>SA: 创建 MountedNoFSegment<br/>client_refs={client_id}
+        SA->>SA: 创建 OffsetBufferAllocator
+        SA->>SA: 更新 Metrics
+        SA-->>MS: OK
+    end
+    MS-->>Client: OK
+
+    Note over Client,SA: 卸载流程
+    Client->>MS: UnmountNoFSegment(device_name, client_id)
+    MS->>SA: PrepareUnmountSegment(device_name, client_id, &dec)
+    SA->>SA: client_refs.erase(client_id)
+    alt client_refs 不为空
+        SA-->>MS: OK（仅减引用）
+    else client_refs 为空
+        SA->>SA: status = UNMOUNTING
+        SA->>SA: dec = segment.size
+        MS->>SA: CommitUnmountSegment(device_name, dec)
+        SA->>SA: mounted_segments_.erase(device_name)
+    end
+    MS-->>Client: OK
+```
+
+### 6.4 心跳与健康检查
+
+后台心跳线程每 100ms 醒来，对所有 OK 状态的 SSD segment 进行轮询探测。`NoFProbeFn` 以函数注入方式提供（master 不依赖具体驱动实现），探针实现由 transport 层提供——在 NDS 路径下可基于一次轻量 `nds_read` 完成。
+
+```mermaid
+flowchart TD
+    A[HeartbeatThreadFunc 每 100ms 醒来] --> B[同步 heartbeat_states_ 表<br/>新增段加入/已卸载段移除]
+    B --> C[筛选 next_probe_at <= now 的段]
+    C --> D{有待探测段?}
+    D -->|否| F[sleep 100ms]
+    D -->|是| E[对每段调用 ProbeFn]
+    E --> G{探测结果}
+    G -->|成功| H[consecutive_failures=0<br/>更新 last_success_at]
+    G -->|失败| I[consecutive_failures++]
+    I --> J{now - last_success_at >= alive_timeout?}
+    J -->|否| K[记录失败，等待下次]
+    J -->|是| L[HandleFailure → ForceUnmountSegment]
+    H --> M[更新 next_probe_at = now + interval]
+    K --> M
+    L --> M
+    M --> F
+```
+
+`alive_timeout = interval × threshold`（如默认 10s × 3 = 30s）。
+
+### 6.5 故障处理与强制卸载
+
+故障设备不可达，**不走 Drain 路径**（Drain 要求源段可读以迁移数据）。直接 `ForceUnmountSegment` 强制卸载：绕过 `client_refs` 检查、清空引用集合、清理 `client_segments_` 中所有引用、置 `UNMOUNTING`，随后通过 `ClearInvalidHandles` 遍历 `ObjectMetadata` 删除匹配 `device_name` 的副本（对象仍有其他健康副本则降级存活，否则删除 key），最终 `CommitUnmountSegment` 移除 segment 并扣减容量指标。
+
+```mermaid
+flowchart TD
+    A[HandleFailure device_name] --> B[ForceUnmountSegment]
+    B --> B1[绕过 client_refs 检查]
+    B1 --> B2[清空 client_refs]
+    B2 --> B3[清理 client_segments_ 中所有引用]
+    B3 --> B4[status = UNMOUNTING]
+    B4 --> C[ClearInvalidHandles]
+    C --> C1[遍历 ObjectMetadata]
+    C1 --> C2[删除 device_name 匹配的副本]
+    C2 --> C3{对象还有其他有效副本?}
+    C3 -->|是| C4[保留对象，降级存活]
+    C3 -->|否| C5[删除整个 key 数据丢失]
+    C4 --> D[CommitUnmountSegment]
+    C5 --> D
+    D --> D1[mounted_segments_.erase]
+    D1 --> D2[扣减容量指标]
+    D2 --> E[清理 heartbeat_states_ 条目]
+```
+
+数据丢失是硬件故障的必然结果，系统能做的是：新写入自动分配到健康段（`Allocate()` 跳过非 OK 段）、有冗余的对象降级存活、无冗余的对象返回 `OBJECT_NOT_FOUND`。Client 无需显式感知卸载，通过现有 `GetReplicaList` 机制自然切换到健康副本。
+
+### 6.6 与 SPDK 路线的关系
+
+本节设计与 SPDK 路线（#1940 / #2084）中 NoF 心跳、多副本清理、监控指标的**目标一致**（共享物理设备、心跳隔离、故障自动切换），但实现路径不同：
+
+- **不引入 SPDK 依赖**：探针基于 NDS 路径下的轻量 `nds_read`，无需新增 SPDK wrapper；
+- **不涉及 host 侧 buffer 分配**：数据在 NPU HBM 与 NVMe-oF target 间直接 DMA，无需像 SPDK 路径那样分配 host 侧 DMA buffer；
+- **复用既有 `NoFSegmentManager` 框架**：在原有 1:1 挂载语义上扩展 `client_refs` 引用计数与 `ForceUnmountSegment`，避免新增平级 manager。
+
+## 7. GDS 与 NDS 核心 API 对比
 
 本节对照两条路径在 transport 层使用的关键 API，说明其在功能上的对应关系与差异，便于评审者快速理解 NDS 分支的"平行"含义。
 
-### 6.1 API 对照表
+### 7.1 API 对照表
 
 | 阶段         | GDS API (NVIDIA)                               | NDS API (Ascend)                                  | 说明                                                 |
 | ------------ | ---------------------------------------------- | ------------------------------------------------- | ---------------------------------------------------- |
@@ -353,13 +549,13 @@ flowchart LR
 | 批量提交     | `cuFileBatchIOSetUp / cuFileBatchIOSubmit`   | (暂未提供)                                        | NDS 当前无 batch API，由线程池+任务队列替代          |
 | 批量状态查询 | `cuFileBatchIOGetStatus`                     | (暂未提供)                                        | NDS 路径通过`task.success/failed_slice_count` 聚合 |
 
-### 6.2 设计差异说明
+### 7.2 设计差异说明
 
 - **设备标识**：GDS 通过 CUDA context 隐式确定设备；NDS 在每个 API 显式传入 `device_id`，便于在多 NPU 卡场景下精确路由。
-- **批量能力**：GDS 提供完整的 batch 提交/查询 API，可在一次 syscall 内完成多段 IO；NDS 当前仅提供单次 read/write，本提案以线程池并发弥补，待 NDS 后续提供 batch API 后可平滑切换（见第 9 节后续工作）。
+- **批量能力**：GDS 提供完整的 batch 提交/查询 API，可在一次 syscall 内完成多段 IO；NDS 当前仅提供单次 read/write，本提案以线程池并发弥补，待 NDS 后续提供 batch API 后可平滑切换（见第 10 节后续工作）。
 - **句柄语义**：GDS 的 `CUfileHandle_t` 是不透明指针；NDS 的 `nds_Handle` 同样为不透明指针，但其生命周期与 fd 绑定，注销时以 fd 为索引。
 
-## 7. 配置与可观测性
+## 8. 配置与可观测性
 
 通过环境变量进行运行时配置（无需改代码）：
 
@@ -369,22 +565,24 @@ flowchart LR
 | `MC_NDS_DEVICE_ID`        | NPU device id     | `-1`（不初始化）  |
 | `MC_NDS_THREAD_POOL_SIZE` | NDS worker 线程数 | `8`（范围 1–64） |
 
+master 层 SSD segment 的心跳参数（探测间隔、超时、失败阈值）通过 `MasterServiceConfig` 注入，默认值参见 6.4。
+
 状态查询在 NDS 路径下直接基于 `task.success_slice_count / failed_slice_count` 聚合，与 GDS 路径基于 `CUfileIOEvents_t` 的查询语义保持一致（参见 5.3）。
 
-## 8. 与社区路线的协同
+## 9. 与社区路线的协同
 
-- 与 #1940 / #2084 互补：本提案聚焦 transport 层的 NPU 直连，不触及 store 层的 NoF segment 管理、心跳、SSD 注册脚本，这些能力可由 #1940 / #2084 提供，二者可叠加使用。
+- 与 SPDK 路线互补：本提案在 transport 层引入 NPU 直连分支（第 4、5 章），并在 master 层扩展 NoF segment 的共享/心跳/故障隔离能力（第 6 章）。SSD 注册脚本、运维工具等仍可由 SPDK 路线提供，二者可叠加使用。
 - 不修改既有 GDS 分支：`CuFileContext`、`CUFileDescPool` 保持原样，存量用户编译/行为不变。
-- 不替换 LMCache pinned memory：#1940 为满足 SPDK 的 huge page 要求，将 LMCache 的 `cudaHostAlloc()` 改造为「SPDK 分配 huge page + `cudaHostRegister()`」。NDS 路径下数据直接在 NPU HBM 与 NVMe-oF target 间 DMA，不经过 host CPU 内存，因此无需触动 LMCache 的既有分配逻辑，降低跨组件耦合。
+- 不涉及 host 侧 buffer 分配：NDS 路径下数据直接在 NPU HBM 与 NVMe-oF target 间 DMA，无需像 SPDK 路径那样分配 host 侧 DMA buffer，降低跨组件耦合。
 
-## 9. 后续工作
+## 10. 后续工作
 
 1. 在 NDS 提供 batch API 后，将 `NdsWorkerThreadPool` 替换为与 `CUFileDescPool` 对称的 batch 提交模型；
-2. 在 `Slice` 层面引入更细粒度的 `transferred_bytes` 上报，对齐 GDS 路径的事件粒度；
-3. 评估是否抽取公共 `NvmeOfFileContext` 抽象基类，统一 GDS/NDS 的句柄管理接口。
+2. 评估是否抽取公共 `NvmeOfFileContext` 抽象基类，统一 GDS/NDS 的句柄管理接口；
+3. 评估 master 层 `ScopedNoFSegmentAccess` 与既有 `ScopedSegmentAccess` 是否抽取公共基类，统一引用计数与心跳接口。
 
-## 10. 参考文献
+## 11. 参考文献
 
-- [#1940 SSD pool over NVMe-oF (SPDK)](https://github.com/kvcache-ai/Mooncake/issues/1940)
-- [#2084 NVMe-oF SSD cache support (SPDK 补充)](https://github.com/kvcache-ai/Mooncake/pull/2084)
+- [#1940 SSD pool over NVMe-oF](https://github.com/kvcache-ai/Mooncake/issues/1940)
+- [#2084 NVMe-oF SSD cache support](https://github.com/kvcache-ai/Mooncake/pull/2084)
 - NVIDIA GDS: https://docs.nvidia.com/gpudirect-storage/
