@@ -33,6 +33,12 @@ class NdsFileContext {
 
     explicit NdsFileContext(const char *filename, int32_t device_id)
         : device_id_(device_id) {
+#ifdef NDS_USE_STUB
+        // Stub mode: skip real file open, use dummy fd
+        fd_ = -1;
+        handle_ = nds_file_register(0);
+        (void)filename;
+#else
         fd_ = open(filename, O_RDWR);
         if (fd_ < 0) {
             LOG(ERROR) << "NdsFileContext: Failed to open file " << filename
@@ -48,6 +54,7 @@ class NdsFileContext {
             fd_ = -1;
             return;
         }
+#endif
     }
 
     NdsFileContext(const NdsFileContext &) = delete;
