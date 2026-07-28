@@ -3,6 +3,7 @@ project(mooncake CXX C)
 
 # indicates cmake is invoked from top-level dir
 set(GLOBAL_CONFIG "true")
+link_libraries(atomic)
 
 include(mooncake-common/FindJsonCpp.cmake)
 include(mooncake-common/FindGLOG.cmake)
