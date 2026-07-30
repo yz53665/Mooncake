@@ -51,15 +51,15 @@
 
 本提案与 SPDK 路线（#1940 / #2084）**面向不同硬件、互不替代**。NDS 路径由两个编译宏协同启用：`USE_NOF` 负责 master 层 NoF segment 管理基础设施，`USE_NVMEOF_NDS` 负责 transport 层的 NDS 直连数据路径。只定义 `USE_NOF` 时保持原有 SPDK 路径不变（store 层使用 SpdkWrapper）；同时定义 `USE_NOF` 与 `USE_NVMEOF_NDS` 时，master 层复用 NoF segment 管理，transport 层替换为 NDS 直连。在混合集群中，GPU 节点仅编译 `USE_NOF`，NPU 节点同时编译 `USE_NOF` 与 `USE_NVMEOF_NDS`，共享同一套 master 和 segment 池。下表列出二者在定位上的差异：
 
-| 维度             | SPDK 路线 (#1940 / #2084)                                                    | 本提案 (NDS 路线)                                         |
-| ---------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------- |
-| 适用硬件         | NVIDIA GPU（依赖 CUDA）                                                      | 昇腾 NPU（基于 NDS 用户态库）                             |
-| 存储后端接入方式 | SPDK 用户态驱动直连 NVMe-oF target                                           | 复用 NDS C API                                            |
-| Host 内存        | 通过 SPDK 分配 host 侧 DMA buffer                                            | 不涉及，NPU HBM 直接经 NDS 落盘                           |
-| Segment 管理     | 独立的`NoFSegmentManager`、心跳、注册脚本                                  | 在既有 NoFSegmentManager 基础上扩展共享/心跳/故障隔离     |
-| Transport 改动   | 新增 store 层模块                                                            | transport 层新增平行分支 + master 层扩展 NoF segment 管理 |
-| 与 GDS 关系      | 替代/并行于既有 transport                                                    | 与 GDS 完全平行，编译宏切换                               |
-| 集群级共存       | GPU 节点编译 `USE_NOF`，NPU 节点编译 `USE_NOF + USE_NVMEOF_NDS`，共享 master 与 segment 池 | 同左                                                      |
+| 维度             | SPDK 路线 (#1940 / #2084)                                                                     | 本提案 (NDS 路线)                                         |
+| ---------------- | --------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| 适用硬件         | NVIDIA GPU（依赖 CUDA）                                                                       | 昇腾 NPU（基于 NDS 用户态库）                             |
+| 存储后端接入方式 | SPDK 用户态驱动直连 NVMe-oF target                                                            | 复用 NDS C API                                            |
+| Host 内存        | 通过 SPDK 分配 host 侧 DMA buffer                                                             | 不涉及，NPU HBM 直接经 NDS 落盘                           |
+| Segment 管理     | 独立的`NoFSegmentManager`、心跳                                                             | 在既有 NoFSegmentManager 基础上扩展共享/心跳/故障隔离     |
+| Transport 改动   | 新增 store 层模块                                                                             | transport 层新增平行分支 + master 层扩展 NoF segment 管理 |
+| 与 GDS 关系      | 替代/并行于既有 transport                                                                     | 与 GDS 完全平行，编译宏切换                               |
+| 集群级共存       | GPU 节点编译`USE_NOF`，NPU 节点编译 `USE_NOF + USE_NVMEOF_NDS`，共享 master 与 segment 池 | 同左                                                      |
 
 在实现路径上，本提案不引入 SPDK 依赖、不涉及 host 侧 buffer 分配、复用既有 `NoFSegmentManager` 框架，与 SPDK 路线在代码层面完全解耦。两条路径的共存策略详见第 6.5 节。
 
@@ -219,12 +219,6 @@ classDiagram
     class nds_batch_handle_t {
         <<typedef>>
     }
-    class nds_segment_info {
-        +uint8_t eid[16]
-        +uint32_t uasid
-        +uint32_t jetty_id
-        +uint32_t token_id
-    }
     class nds_batch_io_params_t {
         +nds_batch_mode_t mode
         +nds_batch_io_param_batch_t u.batch
@@ -245,17 +239,11 @@ classDiagram
         +nds_deinit(device_id) void
         +nds_buf_register(device_id, buf, len) int
         +nds_buf_deregister(device_id, buf) int
-        +nds_get_segment_info(buf, out) int
         +nds_file_register(fd) nds_Handle
         +nds_file_deregister(fd) int
-        +nds_read(handle, device_id, buf, nbyte, offset) ssize_t
-        +nds_write(handle, device_id, buf, nbyte, offset) ssize_t
-        +nds_read_imported(handle, segment, buf, nbyte, offset) ssize_t
-        +nds_write_imported(handle, segment, buf, nbyte, offset) ssize_t
         +nds_batch_io_setup(handle, max_nr) int
         +nds_batch_io_submit(handle, nr, params, flags) int
         +nds_batch_io_get_status(handle, min_nr, nr, events, timeout) int
-        +nds_batch_io_reset(handle) int
         +nds_batch_io_destroy(handle) int
     }
     nds_file_ctx_t ..> nds_Handle
@@ -335,29 +323,22 @@ flowchart TD
 
 #### 4.3.1 API 对照表
 
-| 阶段         | GDS API (NVIDIA)                               | NDS API (Ascend)                                           | 说明                                                 |
-| ------------ | ---------------------------------------------- | ---------------------------------------------------------- | ---------------------------------------------------- |
-| 驱动初始化   | `cuFileDriverOpen()`                         | `nds_init(device_id)`                                    | NDS 显式接收`device_id`，与多卡场景对齐            |
-| 驱动释放     | `cuFileDriverClose()`                        | `nds_deinit(device_id)`                                  | —                                                   |
-| 设备内存注册 | `cuFileBufRegister(addr, len, flags)`        | `nds_buf_register(device_id, buf, len)`                  | NDS 同样以 HBM 地址为输入                            |
-| 设备内存注销 | `cuFileBufDeregister(addr)`                  | `nds_buf_deregister(device_id, buf)`                     | —                                                   |
-| 文件句柄注册 | `cuFileHandleRegister(&handle, &desc)`       | `nds_file_register(fd)`                                  | NDS 直接接收 fd，返回`nds_Handle`                  |
-| 文件句柄注销 | `cuFileHandleDeregister(handle)`             | `nds_file_deregister(fd)`                                | NDS 以 fd 为索引                                     |
-| 单次读       | `cuFileRead(handle, buf, len, offset, ...)`  | `nds_read(handle, device_id, buf, len, offset)`          | NDS 显式传入`device_id`                            |
-| 单次写       | `cuFileWrite(handle, buf, len, offset, ...)` | `nds_write(handle, device_id, buf, len, offset)`         | —                                                   |
-| 远程段导出   | (无对等 API)                                   | `nds_get_segment_info(buf, out)`                          | 导出已注册 HBM 段的远程访问元数据                     |
-| 远程导入读   | (无对等 API)                                   | `nds_read_imported(handle, segment, buf, nbyte, offset)`  | 跨进程/跨节点读取远端已注册 HBM 段                   |
-| 远程导入写   | (无对等 API)                                   | `nds_write_imported(handle, segment, buf, nbyte, offset)` | 跨进程/跨节点写入远端已注册 HBM 段                   |
-| 批量提交     | `cuFileBatchIOSetUp / cuFileBatchIOSubmit`   | `nds_batch_io_setup / nds_batch_io_submit`                      | 两者均支持批量异步 IO，参数结构不同                   |
-| 批量状态查询 | `cuFileBatchIOGetStatus`                     | `nds_batch_io_get_status`                                     | NDS 返回`nds_batch_io_events_t`，含 cookie/status/ret |
-| 批量重置     | (需销毁重建)                                   | `nds_batch_io_reset`                                         | NDS 支持重置 batch 上下文以复用                       |
-| 批量销毁     | `cuFileBatchIODestroy`                       | `nds_batch_io_destroy`                                       | —                                                   |
+| 阶段         | GDS API (NVIDIA)                             | NDS API (Ascend)                             | 说明                                                    |
+| ------------ | -------------------------------------------- | -------------------------------------------- | ------------------------------------------------------- |
+| 驱动初始化   | `cuFileDriverOpen()`                       | `nds_init(device_id)`                      | NDS 显式接收`device_id`，与多卡场景对齐               |
+| 驱动释放     | `cuFileDriverClose()`                      | `nds_deinit(device_id)`                    | —                                                      |
+| 设备内存注册 | `cuFileBufRegister(addr, len, flags)`      | `nds_buf_register(device_id, buf, len)`    | NDS 同样以 HBM 地址为输入                               |
+| 设备内存注销 | `cuFileBufDeregister(addr)`                | `nds_buf_deregister(device_id, buf)`       | —                                                      |
+| 文件句柄注册 | `cuFileHandleRegister(&handle, &desc)`     | `nds_file_register(fd)`                    | NDS 直接接收 fd，返回`nds_Handle`                     |
+| 文件句柄注销 | `cuFileHandleDeregister(handle)`           | `nds_file_deregister(fd)`                  | NDS 以 fd 为索引                                        |
+| 批量提交     | `cuFileBatchIOSetUp / cuFileBatchIOSubmit` | `nds_batch_io_setup / nds_batch_io_submit` | 两者均支持批量异步 IO，参数结构不同                     |
+| 批量状态查询 | `cuFileBatchIOGetStatus`                   | `nds_batch_io_get_status`                  | NDS 返回`nds_batch_io_events_t`，含 cookie/status/ret |
+| 批量销毁     | `cuFileBatchIODestroy`                     | `nds_batch_io_destroy`                     | —                                                      |
 
 #### 4.3.2 设计差异说明
 
 - **设备标识**：GDS 通过 CUDA context 隐式确定设备；NDS 在每个 API 显式传入 `device_id`，便于在多 NPU 卡场景下精确路由。
-- **批量能力**：GDS 与 NDS 均提供完整的 batch 异步 IO API（`setup / submit / get_status / destroy`）。NDS 的 batch 参数通过 `nds_batch_io_params_t` 描述（含 `mode`、`nds_handle`、`opcode`、`cookie`、`device_id`），与 GDS 的 `CUfileIOParams_t` 语义对等。NDS 额外提供 `nds_batch_io_reset` 用于复用 batch 上下文。
-- **远程段访问**：NDS 提供 `nds_get_segment_info` / `nds_read_imported` / `nds_write_imported` 三个跨进程 API，允许一个进程导出已注册的 HBM 段元数据，另一进程通过导入该元数据直接对远端 HBM 发起 DMA 读写，GDS 无对等功能。
+- **批量能力**：GDS 与 NDS 均提供完整的 batch 异步 IO API（`setup / submit / get_status / destroy`）。NDS 的 batch 参数通过 `nds_batch_io_params_t` 描述（含 `mode`、`nds_handle`、`opcode`、`cookie`、`device_id`），与 GDS 的 `CUfileIOParams_t` 语义对等。
 - **句柄语义**：GDS 的 `CUfileHandle_t` 是不透明指针；NDS 的 `nds_Handle` 同样为不透明指针，但其生命周期与 fd 绑定，注销时以 fd 为索引。
 
 ## 5. Master 层 SSD Segment 管理
@@ -549,14 +530,14 @@ graph TB
 
 两条路径的关键差异：
 
-| 维度         | SPDK NoF 路径                                                  | NDS NoF 路径                                                                   |
-| ------------ | -------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| 编译宏       | `USE_NOF`                                                    | `USE_NOF + USE_NVMEOF_NDS`                                                                   |
-| 传输层位置   | store 层内`SpdkWrapper` + `SpdkNofWorkerPool`              | transfer-engine 层`NVMeoFTransport`（NDS 分支）                              |
-| 数据路径     | host 内存 → SPDK → 网络 → target                            | NPU HBM → NDS → PCIe → target                                               |
-| host 内存    | 需要`spdk_zmalloc` 分配 DMA buffer                           | 不涉及                                                                         |
-| segment 寻址 | `transport_endpoint_` 作为 NVMe-oF transport string 直接连接 | `transport_endpoint_` 作为 segment name 传给 `TransferEngine::openSegment` |
-| 流控         | `SpdkNofQos`（per-segment inflight 限制）                    | 复用 NDS batch API 的内置异步能力，`NdsDescPool` 与 `CUFileDescPool` 模式对齐                  |
+| 维度         | SPDK NoF 路径                                                  | NDS NoF 路径                                                                      |
+| ------------ | -------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| 编译宏       | `USE_NOF`                                                    | `USE_NOF + USE_NVMEOF_NDS`                                                      |
+| 传输层位置   | store 层内`SpdkWrapper` + `SpdkNofWorkerPool`              | transfer-engine 层`NVMeoFTransport`（NDS 分支）                                 |
+| 数据路径     | host 内存 → SPDK → 网络 → target                            | NPU HBM → NDS → PCIe → target                                                  |
+| host 内存    | 需要`spdk_zmalloc` 分配 DMA buffer                           | 不涉及                                                                            |
+| segment 寻址 | `transport_endpoint_` 作为 NVMe-oF transport string 直接连接 | `transport_endpoint_` 作为 segment name 传给 `TransferEngine::openSegment`    |
+| 流控         | `SpdkNofQos`（per-segment inflight 限制）                    | 复用 NDS batch API 的内置异步能力，`NdsDescPool` 与 `CUFileDescPool` 模式对齐 |
 
 ### 6.2 Store 层路由扩展
 
@@ -585,19 +566,103 @@ flowchart TD
 
 ### 6.3 Segment 元数据注册
 
-NDS 路径下，`NVMeoFTransport` 通过 `TransferMetadata::getSegmentDescByID(target_id)` 获取 segment 描述符，从中读取 `nvmeof_buffers` 中的本地块设备路径来执行 IO。因此，当 master 挂载 NoF segment 之后，client 侧需要将 segment 元数据注册到本地 TransferEngine 的 metadata 中。
+#### 6.3.1 NoFSegment 结构体适配分析
 
-注册流程在 **client 初始化 TransferEngine 时自动进行**：client 启动后，通过 RPC 从 master 拉取当前所有已挂载的 NoF segment 列表，逐个注册到本地的 `TransferMetadata` 中。后续 master 新挂载 segment 时，通过已有的心跳/状态同步机制使 client 增量更新。
+当前 `NoFSegment` 结构体定义如下（[types.h](file:///home/qiuruiqi/prj/Mooncake-qrq/mooncake-store/include/types.h) 第 418-427 行）：
+
+```cpp
+struct NoFSegment {
+    UUID id{0, 0};
+    std::string name{};    // 逻辑段名称，用于优选分配
+    uintptr_t base{0};     // NVMe 命名空间偏移量
+    size_t size{0};        // 段容量（字节）
+    std::string te_endpoint{};  // TE p2p 端点（ip:port）
+};
+```
+
+**NDS 路径下的需求分析**：`NVMeoFTransport` 在提交 IO 时需要通过 `TransferMetadata::getSegmentDescByID(target_id)` 获取 segment 描述符，从中读取 `nvmeof_buffers` 中的本地块设备路径（如 `/dev/nvme0n1`），再通过 `open()` + `nds_file_register()` 建立 NDS 句柄。当前 `NoFSegment` 缺少存储本地块设备路径的字段，因此需新增 `device_path`：
+
+```cpp
+struct NoFSegment {
+    UUID id{0, 0};
+    std::string name{};
+    uintptr_t base{0};
+    size_t size{0};
+    std::string te_endpoint{};
+    std::string device_path{};  // 新增：本地 NVMe 块设备路径，NDS 路径使用
+};
+```
+
+| 字段 | NDS 路径用途 | SPDK 路径 |
+|---|---|---|
+| `name` | 作为 segment 标识，与现有逻辑一致 | 同 |
+| `base` | NVMe 命名空间偏移（对 NDS 同样有效） | 同 |
+| `size` | 段容量，构造 `nvmeof_buffers[].length` | 同 |
+| `te_endpoint` | 作为 `SegmentDesc.name`，关联 transport 路由 | 用于 NVMe-oF transport string |
+| `device_path`（新增） | 本地块设备路径，供 `NdsFileContext` 打开并注册 NDS 句柄 | 不需要（SPDK 通过 transport string 直连） |
+
+`NoFSegmentManager::MountSegment()` 中已有字段均保持不变，`device_path` 仅在 NDS 路径下被读取并写入 `SegmentDesc.nvmeof_buffers[].local_path_map`。
+
+#### 6.3.2 设备路径配置与 Segment 自动挂载
+
+设备路径的传入方式参考已有 `ssd_offload_path` 参数模式：在 `store.setup()` 调用时通过新增参数 `nof_device_path` 指定本地 NVMe 块设备路径，在 `install()` 中被注册为一个独立的 `NoFSegment`，由 client 在初始化阶段自动完成注册与挂载，无需外部脚本介入。
+
+完整流程分为两个阶段，参考 RDMA TE 的 `install()` → `addLocalSegment()` → `updateLocalSegmentDesc()` 自动注册模式：
+
+**第一阶段：发起节点自动注册与挂载**
 
 ```mermaid
 sequenceDiagram
-    participant Client as Client 进程
+    participant User as 用户/上层
+    participant RC as RealClient
+    participant TE as TransferEngine
+    participant NVT as NVMeoFTransport
+    participant TM as TransferMetadata
+    participant MS as MasterService
+    participant NSM as NoFSegmentManager
+
+    Note over User,NSM: 第一阶段：setup() → install() → 自动挂载
+    User->>RC: setup(noF_device_path="/dev/nvme0n1")
+    RC->>TE: install("nvmeof", ...)
+    TE->>NVT: install(local_server_name, metadata, topo)
+    Note over NVT: open() 获取 fd<br/>从 /sys/block 读取容量
+    NVT->>NVT: 构造 SegmentDesc{<br/>  protocol="nvmeof",<br/>  nvmeof_buffers=[{device_path, size}]}
+    NVT->>TM: addLocalSegment(segment_id, name, desc)
+    TM-->>NVT: OK
+    NVT->>TM: updateLocalSegmentDesc()
+    Note over TM: 发布到 etcd/redis
+    NVT-->>TE: OK
+
+    MS->>TM: 监听元数据变更 / 心跳感知新 segment
+    MS->>NSM: MountSegment(NoFSegment{name, size, te_endpoint, device_path})
+    Note over NSM: 创建 OffsetBufferAllocator<br/>注册到 mounted_segments_
+    NSM-->>MS: OK
+```
+
+流程说明：
+
+1. **参数传入**：用户调用 `store.setup(noF_device_path="/dev/nvme0n1")` 指定本地 NVMe 块设备路径，类似 `ssd_offload_path` 的传递模式（经 `RealClient::setup_internal()` 传入 `NVMeoFTransport::install()`）。
+2. **设备验证与信息获取**：`NVMeoFTransport::install()` 对指定设备 `open()` 获取 fd，从 `/sys/block/<device>/size` × 512 获取容量。
+3. **构造 SegmentDesc**：以 `device_path` 填充 `nvmeof_buffers[].local_path_map[local_server_name_]`，`protocol = "nvmeof"`。
+4. **本地注册**：调用 `metadata_->addLocalSegment(segment_id, name, desc)`（复用 RDMA TE 已有接口）。
+5. **发布到元数据存储**：调用 `metadata_->updateLocalSegmentDesc()` 发布到 etcd/redis，使 master 可见（复用 RDMA TE 已有接口）。
+6. **Master 自动挂载**：master 通过监听元数据存储变更或心跳感知新 segment，调用 `NoFSegmentManager::MountSegment()` 完成挂载（详见第 5.3 节）。
+
+挂载所需全部信息（设备路径、容量）均由 `noF_device_path` 参数提供，无需自动扫描 `/dev/nvme*`，避免误发现非目标设备。
+
+**第二阶段：其他 client 同步**
+
+其他 client 节点初始化 TransferEngine 时，通过 RPC 从 master 拉取当前所有已挂载的 NoF segment 列表，逐个注册到本地的 `TransferMetadata` 中。后续 master 新挂载 segment 时，通过已有的心跳/状态同步机制使 client 增量更新。
+
+```mermaid
+sequenceDiagram
+    participant Client as 其他 Client 进程
     participant TE as TransferEngine
     participant TM as TransferMetadata
     participant MS as MasterService
     participant NSM as NoFSegmentManager
 
-    Note over Client,NSM: Client 初始化阶段
+    Note over Client,NSM: 第二阶段：其他 Client 初始化时从 master 拉取
     Client->>TE: 初始化 TransferEngine
     TE->>MS: 拉取已挂载的 NoF segment 列表
     MS->>NSM: 查询 mounted_segments_
@@ -621,7 +686,7 @@ sequenceDiagram
 | `nvmeof_buffers[].local_path_map` | `NoFSegment.device_path`（新增字段） | 本地 NVMe 块设备路径，如`/dev/nvme0n1`                                   |
 | `nvmeof_buffers[].length`         | `NoFSegment.size`                    | segment 总大小                                                             |
 
-`device_path` 是 `NoFSegment` 结构体中新增的字段，由 SSD 注册脚本在挂载时填充。该字段仅在 NDS 路径下使用，SPDK 路径不需要（SPDK 通过 `te_endpoint` 中的 transport string 直接连接远端 target）。
+`device_path` 是 `NoFSegment` 结构体中新增的字段，在 `NVMeoFTransport::install()` 阶段由 `noF_device_path` 参数填充。该字段仅在 NDS 路径下使用，SPDK 路径不需要（SPDK 通过 `te_endpoint` 中的 transport string 直接连接远端 target）。
 
 ### 6.4 心跳探测接口替换
 
@@ -661,10 +726,10 @@ NDS 探针实现要点：
 
 **编译期隔离**：
 
-| 编译宏                                      | 编译范围                                          | 链接依赖      |
-| ------------------------------------------- | ------------------------------------------------- | ------------- |
-| `USE_NOF=ON, USE_NVMEOF_NDS=OFF`          | store 层：`SpdkWrapper` + `SpdkNofWorkerPool` | SPDK 静态库   |
-| `USE_NOF=ON, USE_NVMEOF_NDS=ON`           | transport 层：`NVMeoFTransport` NDS 分支        | `libnds.so` |
+| 编译宏                             | 编译范围                                          | 链接依赖      |
+| ---------------------------------- | ------------------------------------------------- | ------------- |
+| `USE_NOF=ON, USE_NVMEOF_NDS=OFF` | store 层：`SpdkWrapper` + `SpdkNofWorkerPool` | SPDK 静态库   |
+| `USE_NOF=ON, USE_NVMEOF_NDS=ON`  | transport 层：`NVMeoFTransport` NDS 分支        | `libnds.so` |
 
 `USE_NOF` 控制 master/store 层的 NoF segment 管理基础设施，`USE_NVMEOF_NDS` 控制 transport 层是否使用 NDS 直连（否则使用 GDS）。两者作用在不同层次，可独立组合。
 
@@ -769,11 +834,12 @@ sequenceDiagram
 
 通过环境变量进行运行时配置（无需改代码）：
 
-| 环境变量                    | 含义              | 默认值              |
-| --------------------------- | ----------------- | ------------------- |
-| `USE_NOF`（编译期）             | 启用 NoF 基础设施（master 层） | `OFF`             |
-| `USE_NVMEOF_NDS`（编译期）     | 启用 NDS 传输分支（transport 层） | `OFF`             |
-| `MC_NDS_DEVICE_ID`              | NPU device id                   | `-1`（从 aclrtGetDevice 获取）  |
+| 环境变量                     | 含义                              | 默认值                           |
+| ---------------------------- | --------------------------------- | -------------------------------- |
+| `USE_NOF`（编译期）        | 启用 NoF 基础设施（master 层）    | `OFF`                          |
+| `USE_NVMEOF_NDS`（编译期） | 启用 NDS 传输分支（transport 层） | `OFF`                          |
+| `MC_NDS_DEVICE_ID`         | NPU device id                     | `-1`（从 aclrtGetDevice 获取） |
+| `noF_device_path`（setup 参数） | 本地 NVMe 块设备路径（单次一个） | 空（不启用 NoF segment）    |
 
 master 层 SSD segment 的心跳参数（探测间隔、超时、失败阈值）通过 `MasterServiceConfig` 注入，默认值参见第 5.4 节。
 
@@ -781,7 +847,7 @@ master 层 SSD segment 的心跳参数（探测间隔、超时、失败阈值）
 
 ## 8. 与社区路线的协同
 
-- 与 SPDK 路线互补（定位差异见第 2.4 节）：本提案在 transport 层引入 NPU 直连分支，并在 master 层扩展 NoF segment 的共享/心跳/故障隔离能力。SSD 注册脚本、运维工具等仍可由 SPDK 路线提供，二者可叠加使用。
+- 与 SPDK 路线互补（定位差异见第 2.4 节）：本提案在 transport 层引入 NPU 直连分支，并在 master 层扩展 NoF segment 的共享/心跳/故障隔离能力。运维工具等仍可由 SPDK 路线提供，二者可叠加使用。
 - 不修改既有 GDS 分支：`CuFileContext`、`CUFileDescPool` 保持原样，存量用户编译/行为不变。
 
 ## 9. 后续工作
@@ -790,7 +856,7 @@ master 层 SSD segment 的心跳参数（探测间隔、超时、失败阈值）
 2. 评估是否抽取公共 `NvmeOfFileContext` 抽象基类，统一 GDS/NDS 的句柄管理接口；
 3. 评估 master 层 `ScopedNoFSegmentAccess` 与既有 `ScopedSegmentAccess` 是否抽取公共基类，统一引用计数与心跳接口；
 4. 实现 `submitNdsNofOperation` 及 `TransferSubmitter` 中的 `USE_NOF + USE_NVMEOF_NDS` 路由分支（第 6.2 节）；
-5. 在 `NoFSegment` 中增加 `device_path` 字段，并在 client 初始化 TransferEngine 时完成 `SegmentDesc` 的 metadata 自动注册（第 6.3 节）；
+5. 在 `NoFSegment` 中增加 `device_path` 字段，在 `store.setup()` 中新增 `noF_device_path` 参数，并在 `NVMeoFTransport::install()` 中基于该参数完成 device 验证与 SegmentDesc 的 metadata 自动注册（第 6.3 节）；
 6. 在 `MasterService` 构造中为 `USE_NOF + USE_NVMEOF_NDS` 绑定基于 `nds_read` 的默认 `NoFProbeFn`，替换当前仅 `USE_NOF` 的探针绑定（第 6.4 节）；
 7. 在 `NVMeoFTransport` 的 transport 层补齐 QoS 流控能力，使其达到与 SPDK 路径 `SpdkNofQos` 对等的水平。
 
