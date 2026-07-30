@@ -45,7 +45,7 @@
 - **NPU HBM 与 NVMe-oF 直连**：通过 NDS 库实现 HBM ↔ NVMe-oF 的直接搬运，数据面不经过 host 内存中转。
 - **零侵入既有路径**：不修改 GDS 分支，不引入 SPDK 依赖，不触动 host 侧 buffer 分配逻辑。
 - **扩展 master 层 SSD segment 管理**：在既有 `NoFSegmentManager` 基础上补齐多 client 共享（`client_refs`）、探针注入（`NoFProbeFn`）、复用强制卸载链路，使 NDS 路径与既有 SPDK 路线共享同一套 segment 生命周期管理框架。
-- **与现有 batch 提交模型对等**：NDS 提供与 GDS `cuFileBatchIOSetUp / cuFileBatchIOSubmit / cuFileBatchIOGetStatus` 对等的 batch 异步 IO API（`ndsBatchIOSetUp / ndsBatchIOSubmit / ndsBatchIOGetStatus`），`NdsDescPool` 封装 NDS batch 上下文管理与 handle 复用池，与 `CUFileDescPool` 的设计模式对齐。
+- **与现有 batch 提交模型对等**：NDS 提供与 GDS `cuFileBatchIOSetUp / cuFileBatchIOSubmit / cuFileBatchIOGetStatus` 对等的 batch 异步 IO API（`nds_batch_io_setup / nds_batch_io_submit / nds_batch_io_get_status`），`NdsDescPool` 封装 NDS batch 上下文管理与 handle 复用池，与 `CUFileDescPool` 的设计模式对齐。
 
 ### 2.4 与 SPDK 路线的定位差异
 
@@ -76,19 +76,22 @@ graph TB
         NSM -->|挂载/卸载/心跳<br/>地址偏移寻址| SEG[(SSD Segment<br/>块设备)]
     end
 
-    subgraph Existing["既有 NVMe-oF Transport (GDS 路径)"]
+    subgraph Transport["NVMe-oF Transport 层"]
         TE[TransferEngine]
         NVT[NVMeoFTransport]
+        TE --> NVT
+    end
+
+    subgraph Existing["既有后端 (GDS 路径)"]
         CFC[CuFileContext]
         CDP[CUFileDescPool]
-        TE --> NVT
         NVT -->|USE_NVMEOF_NDS=OFF| CFC
         NVT -->|USE_NVMEOF_NDS=OFF| CDP
         CFC -->|cuFileHandleRegister| GDS[(NVIDIA GDS Lib)]
         CDP -->|cuFileBatchIOSubmit| GDS
     end
 
-    subgraph Proposed["本提案新增 (NDS 路径)"]
+    subgraph Proposed["本提案新增后端 (NDS 路径)"]
         NDS_CTX[NdsFileContext]
         NDS_BATCH[NdsDescPool]
         NDS_API[nds.h C API]
@@ -175,12 +178,12 @@ classDiagram
     }
 
     class NdsDescPool {
-        -ndsBatchHandle_t handle_pool_[]
+        -nds_batch_handle_t handle_pool_[]
         -NdsBatchDesc* descs_[256]
         +allocNdsDesc(batch_size) int
         +pushParams(idx, params, slice) int
         +submitBatch(idx) int
-        +getTransferStatus(idx, slice_id) ndsBatchIOEvents_t
+        +getTransferStatus(idx, slice_id) nds_batch_io_events_t
         +getSliceNum(idx) int
         +freeNdsDesc(idx) int
         +getDesc(idx) NdsBatchDesc*
@@ -213,7 +216,7 @@ classDiagram
     class nds_Handle {
         <<typedef>>
     }
-    class ndsBatchHandle_t {
+    class nds_batch_handle_t {
         <<typedef>>
     }
     class nds_segment_info {
@@ -222,17 +225,17 @@ classDiagram
         +uint32_t jetty_id
         +uint32_t token_id
     }
-    class ndsBatchIOParams_t {
-        +ndsBatchMode_t mode
-        +ndsBatchIOParamBatch_t u.batch
+    class nds_batch_io_params_t {
+        +nds_batch_mode_t mode
+        +nds_batch_io_param_batch_t u.batch
         +nds_Handle nds_handle
-        +ndsBatchIOOp_t opcode
+        +nds_batch_io_op_t opcode
         +void* cookie
         +int32_t device_id
     }
-    class ndsBatchIOEvents_t {
+    class nds_batch_io_events_t {
         +void* cookie
-        +ndsBatchIOStatus_t status
+        +nds_batch_io_status_t status
         +ssize_t ret
         +int error
     }
@@ -249,16 +252,16 @@ classDiagram
         +nds_write(handle, device_id, buf, nbyte, offset) ssize_t
         +nds_read_imported(handle, segment, buf, nbyte, offset) ssize_t
         +nds_write_imported(handle, segment, buf, nbyte, offset) ssize_t
-        +ndsBatchIOSetUp(handle, max_nr) int
-        +ndsBatchIOSubmit(handle, nr, params, flags) int
-        +ndsBatchIOGetStatus(handle, min_nr, nr, events, timeout) int
-        +ndsBatchIOReset(handle) int
-        +ndsBatchIODestroy(handle) int
+        +nds_batch_io_setup(handle, max_nr) int
+        +nds_batch_io_submit(handle, nr, params, flags) int
+        +nds_batch_io_get_status(handle, min_nr, nr, events, timeout) int
+        +nds_batch_io_reset(handle) int
+        +nds_batch_io_destroy(handle) int
     }
     nds_file_ctx_t ..> nds_Handle
-    ndsBatchIOParams_t ..> nds_Handle
+    nds_batch_io_params_t ..> nds_Handle
     NDSAPI ..> nds_Handle
-    NDSAPI ..> ndsBatchHandle_t
+    NDSAPI ..> nds_batch_handle_t
 ```
 
 ### 4.2 关键流程图
@@ -303,9 +306,9 @@ sequenceDiagram
         FileCtx->>NDS: nds_file_register(fd)
         NDS-->>FileCtx: nds_Handle
         Note over NVT,NdsPool: addSliceToNdsBatch 将 Slice* 作为 cookie<br/>NdsDescPool::pushParams 关联 params 与 slice
-        NVT->>NdsPool: pushParams(idx, ndsBatchIOParams_t, slice)
+        NVT->>NdsPool: pushParams(idx, nds_batch_io_params_t, slice)
     end
-    NdsPool->>NDS: ndsBatchIOSubmit(handle, nr, params, 0)
+    NdsPool->>NDS: nds_batch_io_submit(handle, nr, params, 0)
     NDS-->>NdsPool: 0 (提交成功)
     NVT-->>App: Status::OK()
 
@@ -317,7 +320,7 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     Q["getTransferStatus(batch_id, task_id)"] --> CT{"USE_NVMEOF_NDS?"}
-    CT -->|ON| NDSGET["ndsBatchIOGetStatus<br/>返回 ndsBatchIOEvents_t"]
+    CT -->|ON| NDSGET["nds_batch_io_get_status<br/>返回 nds_batch_io_events_t"]
     NDSGET --> UPDATE["通过 cookie (Slice指针) 更新<br/>Slice::markSuccess / markFailed"]
     UPDATE --> MAP["解析 status / ret / error"]
     MAP --> OUT["返回 status"]
@@ -345,15 +348,15 @@ flowchart TD
 | 远程段导出   | (无对等 API)                                   | `nds_get_segment_info(buf, out)`                          | 导出已注册 HBM 段的远程访问元数据                     |
 | 远程导入读   | (无对等 API)                                   | `nds_read_imported(handle, segment, buf, nbyte, offset)`  | 跨进程/跨节点读取远端已注册 HBM 段                   |
 | 远程导入写   | (无对等 API)                                   | `nds_write_imported(handle, segment, buf, nbyte, offset)` | 跨进程/跨节点写入远端已注册 HBM 段                   |
-| 批量提交     | `cuFileBatchIOSetUp / cuFileBatchIOSubmit`   | `ndsBatchIOSetUp / ndsBatchIOSubmit`                      | 两者均支持批量异步 IO，参数结构不同                   |
-| 批量状态查询 | `cuFileBatchIOGetStatus`                     | `ndsBatchIOGetStatus`                                     | NDS 返回`ndsBatchIOEvents_t`，含 cookie/status/ret |
-| 批量重置     | (需销毁重建)                                   | `ndsBatchIOReset`                                         | NDS 支持重置 batch 上下文以复用                       |
-| 批量销毁     | `cuFileBatchIODestroy`                       | `ndsBatchIODestroy`                                       | —                                                   |
+| 批量提交     | `cuFileBatchIOSetUp / cuFileBatchIOSubmit`   | `nds_batch_io_setup / nds_batch_io_submit`                      | 两者均支持批量异步 IO，参数结构不同                   |
+| 批量状态查询 | `cuFileBatchIOGetStatus`                     | `nds_batch_io_get_status`                                     | NDS 返回`nds_batch_io_events_t`，含 cookie/status/ret |
+| 批量重置     | (需销毁重建)                                   | `nds_batch_io_reset`                                         | NDS 支持重置 batch 上下文以复用                       |
+| 批量销毁     | `cuFileBatchIODestroy`                       | `nds_batch_io_destroy`                                       | —                                                   |
 
 #### 4.3.2 设计差异说明
 
 - **设备标识**：GDS 通过 CUDA context 隐式确定设备；NDS 在每个 API 显式传入 `device_id`，便于在多 NPU 卡场景下精确路由。
-- **批量能力**：GDS 与 NDS 均提供完整的 batch 异步 IO API（`SetUp / Submit / GetStatus / Destroy`）。NDS 的 batch 参数通过 `ndsBatchIOParams_t` 描述（含 `mode`、`nds_handle`、`opcode`、`cookie`、`device_id`），与 GDS 的 `CUfileIOParams_t` 语义对等。NDS 额外提供 `ndsBatchIOReset` 用于复用 batch 上下文。
+- **批量能力**：GDS 与 NDS 均提供完整的 batch 异步 IO API（`setup / submit / get_status / destroy`）。NDS 的 batch 参数通过 `nds_batch_io_params_t` 描述（含 `mode`、`nds_handle`、`opcode`、`cookie`、`device_id`），与 GDS 的 `CUfileIOParams_t` 语义对等。NDS 额外提供 `nds_batch_io_reset` 用于复用 batch 上下文。
 - **远程段访问**：NDS 提供 `nds_get_segment_info` / `nds_read_imported` / `nds_write_imported` 三个跨进程 API，允许一个进程导出已注册的 HBM 段元数据，另一进程通过导入该元数据直接对远端 HBM 发起 DMA 读写，GDS 无对等功能。
 - **句柄语义**：GDS 的 `CUfileHandle_t` 是不透明指针；NDS 的 `nds_Handle` 同样为不透明指针，但其生命周期与 fd 绑定，注销时以 fd 为索引。
 
@@ -578,7 +581,7 @@ flowchart TD
 | 2    | 构造`TransferRequest`                             | `target_id = seg`，`target_offset = handle.buffer_address_`，`source = ptr`，`length = size` |
 | 3    | `submitTransfer({request})`                       | 通过 TransferEngine 提交，由`NVMeoFTransport`（NDS 分支）执行                                      |
 
-此方案复用现有的 `submitTransfer` 路径（与 `submitTransferEngineOperation` 一致），无需在 store 层新增 worker 线程池。流控方面，NDS 的 `ndsBatchIOSubmit` 提供与 GDS `cuFileBatchIOSubmit` 对等的批量异步提交能力，由 `NdsDescPool` 封装（与 `CUFileDescPool` 模式对齐）。
+此方案复用现有的 `submitTransfer` 路径（与 `submitTransferEngineOperation` 一致），无需在 store 层新增 worker 线程池。流控方面，NDS 的 `nds_batch_io_submit` 提供与 GDS `cuFileBatchIOSubmit` 对等的批量异步提交能力，由 `NdsDescPool` 封装（与 `CUFileDescPool` 模式对齐）。
 
 ### 6.3 Segment 元数据注册
 
@@ -689,16 +692,16 @@ NDS 探针实现要点：
 - **NPU (Ascend)**：物理 NPU 卡，其 HBM 是 KV Cache 数据的实际驻留位置。HBM 缓冲区在初始化阶段通过 `nds_buf_register` 注册到 NDS 库，NDS 后续可直接对该地址发起 DMA。
 - **Host Process**：运行 `mooncake-transfer-engine` 的用户态进程，包含三个组件：
   - `NVMeoFTransport`：负责将上层 `TransferRequest` 分解为若干 `Slice`，每个 Slice 描述一段 (HBM 地址, 文件偏移, 长度) 的映射；
-  - `NdsDescPool`：封装 NDS batch 异步 IO 上下文（`ndsBatchIOSetUp / ndsBatchIOSubmit / ndsBatchIOGetStatus`），维护 `ndsBatchHandle_t` 复用池与 `NdsBatchDesc` 数组，负责将批量 Slice 转化为 NDS batch 提交调用；
-  - `NdsFileContext`：持有目标文件 `fd` 与 NDS 句柄 `nds_Handle`，是 `NdsDescPool` 构造 `ndsBatchIOParams_t` 时必须的上下文。
+  - `NdsDescPool`：封装 NDS batch 异步 IO 上下文（`nds_batch_io_setup / nds_batch_io_submit / nds_batch_io_get_status`），维护 `nds_batch_handle_t` 复用池与 `NdsBatchDesc` 数组，负责将批量 Slice 转化为 NDS batch 提交调用；
+  - `NdsFileContext`：持有目标文件 `fd` 与 NDS 句柄 `nds_Handle`，是 `NdsDescPool` 构造 `nds_batch_io_params_t` 时必须的上下文。
 - **Storage Backend**：远端 NVMe-oF target / SSD Pool，对 host 表现为一个块设备文件路径。
 
 **数据流要点**
 
 1. **控制流经 host，数据流不经过 host**：`NVMeoFTransport` 与 `NdsDescPool` 都运行在 host CPU 上，但它们只负责"任务分解"和"调用 NDS batch API"；真正搬运数据的 DMA 由 NDS 库在 NPU HBM 与 NVMe-oF target 之间直接完成，**不经过 host 内存中转**，从而实现与 GDS 对称的 zero-copy 语义。
 2. **文件句柄由 host 打开**：`NdsFileContext` 通过 `open(filename, O_RDWR)` 获得宿主机视角的 `fd`，再经 `nds_file_register(fd)` 转换为 NDS 句柄。这一步是控制面操作，不涉及数据拷贝。
-3. **NDS batch API 的执行模式**：`NdsDescPool` 将一组 Slice 封装为 `ndsBatchIOParams_t` 数组后调用 `ndsBatchIOSubmit` 批量提交，随后通过 `ndsBatchIOGetStatus` 轮询各 Slice 的完成状态（`ndsBatchIOEvents_t`）。为减少 `ndsBatchIOSetUp/Destroy` 的开销，`NdsDescPool` 内部维护 `ndsBatchHandle_t` 复用池。该模式与 GDS 路径的 `CUFileDescPool` 完全对称。
-4. **与 GDS 路径的对称性**：GDS 路径下 `cuFileBatchIOSubmit` 在 GPU 显存与 NVMe-oF target 间直接 DMA；NDS 路径下 `ndsBatchIOSubmit` 在 HBM 与 NVMe-oF target 间直接 DMA。两者都绕过 host DRAM，差别仅在底层库与目标设备。
+3. **NDS batch API 的执行模式**：`NdsDescPool` 将一组 Slice 封装为 `nds_batch_io_params_t` 数组后调用 `nds_batch_io_submit` 批量提交，随后通过 `nds_batch_io_get_status` 轮询各 Slice 的完成状态（`nds_batch_io_events_t`）。为减少 `nds_batch_io_setup/destroy` 的开销，`NdsDescPool` 内部维护 `nds_batch_handle_t` 复用池。该模式与 GDS 路径的 `CUFileDescPool` 完全对称。
+4. **与 GDS 路径的对称性**：GDS 路径下 `cuFileBatchIOSubmit` 在 GPU 显存与 NVMe-oF target 间直接 DMA；NDS 路径下 `nds_batch_io_submit` 在 HBM 与 NVMe-oF target 间直接 DMA。两者都绕过 host DRAM，差别仅在底层库与目标设备。
 
 **架构级数据流**
 
@@ -709,7 +712,7 @@ flowchart LR
     end
     subgraph Host["Host Process (控制面)"]
         NVT[NVMeoFTransport<br/>分解 TransferRequest → Slice]
-        NdsBatch[NdsDescPool<br/>ndsBatchIOSubmit 批量提交]
+        NdsBatch[NdsDescPool<br/>nds_batch_io_submit 批量提交]
         Ctx[NdsFileContext<br/>fd + nds_Handle]
     end
     subgraph Backend["Storage Backend (数据面)"]
@@ -721,7 +724,7 @@ flowchart LR
     NVT -->|open + register| Ctx
     Ctx -->|提供 nds_Handle| NdsBatch
     Ctx -. open(fd) .-> NVME
-    NdsBatch -->|调用 ndsBatchIOSubmit| NDS_API[NDS Lib<br/>驱动 DMA]
+    NdsBatch -->|调用 nds_batch_io_submit| NDS_API[NDS Lib<br/>驱动 DMA]
     HBM ==>|DMA 直传<br/>不经过 host DRAM| NVME
 ```
 
@@ -748,12 +751,12 @@ sequenceDiagram
     TS->>TE: submitTransfer({request})
     TE->>NVT: submitTransferTask(task_list)
     NVT->>NVT: 从 SegmentDesc.nvmeof_buffers<br/>解析 file_path + file_offset
-    Note over NVT,NdsBatch: addSliceToNdsBatch 封装<br/>ndsBatchIOParams_t + Slice*
+    Note over NVT,NdsBatch: addSliceToNdsBatch 封装<br/>nds_batch_io_params_t + Slice*
     NVT->>NdsBatch: allocNdsDesc + pushParams
-    NdsBatch->>NDS: ndsBatchIOSubmit(handle, nr, params, 0)
+    NdsBatch->>NDS: nds_batch_io_submit(handle, nr, params, 0)
     NDS->>TGT: NPU HBM ↔ NVMe-oF DMA
     TGT-->>NDS: 完成
-    NDS-->>NdsBatch: ndsBatchIOGetStatus → events[]
+    NDS-->>NdsBatch: nds_batch_io_get_status → events[]
     NdsBatch-->>NVT: Status
     NVT-->>TE: Status
     TE-->>TS: TransferFuture
@@ -774,7 +777,7 @@ sequenceDiagram
 
 master 层 SSD segment 的心跳参数（探测间隔、超时、失败阈值）通过 `MasterServiceConfig` 注入，默认值参见第 5.4 节。
 
-状态查询在 NDS 路径下通过 `ndsBatchIOGetStatus` 获取 `ndsBatchIOEvents_t`（含 `status`、`ret`、`error`），与 GDS 路径基于 `CUfileIOEvents_t` 的查询语义保持一致（参见第 4.2.3 节）。
+状态查询在 NDS 路径下通过 `nds_batch_io_get_status` 获取 `nds_batch_io_events_t`（含 `status`、`ret`、`error`），与 GDS 路径基于 `CUfileIOEvents_t` 的查询语义保持一致（参见第 4.2.3 节）。
 
 ## 8. 与社区路线的协同
 
