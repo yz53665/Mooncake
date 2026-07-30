@@ -14,7 +14,7 @@
 - [#1940 SSD pool over NVMe-oF](https://github.com/kvcache-ai/Mooncake/issues/1940)：提出了基于 SPDK 的 NVMe-oF SSD Pool 整体架构方案。
 - [#2084 NVMe-oF SSD cache support](https://github.com/kvcache-ai/Mooncake/pull/2084)：在 #1940 基础上实现了 store 层基础设施（`SpdkWrapper`、`NoFSegmentManager`、NoF 心跳与自动卸载、多副本清理、监控指标等），是本仓库中 SPDK NoF 路线的实际代码基础。
 
-本提案通过编译宏 `USE_NDS` 与既有 GDS 路径共存。由于 NPU HBM 直接经 NDS 与 NVMe-oF target 间 DMA，因此无需像 SPDK 路径那样通过 `SpdkWrapper::Alloc` 分配 host 侧 DMA buffer。
+本提案通过编译宏 `USE_NVMEOF_NDS` 在 transport 层启用 NDS 直连路径（替代 GDS），通过 `USE_NOF` 在 master 层启用 NoF segment 管理基础设施。两个宏作用在不同层次，组合使用即可构成完整的 NPU 直连 SSD 方案。由于 NPU HBM 直接经 NDS 与 NVMe-oF target 间 DMA，因此无需像 SPDK 路径那样通过 `SpdkWrapper::Alloc` 分配 host 侧 DMA buffer。
 
 ## 2. 背景与动机
 
@@ -41,15 +41,15 @@
 
 ### 2.3 目标
 
-- **补齐 NPU 直连存储路径**：通过编译宏 `USE_NDS` 在 transport 层引入与 GDS 平行的 NDS 分支。
+- **补齐 NPU 直连存储路径**：通过编译宏 `USE_NVMEOF_NDS` 在 transport 层引入与 GDS 平行的 NDS 分支，通过 `USE_NOF` 在 master 层启用 NoF segment 管理。
 - **NPU HBM 与 NVMe-oF 直连**：通过 NDS 库实现 HBM ↔ NVMe-oF 的直接搬运，数据面不经过 host 内存中转。
 - **零侵入既有路径**：不修改 GDS 分支，不引入 SPDK 依赖，不触动 host 侧 buffer 分配逻辑。
 - **扩展 master 层 SSD segment 管理**：在既有 `NoFSegmentManager` 基础上补齐多 client 共享（`client_refs`）、探针注入（`NoFProbeFn`）、复用强制卸载链路，使 NDS 路径与既有 SPDK 路线共享同一套 segment 生命周期管理框架。
-- **与现有 batch 提交模型对等**：NDS 提供与 GDS `cuFileBatchIOSetUp / cuFileBatchIOSubmit / cuFileBatchIOGetStatus` 对等的 batch 异步 IO API（`ndsBatchIOSetUp / ndsBatchIOSubmit / ndsBatchIOGetStatus`），`NdsBatchContext` 封装 NDS batch 上下文管理，与 `CUFileDescPool` 的设计模式对齐。
+- **与现有 batch 提交模型对等**：NDS 提供与 GDS `cuFileBatchIOSetUp / cuFileBatchIOSubmit / cuFileBatchIOGetStatus` 对等的 batch 异步 IO API（`ndsBatchIOSetUp / ndsBatchIOSubmit / ndsBatchIOGetStatus`），`NdsDescPool` 封装 NDS batch 上下文管理与 handle 复用池，与 `CUFileDescPool` 的设计模式对齐。
 
 ### 2.4 与 SPDK 路线的定位差异
 
-本提案与 SPDK 路线（#1940 / #2084）**面向不同硬件、互不替代**。NDS 路径通过同时定义 `USE_NOF` 与 `USE_NDS` 编译宏启用——`USE_NOF` 提供 NoF segment 管理基础设施，`USE_NDS` 在该基础上替换传输层为 NDS 直连路径。只定义 `USE_NOF` 时保持原有 SPDK 路径不变。在混合集群中，GPU 节点仅编译 `USE_NOF`，NPU 节点同时编译 `USE_NOF` 与 `USE_NDS`，共享同一套 master 和 segment 池。下表列出二者在定位上的差异：
+本提案与 SPDK 路线（#1940 / #2084）**面向不同硬件、互不替代**。NDS 路径由两个编译宏协同启用：`USE_NOF` 负责 master 层 NoF segment 管理基础设施，`USE_NVMEOF_NDS` 负责 transport 层的 NDS 直连数据路径。只定义 `USE_NOF` 时保持原有 SPDK 路径不变（store 层使用 SpdkWrapper）；同时定义 `USE_NOF` 与 `USE_NVMEOF_NDS` 时，master 层复用 NoF segment 管理，transport 层替换为 NDS 直连。在混合集群中，GPU 节点仅编译 `USE_NOF`，NPU 节点同时编译 `USE_NOF` 与 `USE_NVMEOF_NDS`，共享同一套 master 和 segment 池。下表列出二者在定位上的差异：
 
 | 维度             | SPDK 路线 (#1940 / #2084)                                                    | 本提案 (NDS 路线)                                         |
 | ---------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------- |
@@ -59,7 +59,7 @@
 | Segment 管理     | 独立的`NoFSegmentManager`、心跳、注册脚本                                  | 在既有 NoFSegmentManager 基础上扩展共享/心跳/故障隔离     |
 | Transport 改动   | 新增 store 层模块                                                            | transport 层新增平行分支 + master 层扩展 NoF segment 管理 |
 | 与 GDS 关系      | 替代/并行于既有 transport                                                    | 与 GDS 完全平行，编译宏切换                               |
-| 集群级共存       | GPU 节点编译 `USE_NOF`，NPU 节点编译 `USE_NOF + USE_NDS`，共享 master 与 segment 池 | 同左                                                      |
+| 集群级共存       | GPU 节点编译 `USE_NOF`，NPU 节点编译 `USE_NOF + USE_NVMEOF_NDS`，共享 master 与 segment 池 | 同左                                                      |
 
 在实现路径上，本提案不引入 SPDK 依赖、不涉及 host 侧 buffer 分配、复用既有 `NoFSegmentManager` 框架，与 SPDK 路线在代码层面完全解耦。两条路径的共存策略详见第 6.5 节。
 
@@ -82,18 +82,18 @@ graph TB
         CFC[CuFileContext]
         CDP[CUFileDescPool]
         TE --> NVT
-        NVT -->|USE_NDS=OFF| CFC
-        NVT -->|USE_NDS=OFF| CDP
+        NVT -->|USE_NVMEOF_NDS=OFF| CFC
+        NVT -->|USE_NVMEOF_NDS=OFF| CDP
         CFC -->|cuFileHandleRegister| GDS[(NVIDIA GDS Lib)]
         CDP -->|cuFileBatchIOSubmit| GDS
     end
 
     subgraph Proposed["本提案新增 (NDS 路径)"]
         NDS_CTX[NdsFileContext]
-        NDS_BATCH[NdsBatchContext]
+        NDS_BATCH[NdsDescPool]
         NDS_API[nds.h C API]
-        NVT -->|USE_NDS=ON| NDS_CTX
-        NVT -->|USE_NDS=ON| NDS_BATCH
+        NVT -->|USE_NVMEOF_NDS=ON| NDS_CTX
+        NVT -->|USE_NVMEOF_NDS=ON| NDS_BATCH
         NDS_CTX --> NDS_API
         NDS_BATCH --> NDS_API
         NDS_API --> NDSL[(libnds.so / NPU Direct Storage)]
@@ -112,19 +112,19 @@ graph TB
 flowchart LR
     SRC[nvmeof_transport.cpp] --> IS_NOF{USE_NOF?}
     IS_NOF -->|否| INC_GDS[cufile_context.h<br/>cufile_desc_pool.h]
-    IS_NOF -->|是| IS_NDS{USE_NDS?}
+    IS_NOF -->|是| IS_NDS{USE_NVMEOF_NDS?}
     IS_NDS -->|否| INC_SPDK[spdk_wrapper.h<br/>spdk_nof_worker_pool.h]
-    IS_NDS -->|是| INC_NDS[nds_context.h<br/>nds.h]
+    IS_NDS -->|是| INC_NDS[nds_context.h<br/>nds_desc_pool.h<br/>nds.h]
     INC_GDS --> LINK_GDS[libcufile.so + CUDA]
     INC_SPDK --> LINK_SPDK[SPDK 静态库]
     INC_NDS --> LINK_NDS[libnds.so + ascendcl]
 ```
 
-`CMakeLists.txt` 中通过 `USE_NOF` 与 `USE_NDS` 选项组合控制：
+`CMakeLists.txt` 中通过 `USE_NOF` 与 `USE_NVMEOF_NDS` 选项组合控制：
 
-- `USE_NOF=ON, USE_NDS=ON`：编译 `nvmeof_transport.cpp` 的 NDS 分支，链接 `libnds.so` 与 `ascendcl`；
-- `USE_NOF=ON, USE_NDS=OFF`（默认）：编译 store 层 SPDK 路径（`SpdkWrapper` + `SpdkNofWorkerPool`），链接 SPDK 静态库；
-- `USE_NOF=OFF, USE_NDS=OFF`（默认）：编译 GDS 分支（`cufile_context.cpp`、`cufile_desc_pool.cpp`），链接 `libcufile.so`。
+- `USE_NOF=ON, USE_NVMEOF_NDS=ON`：编译 `nvmeof_transport.cpp` 的 NDS 分支 + `nds_desc_pool.cpp`，链接 `libnds.so` 与 `ascendcl`；可选 `NDS_USE_STUB=ON` 编译 `nds_stub.cpp`（无需真实 NDS 硬件即可测试）；
+- `USE_NOF=ON, USE_NVMEOF_NDS=OFF`（默认）：编译 store 层 SPDK 路径（`SpdkWrapper` + `SpdkNofWorkerPool`），链接 SPDK 静态库；
+- `USE_NOF=OFF, USE_NVMEOF_NDS=OFF`（默认）：编译 GDS 分支（`cufile_context.cpp`、`cufile_desc_pool.cpp`），链接 `libcufile.so`。
 
 ## 4. Transport 层设计
 
@@ -174,14 +174,16 @@ classDiagram
         +freeCUfileDesc(idx) int
     }
 
-    class NdsBatchContext {
-        -ndsBatchHandle_t handle_
-        -ndsBatchIOParams_t params_[256]
-        +allocNdsBatchDesc(batch_size) int
-        +pushNdsParams(idx, params) int
+    class NdsDescPool {
+        -ndsBatchHandle_t handle_pool_[]
+        -NdsBatchDesc* descs_[256]
+        +allocNdsDesc(batch_size) int
+        +pushParams(idx, params, slice) int
         +submitBatch(idx) int
         +getTransferStatus(idx, slice_id) ndsBatchIOEvents_t
-        +freeNdsBatchDesc(idx) int
+        +getSliceNum(idx) int
+        +freeNdsDesc(idx) int
+        +getDesc(idx) NdsBatchDesc*
     }
 
     class NdsFileContext {
@@ -194,10 +196,10 @@ classDiagram
     }
 
     Transport <|.. NVMeoFTransport
-    NVMeoFTransport o-- CuFileContext : USE_NDS=OFF
-    NVMeoFTransport o-- CUFileDescPool : USE_NDS=OFF
-    NVMeoFTransport o-- NdsFileContext : USE_NDS=ON
-    NVMeoFTransport o-- NdsBatchContext : USE_NDS=ON
+    NVMeoFTransport o-- CuFileContext : USE_NVMEOF_NDS=OFF
+    NVMeoFTransport o-- CUFileDescPool : USE_NVMEOF_NDS=OFF
+    NVMeoFTransport o-- NdsFileContext : USE_NVMEOF_NDS=ON
+    NVMeoFTransport o-- NdsDescPool : USE_NVMEOF_NDS=ON
 ```
 
 #### 4.1.2 NDS C API 抽象（`nds.h`）
@@ -272,9 +274,11 @@ sequenceDiagram
 
     App->>TE: install / registerLocalMemory(addr, len)
     TE->>NVT: registerLocalMemory(addr, len, ...)
-    alt USE_NDS=ON 且未初始化
+    Note over NVT: 构造时已通过 aclrtGetDevice<br/>或 MC_NDS_DEVICE_ID 获取 device_id
+    alt USE_NVMEOF_NDS=ON 且未初始化
         NVT->>NDS: nds_init(device_id)
         NDS-->>NVT: 0
+        NVT->>NVT: aclrtSetDevice(device_id)
     end
     NVT->>NDS: nds_buf_register(device_id, addr, len)
     NDS-->>NVT: 0
@@ -287,34 +291,35 @@ sequenceDiagram
 sequenceDiagram
     participant App as Application
     participant NVT as NVMeoFTransport
-    participant NdsCtx as NdsBatchContext
+    participant NdsPool as NdsDescPool
     participant FileCtx as NdsFileContext
     participant NDS as NDS Lib
 
     App->>NVT: submitTransfer(batch_id, entries)
-    NVT->>NdsCtx: allocNdsBatchDesc(batch_size)
+    NVT->>NdsPool: allocNdsDesc(batch_size)
     loop 每个 TransferRequest
         NVT->>NVT: 计算 slice 与 file_offset
         NVT->>FileCtx: 查找/创建 NdsFileContext(file_path, device_id)
         FileCtx->>NDS: nds_file_register(fd)
         NDS-->>FileCtx: nds_Handle
-        NVT->>NVT: addSliceToTask(...) 构造 Slice
-        NVT->>NdsCtx: pushNdsParams(idx, ndsBatchIOParams_t)
+        Note over NVT,NdsPool: addSliceToNdsBatch 将 Slice* 作为 cookie<br/>NdsDescPool::pushParams 关联 params 与 slice
+        NVT->>NdsPool: pushParams(idx, ndsBatchIOParams_t, slice)
     end
-    NdsCtx->>NDS: ndsBatchIOSubmit(handle, nr, params, 0)
-    NDS-->>NdsCtx: 0 (提交成功)
+    NdsPool->>NDS: ndsBatchIOSubmit(handle, nr, params, 0)
+    NDS-->>NdsPool: 0 (提交成功)
     NVT-->>App: Status::OK()
 
-    Note over NdsCtx,NDS: 异步执行：NPU HBM ↔ NVMe-oF target DMA
+    Note over NdsPool,NDS: 异步执行：NPU HBM ↔ NVMe-oF target DMA
 ```
 
 #### 4.2.3 状态查询流程
 
 ```mermaid
 flowchart TD
-    Q[getTransferStatus batch_id, task_id] --> CT{USE_NDS?}
+    Q[getTransferStatus batch_id, task_id] --> CT{USE_NVMEOF_NDS?}
     CT -->|ON| NDSGET[ndsBatchIOGetStatus<br/>返回 ndsBatchIOEvents_t]
-    NDSGET --> MAP[解析 status/ret/error]
+    NDSGET --> UPDATE[通过 cookie (Slice*) 更新<br/>Slice::markSuccess/markFailed]
+    UPDATE --> MAP[解析 status/ret/error]
     MAP --> OUT[返回 status]
     CT -->|OFF| EV[desc_pool_->getTransferStatus<br/>CUfileIOEvents_t]
     EV --> MAP2[from_cufile_transfer_status]
@@ -530,8 +535,8 @@ graph TB
 
     subgraph Fork["编译期分流（TransferSubmitter::submit）"]
         FORK{replica.is_nof_replica<br/>编译宏选择}
-        FORK -->|"USE_NOF（无 USE_NDS）"| SPDK_PATH[SpdkWrapper + SpdkNofWorkerPool<br/>SPDK 用户态驱动直连 target]
-        FORK -->|"USE_NOF + USE_NDS"| NDS_PATH[TransferEngine → NVMeoFTransport<br/>NDS 库直连 target]
+        FORK -->|"USE_NOF（无 USE_NVMEOF_NDS）"| SPDK_PATH[SpdkWrapper + SpdkNofWorkerPool<br/>SPDK 用户态驱动直连 target]
+        FORK -->|"USE_NOF + USE_NVMEOF_NDS"| NDS_PATH[TransferEngine → NVMeoFTransport<br/>NDS 库直连 target]
     end
 
     CLIENT --> FORK
@@ -543,16 +548,16 @@ graph TB
 
 | 维度         | SPDK NoF 路径                                                  | NDS NoF 路径                                                                   |
 | ------------ | -------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| 编译宏       | `USE_NOF`                                                    | `USE_NOF + USE_NDS`                                                                   |
+| 编译宏       | `USE_NOF`                                                    | `USE_NOF + USE_NVMEOF_NDS`                                                                   |
 | 传输层位置   | store 层内`SpdkWrapper` + `SpdkNofWorkerPool`              | transfer-engine 层`NVMeoFTransport`（NDS 分支）                              |
 | 数据路径     | host 内存 → SPDK → 网络 → target                            | NPU HBM → NDS → PCIe → target                                               |
 | host 内存    | 需要`spdk_zmalloc` 分配 DMA buffer                           | 不涉及                                                                         |
 | segment 寻址 | `transport_endpoint_` 作为 NVMe-oF transport string 直接连接 | `transport_endpoint_` 作为 segment name 传给 `TransferEngine::openSegment` |
-| 流控         | `SpdkNofQos`（per-segment inflight 限制）                    | 复用 NDS batch API 的内置异步能力，与 `CUFileDescPool` 模式对齐                  |
+| 流控         | `SpdkNofQos`（per-segment inflight 限制）                    | 复用 NDS batch API 的内置异步能力，`NdsDescPool` 与 `CUFileDescPool` 模式对齐                  |
 
 ### 6.2 Store 层路由扩展
 
-当前 `TransferSubmitter::submit()` 中 NoF 副本的处理分支仅支持 `USE_NOF`，适配方案是在该分支中增加 `USE_NDS` 的备选路径：
+当前 `TransferSubmitter::submit()` 中 NoF 副本的处理分支仅支持 `USE_NOF`，适配方案是在该分支中增加 `USE_NVMEOF_NDS` 的备选路径：
 
 ```mermaid
 flowchart TD
@@ -560,8 +565,8 @@ flowchart TD
     B -->|memory| M[submitMemoryReadOperation<br/>或 submitMemcpyOperation / submitTransferEngineOperation]
     B -->|nof_replica| N{编译宏}
     B -->|disk| D[submitFileReadOperation]
-    N -->|"USE_NOF（无 USE_NDS）"| NOF_SPDK[submitSpdkNofOperation<br/>handle → SpdkWrapper::OpenNofSegment<br/>→ SpdkNofWorkerPool::submitTask]
-    N -->|"USE_NOF + USE_NDS"| NOF_NDS[submitNdsNofOperation<br/>handle → engine_.openSegment<br/>→ submitTransfer → NVMeoFTransport]
+    N -->|"USE_NOF（无 USE_NVMEOF_NDS）"| NOF_SPDK[submitSpdkNofOperation<br/>handle → SpdkWrapper::OpenNofSegment<br/>→ SpdkNofWorkerPool::submitTask]
+    N -->|"USE_NOF + USE_NVMEOF_NDS"| NOF_NDS[submitNdsNofOperation<br/>handle → engine_.openSegment<br/>→ submitTransfer → NVMeoFTransport]
     N -->|均未定义| ERR[LOG ERROR + 返回 nullopt]
 ```
 
@@ -573,7 +578,7 @@ flowchart TD
 | 2    | 构造`TransferRequest`                             | `target_id = seg`，`target_offset = handle.buffer_address_`，`source = ptr`，`length = size` |
 | 3    | `submitTransfer({request})`                       | 通过 TransferEngine 提交，由`NVMeoFTransport`（NDS 分支）执行                                      |
 
-此方案复用现有的 `submitTransfer` 路径（与 `submitTransferEngineOperation` 一致），无需在 store 层新增 worker 线程池。流控方面，NDS 的 `ndsBatchIOSubmit` 提供与 GDS `cuFileBatchIOSubmit` 对等的批量异步提交能力，由 `NdsBatchContext` 封装（与 `CUFileDescPool` 模式对齐）。
+此方案复用现有的 `submitTransfer` 路径（与 `submitTransferEngineOperation` 一致），无需在 store 层新增 worker 线程池。流控方面，NDS 的 `ndsBatchIOSubmit` 提供与 GDS `cuFileBatchIOSubmit` 对等的批量异步提交能力，由 `NdsDescPool` 封装（与 `CUFileDescPool` 模式对齐）。
 
 ### 6.3 Segment 元数据注册
 
@@ -617,13 +622,13 @@ sequenceDiagram
 
 ### 6.4 心跳探测接口替换
 
-当前 `MasterService::ProbeNoFSegment` 被 `#ifdef USE_NOF` 守卫，默认探针绑定 `SpdkWrapper::ProbeNofSegment`。当同时定义 `USE_NOF` 与 `USE_NDS` 时，需要替换为 NDS 探针。
+当前 `MasterService::ProbeNoFSegment` 被 `#ifdef USE_NOF` 守卫，默认探针绑定 `SpdkWrapper::ProbeNofSegment`。当同时定义 `USE_NOF` 与 `USE_NVMEOF_NDS` 时，需要替换为 NDS 探针。
 
 ```mermaid
 flowchart TD
     subgraph Init["MasterService 构造"]
-        A{编译宏} -->|"USE_NOF（无 USE_NDS）"| B[默认绑定 SpdkWrapper::ProbeNofSegment]
-        A -->|"USE_NOF + USE_NDS"| C[默认绑定 NDS 探针<br/>基于 nds_read 的轻量读操作]
+        A{编译宏} -->|"USE_NOF（无 USE_NVMEOF_NDS）"| B[默认绑定 SpdkWrapper::ProbeNofSegment]
+        A -->|"USE_NOF + USE_NVMEOF_NDS"| C[默认绑定 NDS 探针<br/>基于 nds_read 的轻量读操作]
         A -->|均未定义| D[ProbeNoFSegment 直接返回 false]
     end
 
@@ -653,12 +658,12 @@ NDS 探针实现要点：
 
 **编译期隔离**：
 
-| 编译宏                             | 编译范围                                          | 链接依赖      |
-| ---------------------------------- | ------------------------------------------------- | ------------- |
-| `USE_NOF=ON, USE_NDS=OFF`        | store 层：`SpdkWrapper` + `SpdkNofWorkerPool` | SPDK 静态库   |
-| `USE_NOF=ON, USE_NDS=ON`         | transport 层：`NVMeoFTransport` NDS 分支        | `libnds.so` |
+| 编译宏                                      | 编译范围                                          | 链接依赖      |
+| ------------------------------------------- | ------------------------------------------------- | ------------- |
+| `USE_NOF=ON, USE_NVMEOF_NDS=OFF`          | store 层：`SpdkWrapper` + `SpdkNofWorkerPool` | SPDK 静态库   |
+| `USE_NOF=ON, USE_NVMEOF_NDS=ON`           | transport 层：`NVMeoFTransport` NDS 分支        | `libnds.so` |
 
-NDS 路径以 `USE_NOF` 为基础（复用 NoF segment 管理基础设施），再通过 `USE_NDS` 将传输层替换为 NDS 直连路径。两者可部署在不同节点上。
+`USE_NOF` 控制 master/store 层的 NoF segment 管理基础设施，`USE_NVMEOF_NDS` 控制 transport 层是否使用 NDS 直连（否则使用 GDS）。两者作用在不同层次，可独立组合。
 
 **运行时隔离**：
 
@@ -673,7 +678,7 @@ NDS 路径以 `USE_NOF` 为基础（复用 NoF segment 管理基础设施），�
 
 **叠加部署**：
 
-在混合集群中，GPU 节点编译 `USE_NOF=ON, USE_NDS=OFF` 走 SPDK 路径，NPU 节点编译 `USE_NOF=ON, USE_NDS=ON` 走 NDS 路径，两者共享同一个 master 和同一套 NoF segment 池。
+在混合集群中，GPU 节点编译 `USE_NOF=ON, USE_NVMEOF_NDS=OFF` 走 SPDK 路径，NPU 节点编译 `USE_NOF=ON, USE_NVMEOF_NDS=ON` 走 NDS 路径，两者共享同一个 master 和同一套 NoF segment 池。
 
 ### 6.6 端到端数据流
 
@@ -684,15 +689,15 @@ NDS 路径以 `USE_NOF` 为基础（复用 NoF segment 管理基础设施），�
 - **NPU (Ascend)**：物理 NPU 卡，其 HBM 是 KV Cache 数据的实际驻留位置。HBM 缓冲区在初始化阶段通过 `nds_buf_register` 注册到 NDS 库，NDS 后续可直接对该地址发起 DMA。
 - **Host Process**：运行 `mooncake-transfer-engine` 的用户态进程，包含三个组件：
   - `NVMeoFTransport`：负责将上层 `TransferRequest` 分解为若干 `Slice`，每个 Slice 描述一段 (HBM 地址, 文件偏移, 长度) 的映射；
-  - `NdsBatchContext`：封装 NDS batch 异步 IO 上下文（`ndsBatchIOSetUp / ndsBatchIOSubmit / ndsBatchIOGetStatus`），负责将批量 Slice 转化为 NDS batch 提交调用；
-  - `NdsFileContext`：持有目标文件 `fd` 与 NDS 句柄 `nds_Handle`，是 `NdsBatchContext` 构造 `ndsBatchIOParams_t` 时必须的上下文。
+  - `NdsDescPool`：封装 NDS batch 异步 IO 上下文（`ndsBatchIOSetUp / ndsBatchIOSubmit / ndsBatchIOGetStatus`），维护 `ndsBatchHandle_t` 复用池与 `NdsBatchDesc` 数组，负责将批量 Slice 转化为 NDS batch 提交调用；
+  - `NdsFileContext`：持有目标文件 `fd` 与 NDS 句柄 `nds_Handle`，是 `NdsDescPool` 构造 `ndsBatchIOParams_t` 时必须的上下文。
 - **Storage Backend**：远端 NVMe-oF target / SSD Pool，对 host 表现为一个块设备文件路径。
 
 **数据流要点**
 
-1. **控制流经 host，数据流不经过 host**：`NVMeoFTransport` 与 `NdsBatchContext` 都运行在 host CPU 上，但它们只负责"任务分解"和"调用 NDS batch API"；真正搬运数据的 DMA 由 NDS 库在 NPU HBM 与 NVMe-oF target 之间直接完成，**不经过 host 内存中转**，从而实现与 GDS 对称的 zero-copy 语义。
+1. **控制流经 host，数据流不经过 host**：`NVMeoFTransport` 与 `NdsDescPool` 都运行在 host CPU 上，但它们只负责"任务分解"和"调用 NDS batch API"；真正搬运数据的 DMA 由 NDS 库在 NPU HBM 与 NVMe-oF target 之间直接完成，**不经过 host 内存中转**，从而实现与 GDS 对称的 zero-copy 语义。
 2. **文件句柄由 host 打开**：`NdsFileContext` 通过 `open(filename, O_RDWR)` 获得宿主机视角的 `fd`，再经 `nds_file_register(fd)` 转换为 NDS 句柄。这一步是控制面操作，不涉及数据拷贝。
-3. **NDS batch API 的执行模式**：`NdsBatchContext` 将一组 Slice 封装为 `ndsBatchIOParams_t` 数组后调用 `ndsBatchIOSubmit` 批量提交，随后通过 `ndsBatchIOGetStatus` 轮询各 Slice 的完成状态（`ndsBatchIOEvents_t`）。该模式与 GDS 路径的 `CUFileDescPool` 完全对称。
+3. **NDS batch API 的执行模式**：`NdsDescPool` 将一组 Slice 封装为 `ndsBatchIOParams_t` 数组后调用 `ndsBatchIOSubmit` 批量提交，随后通过 `ndsBatchIOGetStatus` 轮询各 Slice 的完成状态（`ndsBatchIOEvents_t`）。为减少 `ndsBatchIOSetUp/Destroy` 的开销，`NdsDescPool` 内部维护 `ndsBatchHandle_t` 复用池。该模式与 GDS 路径的 `CUFileDescPool` 完全对称。
 4. **与 GDS 路径的对称性**：GDS 路径下 `cuFileBatchIOSubmit` 在 GPU 显存与 NVMe-oF target 间直接 DMA；NDS 路径下 `ndsBatchIOSubmit` 在 HBM 与 NVMe-oF target 间直接 DMA。两者都绕过 host DRAM，差别仅在底层库与目标设备。
 
 **架构级数据流**
@@ -704,7 +709,7 @@ flowchart LR
     end
     subgraph Host["Host Process (控制面)"]
         NVT[NVMeoFTransport<br/>分解 TransferRequest → Slice]
-        NdsBatch[NdsBatchContext<br/>ndsBatchIOSubmit 批量提交]
+        NdsBatch[NdsDescPool<br/>ndsBatchIOSubmit 批量提交]
         Ctx[NdsFileContext<br/>fd + nds_Handle]
     end
     subgraph Backend["Storage Backend (数据面)"]
@@ -730,20 +735,21 @@ sequenceDiagram
     participant TS as TransferSubmitter
     participant TE as TransferEngine
     participant NVT as NVMeoFTransport<br/>(NDS 分支)
-    participant NdsBatch as NdsBatchContext
+    participant NdsBatch as NdsDescPool
     participant NDS as libnds.so
     participant TGT as NVMe-oF Target
 
     App->>RC: put/get
     RC->>C: Put/Get
     C->>TS: submit(replica.is_nof_replica())
-    Note over TS: USE_NOF + USE_NDS 编译分支
+    Note over TS: USE_NOF + USE_NVMEOF_NDS 编译分支
     TS->>TE: openSegment(transport_endpoint_)
     TE-->>TS: SegmentHandle
     TS->>TE: submitTransfer({request})
     TE->>NVT: submitTransferTask(task_list)
     NVT->>NVT: 从 SegmentDesc.nvmeof_buffers<br/>解析 file_path + file_offset
-    NVT->>NdsBatch: allocNdsBatchDesc + pushNdsParams
+    Note over NVT,NdsBatch: addSliceToNdsBatch 封装<br/>ndsBatchIOParams_t + Slice*
+    NVT->>NdsBatch: allocNdsDesc + pushParams
     NdsBatch->>NDS: ndsBatchIOSubmit(handle, nr, params, 0)
     NDS->>TGT: NPU HBM ↔ NVMe-oF DMA
     TGT-->>NDS: 完成
@@ -762,9 +768,9 @@ sequenceDiagram
 
 | 环境变量                    | 含义              | 默认值              |
 | --------------------------- | ----------------- | ------------------- |
-| `USE_NOF`（编译期）       | 启用 NoF 基础设施 | `OFF`             |
-| `USE_NDS`（编译期）       | 启用 NDS 传输分支 | `OFF`             |
-| `MC_NDS_DEVICE_ID`        | NPU device id     | `-1`（不初始化）  |
+| `USE_NOF`（编译期）             | 启用 NoF 基础设施（master 层） | `OFF`             |
+| `USE_NVMEOF_NDS`（编译期）     | 启用 NDS 传输分支（transport 层） | `OFF`             |
+| `MC_NDS_DEVICE_ID`              | NPU device id                   | `-1`（从 aclrtGetDevice 获取）  |
 
 master 层 SSD segment 的心跳参数（探测间隔、超时、失败阈值）通过 `MasterServiceConfig` 注入，默认值参见第 5.4 节。
 
@@ -777,12 +783,12 @@ master 层 SSD segment 的心跳参数（探测间隔、超时、失败阈值）
 
 ## 9. 后续工作
 
-1. **合入 transport 层 NDS 分支**：将 `NdsFileContext`、`NdsBatchContext` 及 `NVMeoFTransport` 中的 NDS 编译分支（第 4 章）作为独立 PR 合入社区 `mooncake-transfer-engine`；
+1. **合入 transport 层 NDS 分支**：将 `NdsFileContext`、`NdsDescPool` 及 `NVMeoFTransport` 中的 NDS 编译分支（第 4 章）作为独立 PR 合入社区 `mooncake-transfer-engine`；
 2. 评估是否抽取公共 `NvmeOfFileContext` 抽象基类，统一 GDS/NDS 的句柄管理接口；
 3. 评估 master 层 `ScopedNoFSegmentAccess` 与既有 `ScopedSegmentAccess` 是否抽取公共基类，统一引用计数与心跳接口；
-4. 实现 `submitNdsNofOperation` 及 `TransferSubmitter` 中的 `USE_NOF + USE_NDS` 路由分支（第 6.2 节）；
+4. 实现 `submitNdsNofOperation` 及 `TransferSubmitter` 中的 `USE_NOF + USE_NVMEOF_NDS` 路由分支（第 6.2 节）；
 5. 在 `NoFSegment` 中增加 `device_path` 字段，并在 client 初始化 TransferEngine 时完成 `SegmentDesc` 的 metadata 自动注册（第 6.3 节）；
-6. 在 `MasterService` 构造中为 `USE_NOF + USE_NDS` 绑定基于 `nds_read` 的默认 `NoFProbeFn`，替换当前仅 `USE_NOF` 的探针绑定（第 6.4 节）；
+6. 在 `MasterService` 构造中为 `USE_NOF + USE_NVMEOF_NDS` 绑定基于 `nds_read` 的默认 `NoFProbeFn`，替换当前仅 `USE_NOF` 的探针绑定（第 6.4 节）；
 7. 在 `NVMeoFTransport` 的 transport 层补齐 QoS 流控能力，使其达到与 SPDK 路径 `SpdkNofQos` 对等的水平。
 
 ## 10. 参考文献
