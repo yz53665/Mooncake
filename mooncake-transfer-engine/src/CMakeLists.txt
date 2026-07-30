@@ -70,6 +70,10 @@ if(USE_CUDA)
   endif()
 endif()
 
+if(USE_NDS)
+  target_link_libraries(transfer_engine PUBLIC nvmeof_transport)
+endif()
+
 if(USE_MACA)
   if(NOT DEFINED MACA_RUNTIME_LIBS)
     set(MACA_RUNTIME_LIBS mcruntime mxc-runtime64 rt)

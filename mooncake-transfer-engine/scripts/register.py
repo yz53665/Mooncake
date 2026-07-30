@@ -42,13 +42,44 @@ if __name__ == "__main__":
     for file in files:
       # TODO: check file path existence
       buffer = {}
-      buffer['length'] = os.path.getsize(file)
+
+      # Support block devices by reading size from /sys/block/<device>/size
+      if file.startswith('/dev/'):
+        try:
+          # Extract device name (e.g., /dev/nvme2n2 -> nvme2n2)
+          device_name = os.path.basename(file)
+          # Read sector count from sysfs (512 bytes per sector)
+          sectors_path = f"/sys/block/{device_name}/size"
+          if os.path.exists(sectors_path):
+            with open(sectors_path, 'r') as f:
+              sectors = int(f.read().strip())
+              buffer['length'] = sectors * 512
+          else:
+            # Fallback: try blockdev command
+            import subprocess
+            result = subprocess.run(['blockdev', '--getsize64', file],
+                                    capture_output=True, text=True)
+            if result.returncode == 0:
+              buffer['length'] = int(result.stdout.strip())
+            else:
+              raise ValueError(f"Cannot get size for block device {file}")
+        except Exception as e:
+          raise ValueError(f"Failed to get size for block device {file}: {e}")
+      else:
+        buffer['length'] = os.path.getsize(file)
+
       buffer['file_path'] = file
       local_path_map = {}
-      local_path_map[server_name] = file
+      # If segment_name starts with "mooncake/ram/", use sys.argv[2] as key
+      if segment_name.startswith("mooncake/ram/"):
+        local_path_map[sys.argv[2]] = file
+        # Also add entry without port number for other clients to access
+        if ':' in sys.argv[2]:
+          local_path_map[sys.argv[2].split(':')[0]] = file
+      else:
+        local_path_map[server_name] = file
       buffer['local_path_map'] = local_path_map
       value['buffers'].append(buffer)
     
     print(json.dumps(value))
     etcd.put(segment_name, json.dumps(value))
-

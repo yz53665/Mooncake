@@ -221,6 +221,17 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     auto_discover_ = false;
 #endif
 
+#ifdef USE_NDS
+    Transport* nvmeof_transport =
+        multi_transports_->installTransport("nvmeof", local_topology_);
+    if (!nvmeof_transport) {
+        LOG(ERROR) << "Failed to install NVMEOF transport";
+        return -1;
+    }
+    auto_discover_ = false;
+    LOG(INFO) << "NVMEOF transport installed for NDS support";
+#endif
+
 #if defined(USE_CXL) && !defined(USE_ASCEND) && \
     !defined(USE_ASCEND_HETEROGENEOUS)
     if (std::getenv("MC_CXL_DEV_PATH") != nullptr) {
