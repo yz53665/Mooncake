@@ -316,14 +316,14 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    Q[getTransferStatus batch_id, task_id] --> CT{USE_NVMEOF_NDS?}
-    CT -->|ON| NDSGET[ndsBatchIOGetStatus<br/>返回 ndsBatchIOEvents_t]
-    NDSGET --> UPDATE[通过 cookie (Slice*) 更新<br/>Slice::markSuccess/markFailed]
-    UPDATE --> MAP[解析 status/ret/error]
-    MAP --> OUT[返回 status]
-    CT -->|OFF| EV[desc_pool_->getTransferStatus<br/>CUfileIOEvents_t]
-    EV --> MAP2[from_cufile_transfer_status]
-    MAP2 --> OUT2[返回 status]
+    Q["getTransferStatus(batch_id, task_id)"] --> CT{"USE_NVMEOF_NDS?"}
+    CT -->|ON| NDSGET["ndsBatchIOGetStatus<br/>返回 ndsBatchIOEvents_t"]
+    NDSGET --> UPDATE["通过 cookie (Slice指针) 更新<br/>Slice::markSuccess / markFailed"]
+    UPDATE --> MAP["解析 status / ret / error"]
+    MAP --> OUT["返回 status"]
+    CT -->|OFF| EV["desc_pool_.getTransferStatus<br/>CUfileIOEvents_t"]
+    EV --> MAP2["from_cufile_transfer_status"]
+    MAP2 --> OUT2["返回 status"]
 ```
 
 ### 4.3 GDS 与 NDS 核心 API 对比
