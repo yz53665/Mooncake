@@ -585,21 +585,21 @@ struct NoFSegment {
 ```cpp
 struct NoFSegment {
     UUID id{0, 0};
-    std::string name{};
-    uintptr_t base{0};
-    size_t size{0};
-    std::string te_endpoint{};
+    std::string name{};    // 逻辑段名称，用于优选分配
+    uintptr_t base{0};     // NVMe 命名空间偏移量
+    size_t size{0};        // 段容量（字节）
+    std::string te_endpoint{};  // SPDK：NVMe-oF transport string；NDS：逻辑 segment 名称（由 device_path 自动派生）
     std::string device_path{};  // 新增：本地 NVMe 块设备路径，NDS 路径使用
 };
 ```
 
-| 字段 | NDS 路径用途 | SPDK 路径 |
-|---|---|---|
-| `name` | 作为 segment 标识，与现有逻辑一致 | 同 |
-| `base` | NVMe 命名空间偏移（对 NDS 同样有效） | 同 |
-| `size` | 段容量，构造 `nvmeof_buffers[].length` | 同 |
-| `te_endpoint` | 作为 `SegmentDesc.name`，关联 transport 路由 | 用于 NVMe-oF transport string |
-| `device_path`（新增） | 本地块设备路径，供 `NdsFileContext` 打开并注册 NDS 句柄 | 不需要（SPDK 通过 transport string 直连） |
+| 字段                    | NDS 路径用途                                             | SPDK 路径                                 |
+| ----------------------- | -------------------------------------------------------- | ----------------------------------------- |
+| `name`                | 作为 segment 标识，与现有逻辑一致                        | 同                                        |
+| `base`                | NVMe 命名空间偏移（对 NDS 同样有效）                     | 同                                        |
+| `size`                | 段容量，构造`nvmeof_buffers[].length`                  | 同                                        |
+| `te_endpoint`         | 逻辑 segment 名称，用于`TransferSubmitter` 路由和`TransferEngine::openSegment()` 定位 segment；可由`device_path` 自动派生（如`nvmeof://hostname/nvme0n1`），无需用户指定 | NVMe-oF transport string（网络地址），SPDK 直连远端 target |
+| `device_path`（新增） | 本地块设备路径，供`NdsFileContext` 打开并注册 NDS 句柄 | 不需要（SPDK 通过 transport string 直连） |
 
 `NoFSegmentManager::MountSegment()` 中已有字段均保持不变，`device_path` 仅在 NDS 路径下被读取并写入 `SegmentDesc.nvmeof_buffers[].local_path_map`。
 
@@ -834,12 +834,12 @@ sequenceDiagram
 
 通过环境变量进行运行时配置（无需改代码）：
 
-| 环境变量                     | 含义                              | 默认值                           |
-| ---------------------------- | --------------------------------- | -------------------------------- |
-| `USE_NOF`（编译期）        | 启用 NoF 基础设施（master 层）    | `OFF`                          |
-| `USE_NVMEOF_NDS`（编译期） | 启用 NDS 传输分支（transport 层） | `OFF`                          |
-| `MC_NDS_DEVICE_ID`         | NPU device id                     | `-1`（从 aclrtGetDevice 获取） |
-| `noF_device_path`（setup 参数） | 本地 NVMe 块设备路径（单次一个） | 空（不启用 NoF segment）    |
+| 环境变量                          | 含义                              | 默认值                           |
+| --------------------------------- | --------------------------------- | -------------------------------- |
+| `USE_NOF`（编译期）             | 启用 NoF 基础设施（master 层）    | `OFF`                          |
+| `USE_NVMEOF_NDS`（编译期）      | 启用 NDS 传输分支（transport 层） | `OFF`                          |
+| `MC_NDS_DEVICE_ID`              | NPU device id                     | `-1`（从 aclrtGetDevice 获取） |
+| `noF_device_path`（setup 参数） | 本地 NVMe 块设备路径（单次一个）  | 空（不启用 NoF segment）         |
 
 master 层 SSD segment 的心跳参数（探测间隔、超时、失败阈值）通过 `MasterServiceConfig` 注入，默认值参见第 5.4 节。
 
