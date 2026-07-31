@@ -31,7 +31,7 @@
 
 ### 2.2 Master 层：SSD 共享与故障场景下生命周期管理不足
 
-无论上层是 GDS、SPDK 还是 NDS，transport 层只负责"在给定 fd + offset 上发起一次 DMA"，并不感知这块 SSD 是谁挂载的、是否还健康、还有多少容量、其他 client 是否也在使用。这些职责由 master 层的 `NoFSegmentManager` 承担。然而现有 `NoFSegmentManager` 的设计存在三处与 SSD 实际使用方式不匹配的缺口：
+无论下层是 GDS、SPDK 还是 NDS，transport 层只负责"在给定 fd + offset 上发起一次 DMA"，并不感知这块 SSD 是谁挂载的、是否还健康、还有多少容量、其他 client 是否也在使用。这些职责由 master 层的 `NoFSegmentManager` 承担。然而现有 `NoFSegmentManager` 的设计存在三处与 SSD 实际使用方式不匹配的缺口：
 
 1. **1:1 挂载语义无法表达多 client 共享**。现有 `NoFSegmentManager` 假定一个 segment 由一个 client 独占使用。但在 NVMe-oF + SSD Pool 场景下，一块物理 SSD 经常被多个推理/训练 client 同时挂载使用。如果沿用 1:1 语义，则每个 client 各自挂载一份会产生重复的 segment 对象与重复的容量计数；若强制串行化则又限制并发。
 2. **缺少与具体驱动解耦的健康探针**。既有心跳探测直接调用 `SpdkWrapper::ProbeNofSegment`，探针与 SPDK 强绑定。NDS 路径下不存在 SPDK wrapper，若沿用既有实现则心跳形同虚设。
@@ -120,12 +120,12 @@ flowchart LR
     IS_NDS -->|是| INC_NDS[nds_context.h<br/>nds_desc_pool.h<br/>nds.h]
     INC_GDS --> LINK_GDS[libcufile.so + CUDA]
     INC_SPDK --> LINK_SPDK[SPDK 静态库]
-    INC_NDS --> LINK_NDS[libnds.so + ascendcl]
+    INC_NDS --> LINK_NDS[libnds.so + CANN]
 ```
 
 `CMakeLists.txt` 中通过 `USE_NOF` 与 `USE_NVMEOF_NDS` 选项组合控制：
 
-- `USE_NOF=ON, USE_NVMEOF_NDS=ON`：编译 `nvmeof_transport.cpp` 的 NDS 分支 + `nds_desc_pool.cpp`，链接 `libnds.so` 与 `ascendcl`；可选 `NDS_USE_STUB=ON` 编译 `nds_stub.cpp`（无需真实 NDS 硬件即可测试）；
+- `USE_NOF=ON, USE_NVMEOF_NDS=ON`：编译 `nvmeof_transport.cpp` 的 NDS 分支 + `nds_desc_pool.cpp`，链接 `libnds.so` 与 `CANN`；可选 `NDS_USE_STUB=ON` 编译 `nds_stub.cpp`（无需真实 NDS 硬件即可测试）；
 - `USE_NOF=ON, USE_NVMEOF_NDS=OFF`（默认）：编译 store 层 SPDK 路径（`SpdkWrapper` + `SpdkNofWorkerPool`），链接 SPDK 静态库；
 - `USE_NOF=OFF, USE_NVMEOF_NDS=OFF`（默认）：编译 GDS 分支（`cufile_context.cpp`、`cufile_desc_pool.cpp`），链接 `libcufile.so`。
 
@@ -593,13 +593,13 @@ struct NoFSegment {
 };
 ```
 
-| 字段                    | NDS 路径用途                                             | SPDK 路径                                 |
-| ----------------------- | -------------------------------------------------------- | ----------------------------------------- |
-| `name`                | 作为 segment 标识，与现有逻辑一致                        | 同                                        |
-| `base`                | NVMe 命名空间偏移（对 NDS 同样有效）                     | 同                                        |
-| `size`                | 段容量，构造`nvmeof_buffers[].length`                  | 同                                        |
+| 字段                    | NDS 路径用途                                                                                                                                                                     | SPDK 路径                                                  |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| `name`                | 作为 segment 标识，与现有逻辑一致                                                                                                                                                | 同                                                         |
+| `base`                | NVMe 命名空间偏移（对 NDS 同样有效）                                                                                                                                             | 同                                                         |
+| `size`                | 段容量，构造`nvmeof_buffers[].length`                                                                                                                                          | 同                                                         |
 | `te_endpoint`         | 逻辑 segment 名称，用于`TransferSubmitter` 路由和`TransferEngine::openSegment()` 定位 segment；可由`device_path` 自动派生（如`nvmeof://hostname/nvme0n1`），无需用户指定 | NVMe-oF transport string（网络地址），SPDK 直连远端 target |
-| `device_path`（新增） | 本地块设备路径，供`NdsFileContext` 打开并注册 NDS 句柄 | 不需要（SPDK 通过 transport string 直连） |
+| `device_path`（新增） | 本地块设备路径，供`NdsFileContext` 打开并注册 NDS 句柄                                                                                                                         | 不需要（SPDK 通过 transport string 直连）                  |
 
 `NoFSegmentManager::MountSegment()` 中已有字段均保持不变，`device_path` 仅在 NDS 路径下被读取并写入 `SegmentDesc.nvmeof_buffers[].local_path_map`。
 
