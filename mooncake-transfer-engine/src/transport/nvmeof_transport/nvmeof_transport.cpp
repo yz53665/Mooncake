@@ -364,10 +364,8 @@ Status NVMeoFTransport::submitTransfer(
 
 Status NVMeoFTransport::freeBatchID(BatchID batch_id) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
-#ifndef USE_NDS
     auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
     int desc_idx = nvmeof_desc.desc_idx_;
-#endif
     Status rc = Transport::freeBatchID(batch_id);
     if (rc != Status::OK()) {
         return rc;
