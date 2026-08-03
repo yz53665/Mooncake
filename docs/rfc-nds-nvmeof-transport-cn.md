@@ -14,7 +14,7 @@
 - [#1940 SSD pool over NVMe-oF](https://github.com/kvcache-ai/Mooncake/issues/1940)：提出了基于 SPDK 的 NVMe-oF SSD Pool 整体架构方案。
 - [#2084 NVMe-oF SSD cache support](https://github.com/kvcache-ai/Mooncake/pull/2084)：在 #1940 基础上实现了 store 层基础设施（`SpdkWrapper`、`NoFSegmentManager`、NoF 心跳与自动卸载、多副本清理、监控指标等），是本仓库中 SPDK NoF 路线的实际代码基础。
 
-本提案通过编译宏 `USE_NVMEOF_NDS` 在 transport 层启用 NDS 直连路径（替代 GDS），通过 `USE_NOF` 在 master 层启用 NoF segment 管理基础设施。两个宏作用在不同层次，组合使用即可构成完整的 NPU 直连 SSD 方案。由于 NPU HBM 直接经 NDS 与 NVMe-oF target 间 DMA，因此无需像 SPDK 路径那样通过 `SpdkWrapper::Alloc` 分配 host 侧 DMA buffer。
+本提案通过编译宏 `USE_NOF` 与 `USE_NVMEOF_NDS` 分别启用 master 层 NoF segment 管理与 transport 层 NDS 直连路径（宏的分工详见第 2.4 节）。由于 NPU HBM 直接经 NDS 与 NVMe-oF target 间 DMA，因此无需像 SPDK 路径那样通过 `SpdkWrapper::Alloc` 分配 host 侧 DMA buffer。
 
 ## 2. 背景与动机
 
@@ -27,7 +27,7 @@
 
 两条路径共同的问题在于：**昇腾 NPU 场景缺失**。GDS 依赖 `cufile.h` 与 CUDA 环境，SPDK 路线同样依赖 CUDA 环境，二者在昇腾环境下均不可用。
 
-与此同时，昇腾侧已提供与 GDS 角色对等的 **NDS（NPU Direct Storage）用户态库**（`nds_init / nds_buf_register / nds_read / nds_write`），能够在 NPU HBM 与 NVMe-oF target 之间直接发起 DMA，具备构建对等直连路径的底层能力。因此本提案在 transport 层引入与 GDS 平行的 NDS 分支。
+与此同时，昇腾侧已提供与 GDS 角色对等的 **NDS（NPU Direct Storage）用户态库**（`nds_init / nds_buf_register / nds_file_register / nds_batch_io_submit`），能够在 NPU HBM 与 NVMe-oF target 之间直接发起 DMA，具备构建对等直连路径的底层能力。因此本提案在 transport 层引入与 GDS 平行的 NDS 分支。
 
 ### 2.2 Master 层：SSD 共享与故障场景下生命周期管理不足
 
@@ -568,7 +568,7 @@ flowchart TD
 
 #### 6.3.1 NoFSegment 结构体适配分析
 
-当前 `NoFSegment` 结构体定义如下（[types.h](file:///home/qiuruiqi/prj/Mooncake-qrq/mooncake-store/include/types.h) 第 418-427 行）：
+当前 `NoFSegment` 结构体定义如下（`mooncake-store/include/types.h`）：
 
 ```cpp
 struct NoFSegment {
@@ -580,7 +580,7 @@ struct NoFSegment {
 };
 ```
 
-**NDS 路径下的需求分析**：NDS 路径需要走 TransferEngine，client 侧通过 `TransferEngine::openSegment()` 对接 `SegmentDesc`。`SegmentDesc.nvmeof_buffers` 为 `NVMeoFBufferDesc` 结构（[transfer_metadata.h](file:///home/qiuruiqi/prj/Mooncake-qrq/mooncake-transfer-engine/include/transfer_metadata.h#L67-L71)）：
+**NDS 路径下的需求分析**：NDS 路径需要走 TransferEngine，client 侧通过 `TransferEngine::openSegment()` 对接 `SegmentDesc`。`SegmentDesc.nvmeof_buffers` 为 `NVMeoFBufferDesc` 结构（`mooncake-transfer-engine/include/transfer_metadata.h`）：
 
 ```cpp
 struct NVMeoFBufferDesc {
@@ -603,24 +603,24 @@ struct NoFSegment {
 };
 ```
 
-- **`remote_path`（= `te_endpoint`）**：远端标识，格式为 `"远端ip:设备路径"`（如 `"10.0.0.1:/dev/nvme0n1"`）。**其作用是确认 segment 的唯一性**——同一块远端 SSD 在不同节点挂载时必须使用相同的 `remote_path`，从而在 `SegmentDesc` 层面合并为同一个 segment；同时作为 `SegmentDesc.name` 与 `nvmeof_buffers[].file_path` 供 `TransferEngine::openSegment()` 路由定位。
-- **`local_path`（= `device_path`）**：本地 NVMe 块设备路径，**用于本地 NDS 读写**——`NdsFileContext` 对其 `open()` 后经 `nds_file_register()` 建立 NDS 句柄，`NVMeoFTransport` 在该句柄上执行 batch IO。仅挂载该段的节点本地有效。
+- **`remote_path`（= `te_endpoint`）**：远端标识，格式为 `"远端标识:设备路径"`，其中远端标识按场景区分——通用场景为远端 ip，NDS 场景为 NDS 段的 eid（`nds_segment_info_t.eid`）。用于确认 segment 的唯一性，同时作为 `SegmentDesc.name` 与 `nvmeof_buffers[].file_path` 供 `TransferEngine::openSegment()` 路由定位。
+- **`local_path`（= `device_path`）**：本地 NVMe 块设备路径，用于本地 NDS 读写——`NdsFileContext` 对其 `open()` 后经 `nds_file_register()` 建立 NDS 句柄。仅挂载该段的节点本地有效。
 
 | 字段                    | NDS 路径用途                                                                                                                                                                     | SPDK 路径                                                  |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
 | `name`                | 作为 segment 标识，与现有逻辑一致                                                                                                                                                | 同                                                         |
 | `base`                | NVMe 命名空间偏移（对 NDS 同样有效）                                                                                                                                             | 同                                                         |
 | `size`                | 段容量，构造`nvmeof_buffers[].length`                                                                                                                                          | 同                                                         |
-| `te_endpoint`         | 远端地址（`remote_path`，格式`远端ip:设备路径`），用于确认 segment 唯一性，并作为 `SegmentDesc.name` 与 `nvmeof_buffers[].file_path` 供 `TransferEngine::openSegment()` 路由定位 | NVMe-oF transport string（网络地址），SPDK 直连远端 target |
+| `te_endpoint`         | 远端地址（`remote_path`，格式`远端标识:设备路径`，通用场景为 ip、NDS 场景为 eid），用于确认 segment 唯一性，并作为 `SegmentDesc.name` 与 `nvmeof_buffers[].file_path` 供 `TransferEngine::openSegment()` 路由定位 | NVMe-oF transport string（网络地址），SPDK 直连远端 target |
 | `device_path`（新增） | 本地块设备路径（`local_path`），写入 `nvmeof_buffers[].local_path_map[local_server_name_]`，供 `NdsFileContext` 打开并注册 NDS 句柄用于本地 NDS 读写 | 不需要（SPDK 通过 transport string 直连）                  |
 
-`NoFSegmentManager::MountSegment()` 中已有字段均保持不变，`device_path` 仅在 NDS 路径下被读取并写入 `SegmentDesc.nvmeof_buffers[].local_path_map`。
+新增字段对既有 SPDK 路径完全透明：`MountSegment()` 中已有字段均保持不变，`device_path` 仅在 NDS 路径下被读取。
 
 #### 6.3.2 设备路径配置与 Segment 手动挂载
 
 设备路径的传入方式参考已有 `ssd_offload_path` 参数模式：在 `store.setup()` 调用时通过新增参数 `nof_device_path` 指定，类型为**字符串列表**，每个元素格式为 **`"remote_path:local_path"`**，一次调用可挂载多个 NoF 盘：
 
-- `remote_path`：远端标识，格式为 `"远端ip:设备路径"`（如 `"10.0.0.1:/dev/nvme0n1"`），**用于确认 segment 的唯一性**——同一远端 SSD 在不同节点挂载必须使用相同的 `remote_path`，保证在 `SegmentDesc` 层面合并为同一 segment；同时作为 `SegmentDesc.name` 与 `nvmeof_buffers[].file_path`，供 `TransferEngine::openSegment()` 路由定位；
+- `remote_path`：远端标识，格式为 `"远端标识:设备路径"`，其中远端标识按场景区分——通用场景为远端 ip（如 `"10.0.0.1:/dev/nvme0n1"`），NDS 场景为 NDS 段的 eid（`nds_segment_info_t.eid`）。**用于确认 segment 的唯一性**——同一远端 SSD 在不同节点挂载必须使用相同的 `remote_path`，保证在 `SegmentDesc` 层面合并为同一 segment；同时作为 `SegmentDesc.name` 与 `nvmeof_buffers[].file_path`，供 `TransferEngine::openSegment()` 路由定位；
 - `local_path`：本地 NVMe 块设备路径，**用于本地 NDS 读写**——写入 `nvmeof_buffers[].local_path_map[local_server_name_]`，供 `NdsFileContext` 打开并注册 NDS 句柄。
 
 例如 `setup(nof_device_path=["10.0.0.1:/dev/nvme0n1:/dev/nvme0n1", "10.0.0.1:/dev/nvme1n1:/dev/nvme1n1"])` 一次注册两个段。
@@ -641,7 +641,7 @@ sequenceDiagram
     participant NSM as NoFSegmentManager
 
     Note over User,NSM: setup() → install() → 手动批量挂载（仅当前 client）
-    User->>RC: setup(nof_device_path=["10.0.0.1:/dev/nvme0n1:/dev/nvme0n1",<br/>  "10.0.0.1:/dev/nvme1n1:/dev/nvme1n1"])
+    User->>RC: setup(nof_device_path=[...])
     RC->>TE: install("nvmeof", ...)
     TE->>NVT: install(local_server_name, metadata, topo)
     loop 每个 nof_device_path 元素
@@ -663,7 +663,7 @@ sequenceDiagram
 
 流程说明：
 
-1. **参数传入**：用户调用 `store.setup(nof_device_path=["10.0.0.1:/dev/nvme0n1:/dev/nvme0n1", "10.0.0.1:/dev/nvme1n1:/dev/nvme1n1"])` 指定远端标识与本地设备路径列表，格式参考 `ssd_offload_path` 的传递模式（经 `RealClient::setup_internal()` 传入 `NVMeoFTransport::install()`）。每个列表元素按**最后一个冒号**分割：前段 `remote_path`（`远端ip:设备路径`，如 `10.0.0.1:/dev/nvme0n1`）用于确认 segment 唯一性，后段 `local_path`（如 `/dev/nvme0n1`）为本地 NDS 读写使用的设备路径。
+1. **参数传入**：用户调用 `store.setup(nof_device_path=[...])` 指定远端标识与本地设备路径列表，格式参考 `ssd_offload_path` 的传递模式（经 `RealClient::setup_internal()` 传入 `NVMeoFTransport::install()`）。每个列表元素按**最后一个冒号**分割为 `remote_path:local_path`（语义详见上文参数说明）。
 2. **逐项处理**：`NVMeoFTransport::install()` 遍历列表，对每个元素执行以下步骤：
 3. **设备验证与信息获取**：对 `local_path` 指定设备 `open()` 获取 fd，从 `/sys/block/<device>/size` × 512 获取容量。
 4. **构造 SegmentDesc**：`name = remote_path`，`nvmeof_buffers[].file_path = remote_path`，`nvmeof_buffers[].local_path_map[local_server_name_] = local_path`，`protocol = "nvmeof"`。
@@ -671,19 +671,17 @@ sequenceDiagram
 6. **发布到元数据存储**：调用 `metadata_->updateLocalSegmentDesc()` 发布到 etcd/redis，供其他节点路由定位（复用 RDMA TE 已有接口）。
 7. **Client 主动挂载**：`setup_internal()` 中构造 `NoFSegment`（`name = local_hostname_`，`size` 来自步骤 3，`te_endpoint = remote_path`，`device_path = local_path`），调用 `MasterClient::MountNoFSegment()` 发起 RPC，由 `MasterService` 转交 `NoFSegmentManager::MountSegment()` 完成挂载（挂载流程详见第 5.3 节，RPC 链路为既有接口）。
 
-挂载完成后，各段仅对发起挂载的 client 可见可用；其他 client 如需使用这些远端段，需要各自在 `setup()` 中指定对应的 `remote_path:local_path`（本地挂载路径）完成自己的挂载。**不做全局刷新，也没有心跳增量同步机制。**
-
 `SegmentDesc` 各字段的填充规则：
 
 | 字段                                | 来源                                   | 说明                                                                       |
 | ----------------------------------- | -------------------------------------- | -------------------------------------------------------------------------- |
-| `name`                            | `nof_device_path` 的 `remote_path`   | 远端标识（远端 ip + 设备路径），确认 segment 唯一性，与`transport_endpoint_`（`te_endpoint`）一致 |
+| `name`                            | `nof_device_path` 的 `remote_path`   | 远端标识（远端标识 + 设备路径，通用场景为 ip、NDS 场景为 eid），确认 segment 唯一性，与`transport_endpoint_`（`te_endpoint`）一致 |
 | `protocol`                        | 固定`"nvmeof"`                       | 使`TransferSubmitter::submitTransfer` 能识别并路由到 `NVMeoFTransport` |
 | `nvmeof_buffers[].file_path`     | `nof_device_path` 的 `remote_path`   | 远端标识，与 `SegmentDesc.name` 一致                                      |
 | `nvmeof_buffers[].local_path_map` | `nof_device_path` 的 `local_path`    | 本地 NVMe 块设备路径（本地 NDS 读写使用），如`/dev/nvme0n1`，键为`local_server_name_` |
 | `nvmeof_buffers[].length`         | `NoFSegment.size`（从 sysfs 读取）   | segment 总大小                                                             |
 
-`device_path`（= `local_path`）是 `NoFSegment` 结构体中新增的字段，在 `NVMeoFTransport::install()` 阶段由 `nof_device_path` 参数的 `local_path` 填充，供本地 NDS 读写使用。该字段仅在 NDS 路径下使用，SPDK 路径不需要（SPDK 通过 `te_endpoint` 中的 transport string 直接连接远端 target）。
+`device_path`（= `local_path`）是 `NoFSegment` 结构体中新增的字段，在 `NVMeoFTransport::install()` 阶段由 `nof_device_path` 参数的 `local_path` 填充。
 
 ### 6.4 心跳探测接口替换
 
@@ -829,14 +827,14 @@ sequenceDiagram
 
 ## 7. 配置与可观测性
 
-通过环境变量进行运行时配置（无需改代码）：
+通过编译选项与运行参数进行配置：
 
-| 环境变量                          | 含义                              | 默认值                           |
+| 配置项                            | 含义                              | 默认值                           |
 | --------------------------------- | --------------------------------- | -------------------------------- |
 | `USE_NOF`（编译期）             | 启用 NoF 基础设施（master 层）    | `OFF`                          |
 | `USE_NVMEOF_NDS`（编译期）      | 启用 NDS 传输分支（transport 层） | `OFF`                          |
 | `MC_NDS_DEVICE_ID`              | NPU device id                     | `-1`（从 aclrtGetDevice 获取） |
-| `nof_device_path`（setup 参数） | 远端标识+本地路径列表（`["远端ip:设备路径:本地路径", ...]`） | 空（不启用 NoF segment）  |
+| `nof_device_path`（setup 参数） | 远端标识+本地路径列表（`["远端标识:设备路径:本地路径", ...]`，通用场景标识为 ip、NDS 场景为 eid） | 空（不启用 NoF segment）  |
 
 master 层 SSD segment 的心跳参数（探测间隔、超时、失败阈值）通过 `MasterServiceConfig` 注入，默认值参见第 5.4 节。
 
@@ -853,7 +851,7 @@ master 层 SSD segment 的心跳参数（探测间隔、超时、失败阈值）
 2. 评估是否抽取公共 `NvmeOfFileContext` 抽象基类，统一 GDS/NDS 的句柄管理接口；
 3. 评估 master 层 `ScopedNoFSegmentAccess` 与既有 `ScopedSegmentAccess` 是否抽取公共基类，统一引用计数与心跳接口；
 4. 实现 `submitNdsNofOperation` 及 `TransferSubmitter` 中的 `USE_NOF + USE_NVMEOF_NDS` 路由分支（第 6.2 节）；
-5. 在 `NoFSegment` 中增加 `device_path` 字段，在 `store.setup()` 中新增 `nof_device_path` 列表参数（元素格式 `远端ip:设备路径:本地路径`，其中 `remote_path` 确认 segment 唯一性、`local_path` 用于本地 NDS 读写），并在 `NVMeoFTransport::install()` 中遍历该列表完成 device 验证与 SegmentDesc 的 metadata 自动注册（第 6.3 节）；
+5. 在 `NoFSegment` 中增加 `device_path` 字段，在 `store.setup()` 中新增 `nof_device_path` 列表参数（元素格式 `远端标识:设备路径:本地路径`，其中 `remote_path` 确认 segment 唯一性、`local_path` 用于本地 NDS 读写；远端标识通用场景为 ip、NDS 场景为 eid），并在 `NVMeoFTransport::install()` 中遍历该列表完成 device 验证与 SegmentDesc 的 metadata 自动注册（第 6.3 节）；
 6. 在 `setup_internal()` 中构造 `NoFSegment`（`te_endpoint = remote_path`、`device_path = local_path`）并调用 `MasterClient::MountNoFSegment()` 补全 client 侧挂载断点（当前该 RPC 接口无生产调用者），使 `store.setup()` 一次调用完成注册与挂载（第 6.3 节）；
 7. 在 `MasterService` 构造中为 `USE_NOF + USE_NVMEOF_NDS` 绑定基于 `nds_read` 的默认 `NoFProbeFn`，替换当前仅 `USE_NOF` 的探针绑定（第 6.4 节）；
 8. 在 `NVMeoFTransport` 的 transport 层补齐 QoS 流控能力，使其达到与 SPDK 路径 `SpdkNofQos` 对等的水平。
