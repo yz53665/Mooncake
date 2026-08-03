@@ -144,12 +144,14 @@ ScopedKVSegmentAccess 中方法入参的 `client_id` 用于 `client_refs` 元素
 | --------------- | --------------- | ----------------------------------------------------------------------- |
 | `id`          | `UUID`        | 辅助标识，每次挂载时随机生成，仅用于日志/追踪，不参与去重和索引         |
 | `name`        | `std::string` | 逻辑段名，用于 preferred allocation 路由                                |
-| `device_name` | `std::string` | KVS 硬件设备名称（如`/dev/kvu0`），**全局唯一标识，作为主索引** |
+| `device_name` | `std::string` | 远端设备标识，格式为`"eid:设备路径"`（如 `"eid-xxxx:/dev/kvu0"`），**用于确认远端设备唯一性，作为主索引** |
 | `size`        | `size_t`      | KVS 设备总容量（字节）                                                  |
 
 对比普通 `Segment`：**不需要** `base`（无地址概念）、`protocol`（使用专用协议）。
 
 `id` 字段说明：Client 端在挂载时调用 `generate_uuid()` 生成随机 v4 UUID。由于每次挂载生成不同的 UUID，`id` 不适合做去重或索引。KVSegment 的去重和索引统一以 `device_name` 为准。
+
+`device_name` 字段说明：格式为 `"eid:设备路径"`，其中 `eid` 为 NDS 段的远端标识（`nds_segment_info_t.eid`），设备路径为该设备在本地的访问路径（如 `/dev/kvu0`）。其作用是确认远端设备的唯一性：同一块远端 KVS 设备在不同节点挂载时必须使用相同的 `device_name`（含相同的 eid 前缀），保证在 Master 侧合并为同一个 segment。
 
 ### 2.2 枚举扩展（types.h）
 
@@ -201,7 +203,7 @@ ScopedKVSegmentAccess 中方法入参的 `client_id` 用于 `client_refs` 元素
 
 `Replica` 类需新增：`KVReplicaData` variant 分支、`KVDescriptor` variant 分支、对应构造函数、`is_kvs_replica()` 判断方法、`get_descriptor()` 中的 KVS 分支。
 
-其中 `hash_key` 为 `uint64_t`（8 字节），由随机哈希计算得出，碰撞时重新生成。
+其中 `device_name` 与 `KVSegment.device_name` 一致（含 eid 前缀，格式 `eid:设备路径`），`hash_key` 为 `uint64_t`（8 字节），由随机哈希计算得出，碰撞时重新生成。
 
 ### 2.6 key 到 hash_key 的映射
 
@@ -312,7 +314,7 @@ struct KVDescriptor {
 YLT_REFL(KVDescriptor, device_name, object_size, hash_key);
 ```
 
-`hash_key` 类型为 `uint64_t`，与 KVS 硬件的 8 字节 key 直接对应。`KVReplicaData` 同步。
+`hash_key` 类型为 `uint64_t`，与 KVS 硬件的 8 字节 key 直接对应。`KVReplicaData` 同步。fv
 
 ---
 
@@ -347,7 +349,7 @@ sequenceDiagram
     MS->>SA: getKVSegmentAccess().MountSegment()
     Note over SA: 获取 segment_mutex_ 写锁
 
-    SA->>SA: 校验 device_name 不为空、size > 0
+    SA->>SA: 校验 device_name 不为空、格式合法（含 eid 前缀）<br/>size > 0
     SA->>SA: 按 device_name 查找 mounted_segments_
 
     alt device_name 已存在（重复挂载）
@@ -370,6 +372,7 @@ sequenceDiagram
 | 步骤                  | 普通 Segment                                                 | KVSegment                                                         |
 | --------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------- |
 | 地址校验              | `base != 0`、对齐校验                                      | 无（无地址概念）                                                  |
+| 标识校验              | 无                                                            | `device_name` 格式校验（`eid:设备路径`，含 eid 前缀） |
 | 创建分配器            | 创建`CachelibBufferAllocator` 或 `OffsetBufferAllocator` | 不创建，直接记录`remaining_size`                                |
 | 加入 AllocatorManager | `addAllocator()`                                           | 无此步骤                                                          |
 | 去重检查              | 按`segment.id`                                             | **按 `device_name`**（`segment.id` 随机生成，不做去重） |
@@ -462,6 +465,8 @@ sequenceDiagram
     Client->>MS: PutEnd(key, ...)
     MS-->>Client: OK
 ```
+
+KVTransport 以 `device_name`（含 eid 前缀）定位远端 KVS 设备：eid 用于确认目标设备，设备路径用于本地访问。
 
 ### 7.2 Get 流程
 
@@ -570,7 +575,7 @@ flowchart TD
 Client **不需要**感知 KVSegment 的卸载。原因：
 
 1. Client 每次操作都向 Master 请求 descriptor，Master 返回什么就用什么
-2. Client 的 KVTransport 只认 `device_name`，死设备的 descriptor 会被 `ClearInvalidHandles` 清理掉
+2. Client 的 KVTransport 只认 `device_name`（含 eid 前缀），死设备的 descriptor 会被 `ClearInvalidHandles` 清理掉
 3. 与内存段不同，Client 不需要为 KVSegment 做 `registerLocalMemory`，无本地映射需清理
 
 ---
@@ -719,7 +724,7 @@ classDiagram
     MasterService新增成员 ..> KVSProbeFn : kvs_probe_fn_
 ```
 
-`KVSProbeFn` 为探针函数类型，签名为 `bool(const string& device_name, uint32_t timeout_ms, string* error_reason)`。`kvs_heartbeat_states_` 以 `device_name` 为 key，`kvs_heartbeat_mutex_` 保护其访问，`kvs_probe_fn_mutex_` 保护 `kvs_probe_fn_` 的读写。
+`KVSProbeFn` 为探针函数类型，签名为 `bool(const string& device_name, uint32_t timeout_ms, string* error_reason)`，其中 `device_name` 为含 eid 前缀的设备标识（格式 `eid:设备路径`）。`kvs_heartbeat_states_` 以 `device_name` 为 key，`kvs_heartbeat_mutex_` 保护其访问，`kvs_probe_fn_mutex_` 保护 `kvs_probe_fn_` 的读写。
 
 ### 11.4 心跳线程主循环
 
@@ -909,10 +914,10 @@ sequenceDiagram
         TE->>NDS: nds_delete(hash_key, device_name)
         NDS-->>TE: delete 完成
         TE-->>ET: EvictKVSObject 完成
-    
+  
         ET->>MS: Deallocate(device_name, object_size)
         Note over MS: remaining_size += object_size
-    
+  
         ET->>MS: 从 ObjectMetadata 中移除该 KVS 副本
         ET->>MS: 从 global_hash_set_ 中移除 hash_key
     end
@@ -936,7 +941,7 @@ sequenceDiagram
 
 | 接口                                  | 方向                  | 说明                                                    |
 | ------------------------------------- | --------------------- | ------------------------------------------------------- |
-| `EvictKVSObject` RPC                | Master → Client (TE) | 透传`hash_key` + `device_name`，通知 TE 执行 delete |
+| `EvictKVSObject` RPC                | Master → Client (TE) | 透传`hash_key` + `device_name`（含 eid 前缀），通知 TE 执行 delete |
 | `nds_delete(hash_key, device_name)` | TE → NDS             | KV 硬件 delete 语义，物理删除 key                       |
 
 **新增 RPC 消息：**
@@ -1043,7 +1048,7 @@ std::atomic<bool> kvs_eviction_running_{false};
 | **不修改 allocator.h / allocation_strategy.h**                  | KVS 不经过这些组件，改动范围最小                                                                                        |
 | **随机哈希 + 全局 hash 集**                                     | 64 字节→8 字节必然碰撞。随机哈希生成 hash_key，Master 维护`unordered_set<uint64_t>` 去重，碰撞则重新生成             |
 | **hash_key 存入 KVDescriptor**                                  | hash_key 持久化到 ObjectMetadata，Get 路径通过现有 key→元数据索引自然完成映射，无需额外映射表                          |
-| **mounted_segments_ 以 device_name 为 key**                     | `device_name` 是物理设备的唯一标识，`segment.id` 随机生成不具确定性，不适合做索引                                   |
+| **mounted_segments_ 以 device_name 为 key**                     | `device_name` 含 eid 前缀（格式 `eid:设备路径`），是远端设备的唯一标识；`segment.id` 随机生成不具确定性，不适合做索引 |
 | **引入 client_refs 引用计数**                                   | 一个物理 SSD 设备可被多个 client 共享，使用引用计数管理生命周期                                                         |
 | **分配不过滤 client**                                           | 所有 client 共享同一组物理设备，任何 OK 状态的段都可分配                                                                |
 | **Unmount 参数改为 device_name + client_id**                    | 对应引用计数语义：卸载 = 减引用，而非直接销毁                                                                           |
