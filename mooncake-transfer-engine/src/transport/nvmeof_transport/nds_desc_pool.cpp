@@ -118,6 +118,8 @@ int NdsDescPool::allocNdsDesc(size_t batch_size) {
         desc->events.resize(max_batch_size_);
         desc->slices.clear();
         desc->slices.reserve(max_batch_size_);
+        desc->batch_submitted.store(false);
+        desc->submit_failed.store(false);
         for (size_t i = 0; i < max_batch_size_; ++i) {
             desc->events[i].status = NDS_BATCH_IO_WAITING;
             desc->events[i].ret = 0;
@@ -164,6 +166,7 @@ int NdsDescPool::submitBatch(int idx) {
     auto *desc = descs_[idx];
     if (desc->params.empty()) {
         LOG(WARNING) << "Submitting empty batch for descriptor " << idx;
+        desc->batch_submitted.store(true);
         return 0;
     }
 
@@ -173,8 +176,11 @@ int NdsDescPool::submitBatch(int idx) {
                          desc->params.data(), 0) != 0) {
         LOG(ERROR) << "NdsDescPool: ndsBatchIOSubmit failed for " << nr
                    << " slices";
+        desc->submit_failed.store(true);
+        desc->batch_submitted.store(true);
         return -1;
     }
+    desc->batch_submitted.store(true);
     return 0;
 }
 
@@ -192,6 +198,23 @@ ndsBatchIOEvents_t NdsDescPool::getTransferStatus(int idx, int slice_id) {
     if (slice_id < 0 || slice_id >= (int)desc->params.size()) {
         LOG(ERROR) << "Invalid slice_id " << slice_id << " for descriptor "
                    << idx << " (size: " << desc->params.size() << ")";
+        ndsBatchIOEvents_t event;
+        event.status = NDS_BATCH_IO_FAILED;
+        event.ret = -1;
+        return event;
+    }
+
+    // If batch has not been submitted yet (async submit in progress),
+    // report WAITING to caller.
+    if (!desc->batch_submitted.load()) {
+        ndsBatchIOEvents_t event;
+        event.status = NDS_BATCH_IO_WAITING;
+        event.ret = 0;
+        return event;
+    }
+
+    // If submit itself failed, report FAILED for all slices.
+    if (desc->submit_failed.load()) {
         ndsBatchIOEvents_t event;
         event.status = NDS_BATCH_IO_FAILED;
         event.ret = -1;

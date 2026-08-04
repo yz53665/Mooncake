@@ -70,6 +70,7 @@ NVMeoFTransport::NVMeoFTransport() {
 
 NVMeoFTransport::~NVMeoFTransport() {
 #ifdef USE_NDS
+    stopNdsThreadPool();
     if (nds_initialized_ && nds_device_id_ >= 0) {
         nds_deinit(nds_device_id_);
         nds_initialized_ = false;
@@ -283,7 +284,22 @@ Status NVMeoFTransport::submitTransferTask(
         slice_id += task.slice_count;
     }
 
-    nds_desc_pool_->submitBatch(nvmeof_desc.desc_idx_);
+    // Asynchronously submit the batch via the NDS worker thread pool.
+    // Each worker calls ndsBatchIOSubmit and moves on to the next batch
+    // without waiting for getTransferStatus.
+    {
+        int desc_idx = nvmeof_desc.desc_idx_;
+        std::unique_lock<std::mutex> lock(nds_queue_mutex_);
+        if (!nds_running_) {
+            // Fallback: submit synchronously if thread pool is not running
+            nds_desc_pool_->submitBatch(desc_idx);
+        } else {
+            nds_task_queue_.emplace([this, desc_idx]() {
+                nds_desc_pool_->submitBatch(desc_idx);
+            });
+            nds_queue_cv_.notify_one();
+        }
+    }
     return Status::OK();
 #else
     auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
@@ -440,6 +456,7 @@ int NVMeoFTransport::registerLocalMemory(void *addr, size_t length,
                 return -1;
             }
             nds_initialized_ = true;
+            initializeNdsThreadPool();
         }
         if (nds_buf_register(nds_device_id_, addr, length) != 0) {
             LOG(ERROR) << "NVMeoFTransport: nds_buf_register failed for addr="
@@ -528,6 +545,75 @@ void NVMeoFTransport::addSliceToNdsBatch(
     params.cookie = slice;
     params.device_id = nds_device_id_;
     nds_desc_pool_->pushParams(desc_id, params, slice);
+}
+#endif
+
+#ifdef USE_NDS
+void NVMeoFTransport::initializeNdsThreadPool() {
+    nds_running_ = true;
+    nds_workers_.reserve(nds_thread_pool_size_);
+    for (size_t i = 0; i < nds_thread_pool_size_; ++i) {
+        nds_workers_.emplace_back(&NVMeoFTransport::ndsWorkerThread, this);
+    }
+    LOG(INFO) << "NVMeoFTransport: NDS submit thread pool initialized with "
+              << nds_thread_pool_size_ << " threads";
+}
+
+void NVMeoFTransport::stopNdsThreadPool() {
+    bool expected = true;
+    if (!nds_running_.compare_exchange_strong(expected, false)) {
+        return;
+    }
+    nds_queue_cv_.notify_all();
+    for (auto &worker : nds_workers_) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+    nds_workers_.clear();
+    while (!nds_task_queue_.empty()) {
+        nds_task_queue_.pop();
+    }
+    LOG(INFO) << "NVMeoFTransport: NDS submit thread pool stopped";
+}
+
+void NVMeoFTransport::ndsWorkerThread() {
+    // Each worker thread must set the NPU device context for NDS API calls
+    int ret = aclrtSetDevice(nds_device_id_);
+    if (ret != ACL_SUCCESS) {
+        LOG(ERROR) << "NDS worker: aclrtSetDevice failed for device_id="
+                   << nds_device_id_ << ", ret=" << ret;
+    }
+    while (nds_running_) {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lock(nds_queue_mutex_);
+            nds_queue_cv_.wait(lock, [this] {
+                return !nds_running_ || !nds_task_queue_.empty();
+            });
+
+            if (!nds_running_ && nds_task_queue_.empty()) {
+                return;
+            }
+
+            if (!nds_task_queue_.empty()) {
+                task = std::move(nds_task_queue_.front());
+                nds_task_queue_.pop();
+            }
+        }
+
+        if (task) {
+            try {
+                // Execute ndsBatchIOSubmit for this batch, then immediately
+                // loop back to process the next batch without waiting for
+                // getTransferStatus.
+                task();
+            } catch (...) {
+                LOG(ERROR) << "NVMeoFTransport: NDS worker thread caught "
+                              "unknown exception";
+            }
+        }
+    }
 }
 #endif
 

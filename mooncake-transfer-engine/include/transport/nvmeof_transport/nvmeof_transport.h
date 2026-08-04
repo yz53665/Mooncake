@@ -147,6 +147,21 @@ class NVMeoFTransport : public Transport {
 
     int32_t nds_device_id_ = -1;
     bool nds_initialized_ = false;
+
+    // NDS submit thread pool: worker threads execute ndsBatchIOSubmit
+    // asynchronously. Each worker submits the batch and moves on to the next
+    // without waiting for getTransferStatus.
+    void initializeNdsThreadPool();
+    void stopNdsThreadPool();
+    void ndsWorkerThread();
+
+    std::vector<std::thread> nds_workers_;
+    std::queue<std::function<void()>> nds_task_queue_;
+    std::mutex nds_queue_mutex_;
+    std::condition_variable nds_queue_cv_;
+    std::atomic<bool> nds_running_{false};
+    size_t nds_thread_pool_size_ = kDefaultNdsThreadPoolSize;
+    static constexpr size_t kDefaultNdsThreadPoolSize = 8;
 #endif
 };
 }  // namespace mooncake

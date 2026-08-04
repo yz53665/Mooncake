@@ -42,6 +42,9 @@ struct NdsBatchDesc {
     std::vector<ndsBatchIOParams_t> params;
     std::vector<ndsBatchIOEvents_t> events;
     std::vector<Transport::Slice *> slices;
+    // Submit status (atomic for lock-free polling in getTransferStatus)
+    std::atomic<bool> batch_submitted{false};
+    std::atomic<bool> submit_failed{false};
 };
 
 class NdsDescPool {
