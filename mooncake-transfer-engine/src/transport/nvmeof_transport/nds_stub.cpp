@@ -36,7 +36,7 @@ struct nds_file_ctx_t {
 
 struct nds_batch_context {
     unsigned max_nr;
-    std::vector<ndsBatchIOParams_t> params;
+    std::vector<nds_batch_io_params_t> params;
     bool submitted;
 };
 
@@ -78,7 +78,7 @@ extern "C" int nds_buf_deregister(int32_t device_id, void *buf) {
 // NDS segment info stub
 // ============================================================================
 
-extern "C" int nds_get_segment_info(void *buf, nds_segment_info_t *out) {
+extern "C" int nds_get_segment_info(void *buf, nds_segment_infos_t *out) {
     (void)buf;
     if (out) {
         memset(out, 0, sizeof(*out));
@@ -157,48 +157,55 @@ extern "C" ssize_t nds_write_imported(nds_Handle nds_handle,
 // NDS async batch I/O stubs
 // ============================================================================
 
-extern "C" int ndsBatchIOSetUp(ndsBatchHandle_t *handle, unsigned max_nr) {
+extern "C" int nds_batch_io_setup(nds_batch_handle_t *handle, unsigned max_io_count) {
     if (!handle) return -1;
     auto *ctx = new nds_batch_context();
-    ctx->max_nr = max_nr;
+    ctx->max_nr = max_io_count;
     ctx->submitted = false;
     *handle = ctx;
     return 0;
 }
 
-extern "C" int ndsBatchIOSubmit(ndsBatchHandle_t handle, unsigned nr,
-                                ndsBatchIOParams_t *params, unsigned flags) {
+extern "C" int nds_batch_io_submit(nds_batch_handle_t handle, unsigned io_count,
+                                   nds_batch_io_params_t *params, unsigned flags) {
     (void)flags;
     if (!handle || !params) return -1;
-    handle->params.assign(params, params + nr);
+    handle->params.assign(params, params + io_count);
     handle->submitted = true;
     return 0;
 }
 
-extern "C" int ndsBatchIOGetStatus(ndsBatchHandle_t handle, unsigned min_nr,
-                                   unsigned *nr, ndsBatchIOEvents_t *events,
-                                   const struct timespec *timeout) {
-    (void)min_nr;
+extern "C" int nds_batch_io_get_status(nds_batch_handle_t handle, unsigned min_complete,
+                                       unsigned *event_count, nds_batch_io_events_t *events,
+                                       const struct timespec *timeout) {
+    (void)min_complete;
     (void)timeout;
-    if (!handle || !nr || !events) return -1;
+    if (!handle || !event_count || !events) return -1;
     if (!handle->submitted) {
-        *nr = 0;
+        *event_count = 0;
         return 0;
     }
     // Simulate immediate completion for all submitted slices
     unsigned count = static_cast<unsigned>(handle->params.size());
-    if (*nr < count) count = *nr;
+    if (*event_count < count) count = *event_count;
     for (unsigned i = 0; i < count; ++i) {
         events[i].cookie = handle->params[i].cookie;
         events[i].status = NDS_BATCH_IO_COMPLETED;
-        events[i].ret = static_cast<ssize_t>(handle->params[i].u.batch.size);
+        events[i].ret = static_cast<ssize_t>(handle->params[i].nbyte);
         events[i].error = 0;
     }
-    *nr = count;
+    *event_count = count;
     return 0;
 }
 
-extern "C" int ndsBatchIODestroy(ndsBatchHandle_t handle) {
+extern "C" int nds_batch_io_reset(nds_batch_handle_t handle) {
+    if (!handle) return -1;
+    handle->params.clear();
+    handle->submitted = false;
+    return 0;
+}
+
+extern "C" int nds_batch_io_destroy(nds_batch_handle_t handle) {
     if (handle) {
         delete handle;
     }

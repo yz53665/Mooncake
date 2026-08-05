@@ -25,7 +25,7 @@ struct timespec;
  * @brief 声明nds句柄 nds_Handle
  */
 typedef struct nds_file_ctx_t* nds_Handle;
-typedef struct nds_batch_context* ndsBatchHandle_t;
+typedef struct nds_batch_context* nds_batch_handle_t;
 
 /**
  * @brief Metadata required to access a remote registered NDS segment.
@@ -39,6 +39,11 @@ typedef struct nds_segment_info {
     uint32_t jetty_id;
     uint32_t token_id;
 } nds_segment_info_t;
+
+typedef struct nds_segment_infos {
+    nds_segment_info_t h2d_segment_info;
+    nds_segment_info_t rh2d_segment_info;
+} nds_segment_infos_t;
 
 /**
  * @brief nds read/write 输入参数
@@ -54,52 +59,36 @@ typedef struct {
 typedef enum {
     NDS_BATCH_IO_READ = 0,
     NDS_BATCH_IO_WRITE = 1,
-} ndsBatchIOOp_t;
+} nds_batch_io_op_t;
 
 typedef enum {
     NDS_BATCH_IO_WAITING = 0,
     NDS_BATCH_IO_COMPLETED = 1,
     NDS_BATCH_IO_FAILED = 2,
-} ndsBatchIOStatus_t;
-
-typedef enum {
-    NDS_BATCH = 1,
-} ndsBatchMode_t;
+} nds_batch_io_status_t;
 
 /**
- * @brief HBM address descriptor for one batch async I/O slice.
+ * @brief Submit parameter for one batch async I/O entry.
  */
 typedef struct {
-    void *buf;         // Registered NPU HBM address for this slice.
-    off_t file_offset; // File or block-device offset.
-    size_t size;      // Transfer size in bytes.
-} ndsBatchIOParamBatch_t;
-
-/**
- * @brief Submit parameter for one batch async I/O slice.
- * @note buf is the actual HBM address. device_id is still required by NDS to
- *       look up local buffer state and device metadata.
- */
-typedef struct {
-    ndsBatchMode_t mode;
-    union {
-        ndsBatchIOParamBatch_t batch;
-    } u;
     nds_Handle nds_handle;
-    ndsBatchIOOp_t opcode;
-    void *cookie;
     int32_t device_id;
-} ndsBatchIOParams_t;
+    void *buf;
+    size_t nbyte;
+    off_t offset;
+    nds_batch_io_op_t opcode;
+    void *cookie;
+} nds_batch_io_params_t;
 
 /**
- * @brief Completion event for one batch async I/O slice.
+ * @brief Completion event for one batch async I/O entry.
  */
 typedef struct {
     void *cookie;
-    ndsBatchIOStatus_t status;
+    nds_batch_io_status_t status;
     ssize_t ret;
     int error;
-} ndsBatchIOEvents_t;
+} nds_batch_io_events_t;
 
 /**
  * @brief Initialize NDS user-space library
@@ -163,7 +152,7 @@ int nds_buf_deregister(int32_t device_id, void *buf);
  *          the corresponding NDS device and buffer registration alive.
  * @see nds_buf_register, nds_read_imported, nds_write_imported
  */
-int nds_get_segment_info(void *buf, nds_segment_info_t *out);
+int nds_get_segment_info(void *buf, nds_segment_infos_t *out);
 
 /**
  * @brief 注册文件信息
@@ -258,40 +247,47 @@ ssize_t nds_write_imported(nds_Handle nds_handle, const nds_segment_info_t *segm
 /**
  * @brief Create a batch async I/O context.
  * @param handle Output batch handle.
- * @param max_nr Maximum number of slices supported by this batch handle.
+ * @param max_io_count Maximum number of I/O entries supported by this batch handle.
  * @return 0 on success, -1 on failure
  */
-int ndsBatchIOSetUp(ndsBatchHandle_t *handle, unsigned max_nr);
+int nds_batch_io_setup(nds_batch_handle_t *handle, unsigned max_io_count);
 
 /**
- * @brief Submit a batch of async I/O slices.
- * @param handle Batch handle returned by ndsBatchIOSetUp.
- * @param nr Number of slices to submit.
- * @param params I/O parameter array, one entry per slice.
+ * @brief Submit a batch of async I/O entries.
+ * @param handle Batch handle returned by nds_batch_io_setup.
+ * @param io_count Number of I/O entries to submit.
+ * @param params I/O parameter array.
  * @param flags Reserved, must be 0 for now.
  * @return 0 on submit accepted, -1 on failure
  */
-int ndsBatchIOSubmit(ndsBatchHandle_t handle, unsigned nr,
-    ndsBatchIOParams_t *params, unsigned flags);
+int nds_batch_io_submit(nds_batch_handle_t handle, unsigned io_count,
+    nds_batch_io_params_t *params, unsigned flags);
 
 /**
  * @brief Query completion events for a submitted batch.
- * @param handle Batch handle returned by ndsBatchIOSetUp.
- * @param min_nr Reserved, must be 0 for now.
- * @param nr Input event capacity, output number of returned events.
+ * @param handle Batch handle returned by nds_batch_io_setup.
+ * @param min_complete Reserved, must be 0 for now.
+ * @param event_count Input event capacity, output number of returned events.
  * @param events Completion output array.
  * @param timeout Reserved, must be NULL for now.
  * @return 0 on success, -1 on failure
  */
-int ndsBatchIOGetStatus(ndsBatchHandle_t handle, unsigned min_nr,
-    unsigned *nr, ndsBatchIOEvents_t *events, const struct timespec *timeout);
+int nds_batch_io_get_status(nds_batch_handle_t handle, unsigned min_complete,
+    unsigned *event_count, nds_batch_io_events_t *events, const struct timespec *timeout);
+
+/**
+ * @brief Reset a completed batch async I/O context for reuse.
+ * @param handle Batch handle returned by nds_batch_io_setup.
+ * @return 0 on success, -1 on failure
+ */
+int nds_batch_io_reset(nds_batch_handle_t handle);
 
 /**
  * @brief Destroy a batch async I/O context and release related resources.
- * @param handle Batch handle returned by ndsBatchIOSetUp.
+ * @param handle Batch handle returned by nds_batch_io_setup.
  * @return 0 on success, -1 on failure
  */
-int ndsBatchIODestroy(ndsBatchHandle_t handle);
+int nds_batch_io_destroy(nds_batch_handle_t handle);
 
 
 #ifdef __cplusplus

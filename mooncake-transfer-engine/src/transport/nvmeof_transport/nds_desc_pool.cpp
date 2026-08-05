@@ -34,7 +34,7 @@ NdsDescPool::~NdsDescPool() {
     // First, collect and destroy batch_handles from allocated descriptors
     for (size_t i = 0; i < MAX_NR_DESC; ++i) {
         if (descs_[i] != nullptr) {
-            ndsBatchIODestroy(descs_[i]->batch_handle->handle);
+            nds_batch_io_destroy(descs_[i]->batch_handle->handle);
             delete descs_[i]->batch_handle;
             delete descs_[i];
             descs_[i] = nullptr;
@@ -44,7 +44,7 @@ NdsDescPool::~NdsDescPool() {
     // Then clean up any remaining handles in the pool
     std::lock_guard<std::mutex> lock(handle_pool_lock_);
     for (auto *batch_handle : handle_pool_) {
-        ndsBatchIODestroy(batch_handle->handle);
+        nds_batch_io_destroy(batch_handle->handle);
         delete batch_handle;
     }
     handle_pool_.clear();
@@ -93,7 +93,7 @@ int NdsDescPool::allocNdsDesc(size_t batch_size) {
             batch_handle->max_nr != static_cast<unsigned>(max_batch_size_)) {
             // Destroy mismatched handle if exists
             if (batch_handle) {
-                ndsBatchIODestroy(batch_handle->handle);
+                nds_batch_io_destroy(batch_handle->handle);
                 delete batch_handle;
                 batch_handle = nullptr;
             }
@@ -101,10 +101,10 @@ int NdsDescPool::allocNdsDesc(size_t batch_size) {
             auto new_batch_handle = std::make_unique<NdsBatchHandle>();
             new_batch_handle->max_nr =
                 static_cast<unsigned>(max_batch_size_);
-            // ndsBatchIOSetUp is time-costly, so we reuse handles
-            if (ndsBatchIOSetUp(&new_batch_handle->handle,
+            // nds_batch_io_setup is time-costly, so we reuse handles
+            if (nds_batch_io_setup(&new_batch_handle->handle,
                                 new_batch_handle->max_nr) != 0) {
-                LOG(ERROR) << "NdsDescPool: ndsBatchIOSetUp failed for max_nr="
+                LOG(ERROR) << "NdsDescPool: nds_batch_io_setup failed for max_nr="
                            << new_batch_handle->max_nr;
                 delete desc;
                 return -1;
@@ -130,14 +130,14 @@ int NdsDescPool::allocNdsDesc(size_t batch_size) {
         // Clean up on exception to avoid memory leaks
         delete desc;
         if (batch_handle) {
-            ndsBatchIODestroy(batch_handle->handle);
+            nds_batch_io_destroy(batch_handle->handle);
             delete batch_handle;
         }
         throw;  // Re-throw to caller
     }
 }
 
-int NdsDescPool::pushParams(int idx, const ndsBatchIOParams_t &io_params,
+int NdsDescPool::pushParams(int idx, const nds_batch_io_params_t &io_params,
                             Transport::Slice *slice) {
     RWSpinlock::WriteGuard guard(mutex_);
     if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
@@ -172,9 +172,9 @@ int NdsDescPool::submitBatch(int idx) {
 
     // Submit all params in this descriptor
     unsigned nr = static_cast<unsigned>(desc->params.size());
-    if (ndsBatchIOSubmit(desc->batch_handle->handle, nr,
+    if (nds_batch_io_submit(desc->batch_handle->handle, nr,
                          desc->params.data(), 0) != 0) {
-        LOG(ERROR) << "NdsDescPool: ndsBatchIOSubmit failed for " << nr
+        LOG(ERROR) << "NdsDescPool: nds_batch_io_submit failed for " << nr
                    << " slices";
         desc->submit_failed.store(true);
         desc->batch_submitted.store(true);
@@ -184,11 +184,11 @@ int NdsDescPool::submitBatch(int idx) {
     return 0;
 }
 
-ndsBatchIOEvents_t NdsDescPool::getTransferStatus(int idx, int slice_id) {
+nds_batch_io_events_t NdsDescPool::getTransferStatus(int idx, int slice_id) {
     RWSpinlock::WriteGuard guard(mutex_);
     if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
         LOG(ERROR) << "Invalid descriptor index: " << idx;
-        ndsBatchIOEvents_t event;
+        nds_batch_io_events_t event;
         event.status = NDS_BATCH_IO_FAILED;
         event.ret = -1;
         return event;
@@ -198,7 +198,7 @@ ndsBatchIOEvents_t NdsDescPool::getTransferStatus(int idx, int slice_id) {
     if (slice_id < 0 || slice_id >= (int)desc->params.size()) {
         LOG(ERROR) << "Invalid slice_id " << slice_id << " for descriptor "
                    << idx << " (size: " << desc->params.size() << ")";
-        ndsBatchIOEvents_t event;
+        nds_batch_io_events_t event;
         event.status = NDS_BATCH_IO_FAILED;
         event.ret = -1;
         return event;
@@ -207,7 +207,7 @@ ndsBatchIOEvents_t NdsDescPool::getTransferStatus(int idx, int slice_id) {
     // If batch has not been submitted yet (async submit in progress),
     // report WAITING to caller.
     if (!desc->batch_submitted.load()) {
-        ndsBatchIOEvents_t event;
+        nds_batch_io_events_t event;
         event.status = NDS_BATCH_IO_WAITING;
         event.ret = 0;
         return event;
@@ -215,17 +215,17 @@ ndsBatchIOEvents_t NdsDescPool::getTransferStatus(int idx, int slice_id) {
 
     // If submit itself failed, report FAILED for all slices.
     if (desc->submit_failed.load()) {
-        ndsBatchIOEvents_t event;
+        nds_batch_io_events_t event;
         event.status = NDS_BATCH_IO_FAILED;
         event.ret = -1;
         return event;
     }
 
     unsigned nr = static_cast<unsigned>(desc->params.size());
-    if (ndsBatchIOGetStatus(desc->batch_handle->handle, 0, &nr,
+    if (nds_batch_io_get_status(desc->batch_handle->handle, 0, &nr,
                             desc->events.data(), nullptr) != 0) {
-        LOG(ERROR) << "NdsDescPool: ndsBatchIOGetStatus failed for desc " << idx;
-        ndsBatchIOEvents_t event;
+        LOG(ERROR) << "NdsDescPool: nds_batch_io_get_status failed for desc " << idx;
+        nds_batch_io_events_t event;
         event.status = NDS_BATCH_IO_FAILED;
         event.ret = -1;
         return event;
@@ -260,7 +260,7 @@ int NdsDescPool::freeNdsDesc(int idx) {
     // use-after-free bugs if IOs are in-flight.
     //
     // Return the handle to pool for reuse (avoid expensive
-    // ndsBatchIODestroy)
+    // nds_batch_io_destroy)
     {
         std::lock_guard<std::mutex> lock(handle_pool_lock_);
         handle_pool_.push_back(desc->batch_handle);

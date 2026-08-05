@@ -285,7 +285,7 @@ Status NVMeoFTransport::submitTransferTask(
     }
 
     // Asynchronously submit the batch via the NDS worker thread pool.
-    // Each worker calls ndsBatchIOSubmit and moves on to the next batch
+    // Each worker calls nds_batch_io_submit and moves on to the next batch
     // without waiting for getTransferStatus.
     {
         int desc_idx = nvmeof_desc.desc_idx_;
@@ -533,11 +533,10 @@ void NVMeoFTransport::addSliceToNdsBatch(
     void *source_addr, uint64_t file_offset, uint64_t slice_len,
     int desc_id, TransferRequest::OpCode op, nds_Handle nds_handle,
     Slice *slice) {
-    ndsBatchIOParams_t params;
-    params.mode = NDS_BATCH;
-    params.u.batch.buf = source_addr;
-    params.u.batch.file_offset = file_offset;
-    params.u.batch.size = slice_len;
+    nds_batch_io_params_t params;
+    params.buf = source_addr;
+    params.nbyte = slice_len;
+    params.offset = file_offset;
     params.nds_handle = nds_handle;
     params.opcode = (op == Transport::TransferRequest::READ)
                         ? NDS_BATCH_IO_READ
@@ -604,7 +603,7 @@ void NVMeoFTransport::ndsWorkerThread() {
 
         if (task) {
             try {
-                // Execute ndsBatchIOSubmit for this batch, then immediately
+                // Execute nds_batch_io_submit for this batch, then immediately
                 // loop back to process the next batch without waiting for
                 // getTransferStatus.
                 task();

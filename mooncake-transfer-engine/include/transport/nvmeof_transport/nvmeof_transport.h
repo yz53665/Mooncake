@@ -148,7 +148,7 @@ class NVMeoFTransport : public Transport {
     int32_t nds_device_id_ = -1;
     bool nds_initialized_ = false;
 
-    // NDS submit thread pool: worker threads execute ndsBatchIOSubmit
+    // NDS submit thread pool: worker threads execute nds_batch_io_submit
     // asynchronously. Each worker submits the batch and moves on to the next
     // without waiting for getTransferStatus.
     void initializeNdsThreadPool();
