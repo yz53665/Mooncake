@@ -228,19 +228,14 @@ class TransferEngineImpl {
     }
 
     Status freeBatchID(BatchID batch_id) {
-        auto& batch_desc = Transport::toBatchDesc(batch_id);
-        if (!batch_desc.task_list.empty()) {
-            auto& task = batch_desc.task_list[0];
-            if (task.request) {
-                auto desc = metadata_->getSegmentDescByID(task.request->target_id);
-                if (desc && desc->protocol == "nvmeof") {
-                    auto* nvmeof_transport = getTransport("nvmeof");
-                    if (nvmeof_transport) {
-                        return nvmeof_transport->freeBatchID(batch_id);
-                    }
-                }
-            }
+    auto& batch_desc = Transport::toBatchDesc(batch_id);
+    if (batch_desc.context) {
+        // context 非空说明是 transport-specific batch（如 nvmeof）
+        auto* nvmeof_transport = getTransport("nvmeof");
+        if (nvmeof_transport) {
+            return nvmeof_transport->freeBatchID(batch_id);
         }
+    }
         return multi_transports_->freeBatchID(batch_id);
     }
 
