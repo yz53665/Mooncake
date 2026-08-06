@@ -629,7 +629,7 @@ sequenceDiagram
 | `nvmeof_buffers[].local_path_map` | `nof_device_path` 的 `local_path`  | 本地 NVMe 块设备路径（本地 NDS 读写使用），如`/dev/nvme0n1`，键为`local_server_name_`            |
 | `nvmeof_buffers[].length`         | `NoFSegment.size`（从 sysfs 读取）   | segment 总大小                                                                                       |
 
-## 7. 配置与可观测性
+## 6. 配置与可观测性
 
 通过编译选项与运行参数进行配置：
 
@@ -644,23 +644,22 @@ master 层 SSD segment 的心跳参数（探测间隔、超时、失败阈值）
 
 状态查询在 NDS 路径下通过 `nds_batch_io_get_status` 获取 `nds_batch_io_events_t`（含 `status`、`ret`、`error`），与 GDS 路径基于 `CUfileIOEvents_t` 的查询语义保持一致（参见第 4.2.3 节）。
 
-## 8. 与社区路线的协同
+## 7. 与社区路线的协同
 
 - 与 SPDK 路线互补（定位差异见第 2.4 节）：本提案在 transport 层引入 NPU 直连分支，并在 master 层扩展 NoF segment 的共享/心跳/故障隔离能力。运维工具等仍可由 SPDK 路线提供，二者可叠加使用。
 - 不修改既有 GDS 分支：`CuFileContext`、`CUFileDescPool` 保持原样，存量用户编译/行为不变。
 
-## 9. 后续工作
+## 8. 后续工作
 
-1. **合入 transport 层 NDS 分支**：将 `NdsFileContext`、`NdsDescPool` 及 `NVMeoFTransport` 中的 NDS 编译分支（第 4 章）作为独立 PR 合入社区 `mooncake-transfer-engine`；
-2. 评估是否抽取公共 `NvmeOfFileContext` 抽象基类，统一 GDS/NDS 的句柄管理接口；
-3. 评估 master 层 `ScopedNoFSegmentAccess` 与既有 `ScopedSegmentAccess` 是否抽取公共基类，统一引用计数与心跳接口；
-4. 实现 `submitNdsNofOperation` 及 `TransferSubmitter` 中的 `USE_NVMEOF_NDS` 路由分支（第 5.6 节）；
-5. 在 `NoFSegment` 中增加 `device_path` 字段，在 `store.setup()` 中新增 `nof_device_path` 列表参数（元素格式 `远端ip:设备路径:本地路径`，其中 `remote_path` 确认 segment 唯一性、`local_path` 用于本地 NDS 读写），并在 `NVMeoFTransport::install()` 中遍历该列表完成 device 验证与 SegmentDesc 的 metadata 自动注册（第 5.7 节）；
-6. 在 `setup_internal()` 中构造 `NoFSegment`（`te_endpoint = remote_path`、`device_path = local_path`）并调用 `MasterClient::MountNoFSegment()` 补全 client 侧挂载断点（当前该 RPC 接口无生产调用者），使 `store.setup()` 一次调用完成注册与挂载（第 5.7 节）；
-7. 在 `MasterService` 构造中为 `USE_NVMEOF_NDS` 绑定基于 `nds_read` 的默认 `NoFProbeFn`，替换当前默认的 SPDK 探针绑定（第 5.4 节）；
-8. 在 `NVMeoFTransport` 的 transport 层补齐 QoS 流控能力，使其达到与 SPDK 路径 `SpdkNofQos` 对等的水平。
+后续工作按 PR 粒度拆分，共 5 项：
 
-## 10. 参考文献
+1. **合入 transport 层 NDS 分支**：`NdsFileContext`、`NdsDescPool` 及 `NVMeoFTransport` 的 NDS 编译分支（第 4 章），作为独立 PR 合入社区 `mooncake-transfer-engine`；
+2. **扩展 master 层 NoF segment 管理**：多 client 共享（`client_refs`）、探针抽象（`NoFProbeFn`），并为 `USE_NVMEOF_NDS` 绑定基于 `nds_read` 的默认探针、替换 SPDK 探针（第 5.1-5.4 节）；
+3. **client 侧接入**：实现 `submitNdsNofOperation` 及 `TransferSubmitter` 的 `USE_NVMEOF_NDS` 路由分支（第 5.6 节）；在 `NoFSegment` 中增加 `device_path` 字段、`store.setup()` 新增 `nof_device_path` 列表参数（元素格式 `远端ip:设备路径:本地路径`），由 `NVMeoFTransport::install()` 遍历完成 device 验证与 SegmentDesc 注册，并在 `setup_internal()` 中调用 `MasterClient::MountNoFSegment()` 完成挂载（第 5.7 节）；
+4. **补齐 transport 层 QoS 流控**：使 `NVMeoFTransport` 达到与 SPDK 路径 `SpdkNofQos` 对等的水平；
+5. **评估公共抽象基类**：统一 GDS/NDS 句柄管理（`NvmeOfFileContext`）以及 master 层引用计数与心跳接口（`ScopedNoFSegmentAccess` 与 `ScopedSegmentAccess`）。
+
+## 9. 参考文献
 
 - [#1940 SSD pool over NVMe-oF](https://github.com/kvcache-ai/Mooncake/issues/1940)
 - [#2084 NVMe-oF SSD cache support](https://github.com/kvcache-ai/Mooncake/pull/2084)
