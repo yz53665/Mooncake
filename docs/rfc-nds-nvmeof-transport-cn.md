@@ -36,7 +36,7 @@
 1. **1:1 挂载语义与多 client 共享不匹配**。现有 `NoFSegmentManager` 假定一个 segment 由一个 client 独占使用；而一块物理 SSD 常被多个推理/训练 client 同时挂载。沿用 1:1 语义会产生重复的 segment 对象与重复的容量计数，串行化又会限制并发。**本提案扩展 `client_refs` 引用计数**，重复挂载同一 `device_name` 仅增加引用，不创建新 segment（第 5.1、5.3 节）。
 2. **心跳探针与 SPDK 驱动绑定**。既有心跳探测直接调用 `SpdkWrapper::ProbeNofSegment`；NDS 路径下不存在 `SpdkWrapper`，无法复用。**本提案将探针抽象为 `NoFProbeFn` 函数注入**，由 transport 层按路径提供探针实现（SPDK 探针 / NDS 探针，第 5.4 节）。
 
-SSD 故障的强制卸载链路（`ForceUnmountSegment` + `ClearInvalidHandles`）已在 SPDK 路线中实现：故障设备上的数据不可读，无法走"先迁移再卸载"的 Drain 路径，只能强制卸载并清理失效副本。NDS 路径直接复用该链路，不做改动（第 5.5 节）。
+SSD 故障的强制卸载链路（`ForceUnmountSegment` + `ClearInvalidHandles`）已在 SPDK 路线中实现，故障设备不可达、数据不可读，本提案直接复用该链路，不做改动（第 5.5 节）。
 
 ### 2.3 目标
 
