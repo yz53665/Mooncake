@@ -259,9 +259,16 @@ int NdsDescPool::freeNdsDesc(int idx) {
     // optimization - the handle will be immediately reused and could lead to
     // use-after-free bugs if IOs are in-flight.
     //
+    // Reset the batch context before returning to pool so the next user
+    // gets a clean handle (clears submitted params and completion state).
     // Return the handle to pool for reuse (avoid expensive
     // nds_batch_io_destroy)
-    {
+    if (nds_batch_io_reset(desc->batch_handle->handle) != 0) {
+        LOG(WARNING) << "NdsDescPool: nds_batch_io_reset failed for desc "
+                     << idx << ", destroying handle instead of reusing";
+        nds_batch_io_destroy(desc->batch_handle->handle);
+        delete desc->batch_handle;
+    } else {
         std::lock_guard<std::mutex> lock(handle_pool_lock_);
         handle_pool_.push_back(desc->batch_handle);
     }
