@@ -139,6 +139,10 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             if (event.status == NDS_BATCH_IO_COMPLETED) {
                 slice->markSuccess();
             } else if (event.status == NDS_BATCH_IO_FAILED) {
+                LOG(ERROR) << "NVMeoFTransport: NDS slice " << i
+                           << " failed, task_id=" << task_id
+                           << ", error=" << event.error
+                           << ", ret=" << event.ret;
                 slice->markFailed();
             }
         }
