@@ -274,11 +274,11 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov,
                 static_cast<char*>(current_iov->iov_base) +
                 current_iov_offset);
             nds_segment_info_t segment_info;
+            int ret = nds_get_segment_info(reinterpret_cast<void*>(hbm_buf), &segment_info);
             char eid_hex[33] = {0};
             for (int i = 0; i < 16; ++i) {
                 snprintf(eid_hex + i * 2, 3, "%02x", segment_info.eid[i]);
             }
-            int ret = nds_get_segment_info(reinterpret_cast<void*>(hbm_buf), &segment_info);
             if (ret != 0) {
                 LOG(ERROR) << "nds_get_segment_info failed, errno: " << ret;
                 LOG(ERROR) << "eid=0x" << eid_hex
