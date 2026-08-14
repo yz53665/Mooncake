@@ -14,11 +14,44 @@
 - [#1940 SSD pool over NVMe-oF](https://github.com/kvcache-ai/Mooncake/issues/1940)：提出了基于 SPDK 的 NVMe-oF SSD Pool 整体架构方案。
 - [#2084 NVMe-oF SSD cache support](https://github.com/kvcache-ai/Mooncake/pull/2084)：在 #1940 基础上实现了 store 层基础设施（`SpdkWrapper`、`NoFSegmentManager`、NoF 心跳与自动卸载、多副本清理、监控指标等），是本仓库中 SPDK NoF 路线的实际代码基础。
 
-本提案通过编译宏 `USE_NVMEOF_NDS` 一次性启用 NDS 直连路径（涵盖 master 层 NoF segment 管理与 transport 层 NDS 传输分支，详见第 2.4 节）。由于 NPU HBM 直接经 NDS 与 NVMe-oF target 间 DMA，因此无需像 SPDK 路径那样通过 `SpdkWrapper::Alloc` 分配 host 侧 DMA buffer。
+本提案通过编译宏 `USE_NVMEOF_NDS` 一次性启用 NDS 直连路径（涵盖 master 层 NoF segment 管理与 transport 层 NDS 传输分支，详见第 2.5 节）。由于 NPU HBM 直接经 NDS 与 NVMe-oF target 间 DMA，因此无需像 SPDK 路径那样通过 `SpdkWrapper::Alloc` 分配 host 侧 DMA buffer。
 
 ## 2. 背景与动机
 
-### 2.1 Transport 层：NPU 直连存储路径缺失
+### 2.1 NDS（NPU Direct Storage）简介
+
+NDS（NPU Direct Storage，CCDK/nds）是华为昇腾平台提供的 NPU 直连存储用户态库，对外暴露 `nds.h` 接口，角色与 NVIDIA GDS（GPU Direct Storage）对等：它将 NPU HBM 与 NVMe 设备之间的数据搬运直接下放到硬件 DMA 完成，避免数据经 host 内存中转，从而显著降低拷贝开销与延迟、提升带宽利用率。
+
+```mermaid
+graph LR
+    HBM[(NPU HBM)]
+    NDSL[NDS 用户态库<br/>CCDK/nds]
+    NVME[(NVMe 设备)]
+    HOST[Host 内存]
+    HBM -- 注册缓冲 --> NDSL
+    NVME -- 注册设备 --> NDSL
+    HBM <-->|直接 DMA| NVME
+    HBM -. 传统路径：经 host 中转 .-> HOST
+    HOST -.-> NVME
+```
+
+其工作原理可概括为三步：**注册**——将 HBM 缓冲与文件/块设备登记到 NDS 库；**建立通道**——按设备与对端建立可复用的数据传输通道；**传输**——以同步或异步批量方式直接发起 DMA 搬运，完成后查询传输状态。
+
+```mermaid
+flowchart TB
+    subgraph NDS["NDS 用户态库（CCDK/nds）"]
+        LIF["生命周期管理<br/>库的初始化与释放"]
+        BUF["缓冲注册与导出<br/>HBM 缓冲登记，元数据可跨进程/跨机共享"]
+        FREG["文件/块设备注册<br/>设备登记并定位底层存储"]
+        SYNC["同步读写<br/>发起一次直接 DMA"]
+        BATCH["异步批量 I/O<br/>批量提交与完成状态查询"]
+    end
+    NDS --> DATA((HBM ↔ NVMe 直接 DMA))
+```
+
+NDS 提供五大功能域：**生命周期管理**（库的初始化与释放）、**HBM 缓冲注册与导出**（将 HBM 缓冲登记为可直接访问的段，元数据可导出供跨进程/跨机共享访问）、**文件/块设备注册**（将文件或块设备登记到 NDS 并定位其底层存储位置）、**同步读写**与**异步批量 I/O**（与 GDS 的批量异步 IO 模型对等）。
+
+### 2.2 Transport 层：NPU 直连存储路径缺失
 
 当前仓库中围绕 NVMe-oF 直连存储存在两条已实现的路径，但二者都面向 NVIDIA GPU：
 
@@ -29,7 +62,7 @@
 
 与此同时，昇腾侧已提供与 GDS 角色对等的 **NDS（NPU Direct Storage）用户态库**（`nds_init / nds_buf_register / nds_file_register / nds_batch_io_submit`），能够在 NPU HBM 与 NVMe-oF target 之间直接发起 DMA，具备构建对等直连路径的底层能力。因此本提案在 transport 层引入与 GDS 平行的 NDS 分支。
 
-### 2.2 Master 层：SSD 共享与故障场景下的生命周期管理
+### 2.3 Master 层：SSD 共享与故障场景下的生命周期管理
 
 无论下层是 GDS、SPDK 还是 NDS，transport 层只负责"在给定 fd + offset 上发起一次 DMA"，并不感知这块 SSD 是谁挂载的、是否还健康、还有多少容量、其他 client 是否也在使用。这些职责由 master 层的 `NoFSegmentManager` 承担。现有 `NoFSegmentManager` 与 SSD 的实际使用方式存在两处不匹配，本提案分别给出适配：
 
@@ -38,7 +71,7 @@
 
 SSD 故障的强制卸载链路（`ForceUnmountSegment` + `ClearInvalidHandles`）已在 SPDK 路线中实现，故障设备不可达、数据不可读，本提案直接复用该链路，不做改动（第 5.5 节）。
 
-### 2.3 目标
+### 2.4 目标
 
 - **补齐 NPU 直连存储路径**：通过编译宏 `USE_NVMEOF_NDS` 一次性启用 NDS 分支——transport 层引入与 GDS 平行的 NDS 数据路径，master 层启用 NoF segment 管理。
 - **NPU HBM 与 NVMe-oF 直连**：通过 NDS 库实现 HBM ↔ NVMe-oF 的直接搬运，数据面不经过 host 内存中转。
@@ -46,7 +79,7 @@ SSD 故障的强制卸载链路（`ForceUnmountSegment` + `ClearInvalidHandles`�
 - **扩展 master 层 SSD segment 管理**：在既有 `NoFSegmentManager` 基础上补齐多 client 共享（`client_refs`）、探针注入（`NoFProbeFn`）、复用强制卸载链路，使 NDS 路径与既有 SPDK 路线共享同一套 segment 生命周期管理框架。
 - **与现有 batch 提交模型对等**：NDS 提供与 GDS `cuFileBatchIOSetUp / cuFileBatchIOSubmit / cuFileBatchIOGetStatus` 对等的 batch 异步 IO API（`nds_batch_io_setup / nds_batch_io_submit / nds_batch_io_get_status`），`NdsDescPool` 封装 NDS batch 上下文管理与 handle 复用池，与 `CUFileDescPool` 的设计模式对齐。
 
-### 2.4 与 SPDK 路线的定位差异
+### 2.5 与 SPDK 路线的定位差异
 
 本提案与 SPDK 路线（#1940 / #2084）**面向不同硬件、互不替代**。三条路径由三个独立编译宏启用：transport 层 GDS 分支由既有宏 `USE_NVMEOF` 启用（`nvmeof_transport` 的 `CuFileContext`/`CUFileDescPool`），store 层 SPDK 路径由既有宏 `USE_NOF` 启用（`SpdkWrapper` + `SpdkNofWorkerPool`），NDS 路径由本提案新增宏 `USE_NVMEOF_NDS` 启用（master 层 NoF segment 管理基础设施 + transport 层 NDS 直连数据路径），不依赖前两者。在混合集群中，GPU 节点编译 `USE_NOF` 走 SPDK 路径，NPU 节点编译 `USE_NVMEOF_NDS` 走 NDS 路径，共享同一套 master 和 segment 池。下表列出二者在定位上的差异：
 
@@ -120,7 +153,7 @@ flowchart LR
     INC_NDS --> LINK_NDS[libnds.so + CANN]
 ```
 
-transport 层 GDS 分支由既有宏 `USE_NVMEOF` 启用，NDS 分支由本提案新增宏 `USE_NVMEOF_NDS` 启用，两者相互独立（store 层 SPDK 路径由既有宏 `USE_NOF` 启用，见第 2.4 节）：
+transport 层 GDS 分支由既有宏 `USE_NVMEOF` 启用，NDS 分支由本提案新增宏 `USE_NVMEOF_NDS` 启用，两者相互独立（store 层 SPDK 路径由既有宏 `USE_NOF` 启用，见第 2.5 节）：
 
 - `USE_NVMEOF_NDS=ON`：编译 `nvmeof_transport.cpp` 的 NDS 分支 + `nds_desc_pool.cpp`，链接 `libnds.so` 与 `CANN`；同时启用 master 层 NoF segment 管理。可选 `NDS_USE_STUB=ON` 编译 `nds_stub.cpp`（无需真实 NDS 硬件即可测试）；
 - `USE_NVMEOF_NDS=OFF`（默认）：不启用 NDS 分支，transport 层 GDS 分支行为由 `USE_NVMEOF` 决定。
@@ -646,8 +679,9 @@ master 层 SSD segment 的心跳参数（探测间隔、超时、失败阈值）
 
 ## 7. 与社区路线的协同
 
-- 与 SPDK 路线互补（定位差异见第 2.4 节）：本提案在 transport 层引入 NPU 直连分支，并在 master 层扩展 NoF segment 的共享/心跳/故障隔离能力。运维工具等仍可由 SPDK 路线提供，二者可叠加使用。
+- 与 SPDK 路线互补（定位差异见第 2.5 节）：本提案在 transport 层引入 NPU 直连分支，并在 master 层扩展 NoF segment 的共享/心跳/故障隔离能力。运维工具等仍可由 SPDK 路线提供，二者可叠加使用。
 - 不修改既有 GDS 分支：`CuFileContext`、`CUFileDescPool` 保持原样，存量用户编译/行为不变。
+- 与官方 Roadmap（[#1883](https://github.com/kvcache-ai/Mooncake/issues/1883)）对齐：Roadmap 中与本提案直接相关的 NVMe-oF 提议集中在 Milestone 13（SSD Offload Support）——SPDK 路线（[#1940](https://github.com/kvcache-ai/Mooncake/issues/1940)、[#2084](https://github.com/kvcache-ai/Mooncake/pull/2084) 及其配套 [#2172](https://github.com/kvcache-ai/Mooncake/pull/2172)）与本提案互补共存，[#2176](https://github.com/kvcache-ai/Mooncake/pull/2176) 的 L2→L1 提升等 store 层策略可被 NDS 路径复用；Milestone 6 的昇腾适配条目（Ascend 910B / Atlas 800T，含 Ascend Direct protocol）为本提案 NDS 分支提供路线依据，[#1058](https://github.com/kvcache-ai/Mooncake/issues/1058) 支撑 GPU/NPU 混合集群部署（见第 2.5 节）。
 
 ## 8. 后续工作
 
@@ -661,6 +695,10 @@ master 层 SSD segment 的心跳参数（探测间隔、超时、失败阈值）
 
 ## 9. 参考文献
 
+- Mooncake 官方 Roadmap: https://github.com/kvcache-ai/Mooncake/issues/1883
 - [#1940 SSD pool over NVMe-oF](https://github.com/kvcache-ai/Mooncake/issues/1940)
 - [#2084 NVMe-oF SSD cache support](https://github.com/kvcache-ai/Mooncake/pull/2084)
+- [#2172 feat(store): add SPDK NoF worker pool](https://github.com/kvcache-ai/Mooncake/pull/2172)
+- [#2176 Store L2→L1 promotion-on-hit](https://github.com/kvcache-ai/Mooncake/pull/2176)
+- [#1058 Mooncake Transfer Engine NEXT](https://github.com/kvcache-ai/Mooncake/issues/1058)
 - NVIDIA GDS: https://docs.nvidia.com/gpudirect-storage/
