@@ -681,7 +681,7 @@ master 层 SSD segment 的心跳参数（探测间隔、超时、失败阈值）
 
 - 与 SPDK 路线的互补关系见第 1 章与第 2.5 节（定位差异），此处不再重复；在此基础上有两点协同：一是运维工具等仍可由 SPDK 路线提供，二者可叠加使用；二是 L2→L1 提升等 store 层策略对 NDS 路径透明复用（见下一条）。
 - 不修改既有 GDS 分支：`CuFileContext`、`CUFileDescPool` 保持原样，存量用户编译/行为不变。
-- 与官方 Roadmap（[#1883](https://github.com/kvcache-ai/Mooncake/issues/1883)）对齐：Roadmap 中与本提案直接相关的 NVMe-oF 提议集中在 Milestone 13（SSD Offload Support）——除第 1 章已述的 SPDK 路线（[#1940](https://github.com/kvcache-ai/Mooncake/issues/1940)、[#2084](https://github.com/kvcache-ai/Mooncake/pull/2084)）外，其配套 [#2172](https://github.com/kvcache-ai/Mooncake/pull/2172)（SPDK NoF worker 池）同属该路线，[#2176](https://github.com/kvcache-ai/Mooncake/pull/2176) 的 L2→L1 提升等 store 层策略可被 NDS 路径复用；Milestone 6 的昇腾适配条目（Ascend 910B / Atlas 800T，含 Ascend Direct protocol）为本提案 NDS 分支提供路线依据，[#1058](https://github.com/kvcache-ai/Mooncake/issues/1058) 支撑 GPU/NPU 混合集群部署（见第 2.5 节）。
+- 与官方 Roadmap（[#1883](https://github.com/kvcache-ai/Mooncake/issues/1883)）对齐：Roadmap 中与本提案直接相关的 NVMe-oF 提议集中在 Milestone 13（SSD Offload Support）——除第 1 章已述的 SPDK 路线（[#1940](https://github.com/kvcache-ai/Mooncake/issues/1940)、[#2084](https://github.com/kvcache-ai/Mooncake/pull/2084)）外，其配套 [#2172](https://github.com/kvcache-ai/Mooncake/pull/2172)（SPDK NoF worker 池）同属该路线；Milestone 6 的昇腾适配条目（Ascend 910B / Atlas 800T，含 Ascend Direct protocol）为本提案 NDS 分支提供路线依据。
 
 ## 8. 后续工作
 
