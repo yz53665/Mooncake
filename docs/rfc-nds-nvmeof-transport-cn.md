@@ -60,7 +60,7 @@ NDS 提供五大功能域：**生命周期管理**（库的初始化与释放）
 
 两条路径共同的问题在于：**昇腾 NPU 场景缺失**。GDS 依赖 `cufile.h` 与 CUDA 环境，SPDK 路线同样依赖 CUDA 环境，二者在昇腾环境下均不可用。
 
-与此同时，昇腾侧已提供与 GDS 角色对等的 **NDS（NPU Direct Storage）用户态库**（`nds_init / nds_buf_register / nds_file_register / nds_batch_io_submit`），能够在 NPU HBM 与 NVMe-oF target 之间直接发起 DMA，具备构建对等直连路径的底层能力。因此本提案在 transport 层引入与 GDS 平行的 NDS 分支。
+与此同时，昇腾侧已提供与 GDS 角色对等的 **NDS（NPU Direct Storage）用户态库**（`ndsInit / ndsBufRegister / ndsFileRegister / ndsBatchIoSubmit`），能够在 NPU HBM 与 NVMe-oF target 之间直接发起 DMA，具备构建对等直连路径的底层能力。因此本提案在 transport 层引入与 GDS 平行的 NDS 分支。
 
 ### 2.3 Master 层：SSD 共享与故障场景下的生命周期管理
 
@@ -77,7 +77,7 @@ SSD 故障的强制卸载链路（`ForceUnmountSegment` + `ClearInvalidHandles`�
 - **NPU HBM 与 NVMe-oF 直连**：通过 NDS 库实现 HBM ↔ NVMe-oF 的直接搬运，数据面不经过 host 内存中转。
 - **零侵入既有路径**：不修改 GDS 分支，不引入 SPDK 依赖，不触动 host 侧 buffer 分配逻辑。
 - **扩展 master 层 SSD segment 管理**：在既有 `NoFSegmentManager` 基础上补齐多 client 共享（`client_refs`）、探针注入（`NoFProbeFn`）、复用强制卸载链路，使 NDS 路径与既有 SPDK 路线共享同一套 segment 生命周期管理框架。
-- **与现有 batch 提交模型对等**：NDS 提供与 GDS `cuFileBatchIOSetUp / cuFileBatchIOSubmit / cuFileBatchIOGetStatus` 对等的 batch 异步 IO API（`nds_batch_io_setup / nds_batch_io_submit / nds_batch_io_get_status`），`NdsDescPool` 封装 NDS batch 上下文管理与 handle 复用池，与 `CUFileDescPool` 的设计模式对齐。
+- **与现有 batch 提交模型对等**：NDS 提供与 GDS `cuFileBatchIOSetUp / cuFileBatchIOSubmit / cuFileBatchIOGetStatus` 对等的 batch 异步 IO API（`ndsBatchIoSetup / ndsBatchIoSubmit / ndsBatchIoGetStatus`），`NdsDescPool` 封装 NDS batch 上下文管理与 handle 复用池，与 `CUFileDescPool` 的设计模式对齐。
 
 ### 2.5 与 SPDK 路线的定位差异
 
@@ -207,24 +207,22 @@ classDiagram
     }
 
     class NdsDescPool {
-        -nds_batch_handle_t handle_pool_[]
+        -NdsBatchHandle handle_pool_[]
         -NdsBatchDesc* descs_[256]
         +allocNdsDesc(batch_size) int
         +pushParams(idx, params, slice) int
         +submitBatch(idx) int
-        +getTransferStatus(idx, slice_id) nds_batch_io_events_t
+        +getTransferStatus(idx, slice_id) NdsBatchIoEvents
         +getSliceNum(idx) int
         +freeNdsDesc(idx) int
-        +getDesc(idx) NdsBatchDesc*
+        +getNdsDesc(idx) NdsBatchDesc*
     }
 
     class NdsFileContext {
-        -nds_Handle handle_
+        -NdsHandle handle_
         -int fd_
-        -int32_t device_id_
-        +NdsFileContext(filename, device_id)
-        +getHandle() nds_Handle
-        +getDeviceId() int32_t
+        +NdsFileContext(filename)
+        +getHandle() NdsHandle
     }
 
     Transport <|.. NVMeoFTransport
@@ -238,47 +236,46 @@ classDiagram
 
 ```mermaid
 classDiagram
-    class nds_file_ctx_t {
+    class NdsFileCtx {
         +int fd
         +int dummy
     }
-    class nds_Handle {
+    class NdsHandle {
         <<typedef>>
     }
-    class nds_batch_handle_t {
+    class NdsBatchHandle {
         <<typedef>>
     }
-    class nds_batch_io_params_t {
-        +nds_batch_mode_t mode
-        +nds_batch_io_param_batch_t u.batch
-        +nds_Handle nds_handle
-        +nds_batch_io_op_t opcode
+    class NdsBatchIoParams {
+        +NdsBatchMode mode
+        +NdsBatchIoParamBatch u.batch
+        +NdsHandle nds_handle
+        +NdsBatchIoOp opcode
         +void* cookie
-        +int32_t device_id
     }
-    class nds_batch_io_events_t {
+    class NdsBatchIoEvents {
         +void* cookie
-        +nds_batch_io_status_t status
+        +NdsBatchIoStatus status
         +ssize_t ret
         +int error
     }
-    class NDSAPI {
+    class NdsApi {
         <<C functions>>
-        +nds_init(device_id) int
-        +nds_deinit(device_id) void
-        +nds_buf_register(device_id, buf, len) int
-        +nds_buf_deregister(device_id, buf) int
-        +nds_file_register(fd) nds_Handle
-        +nds_file_deregister(fd) int
-        +nds_batch_io_setup(handle, max_nr) int
-        +nds_batch_io_submit(handle, nr, params, flags) int
-        +nds_batch_io_get_status(handle, min_nr, nr, events, timeout) int
-        +nds_batch_io_destroy(handle) int
+        +ndsInit() int
+        +ndsDeinit() void
+        +ndsBufRegister(buf, len) int
+        +ndsBufDeregister(buf) int
+        +ndsFileRegister(fd) NdsHandle
+        +ndsFileDeregister(fd) int
+        +ndsBatchIoSetup(handle, max_nr) int
+        +ndsBatchIoSubmit(handle, nr, params, flags) int
+        +ndsBatchIoGetStatus(handle, min_nr, nr, events, timeout) int
+        +ndsBatchIoDestroy(handle) int
     }
-    nds_file_ctx_t ..> nds_Handle
-    nds_batch_io_params_t ..> nds_Handle
-    NDSAPI ..> nds_Handle
-    NDSAPI ..> nds_batch_handle_t
+    NdsFileCtx ..> NdsHandle
+    NdsBatchIoParams ..> NdsHandle
+    NdsApi ..> NdsHandle
+    NdsApi ..> NdsBatchHandle
 ```
 
 ### 4.2 关键流程图
@@ -294,13 +291,11 @@ sequenceDiagram
 
     App->>TE: install / registerLocalMemory(addr, len)
     TE->>NVT: registerLocalMemory(addr, len, ...)
-    Note over NVT: 构造时已通过 aclrtGetDevice 获取 device_id
     alt USE_NVMEOF_NDS=ON 且未初始化
-        NVT->>NDS: nds_init(device_id)
+        NVT->>NDS: ndsInit()
         NDS-->>NVT: 0
-        NVT->>NVT: aclrtSetDevice(device_id)
     end
-    NVT->>NDS: nds_buf_register(device_id, addr, len)
+    NVT->>NDS: ndsBufRegister(addr, len)
     NDS-->>NVT: 0
     NVT-->>TE: 0
 ```
@@ -319,13 +314,13 @@ sequenceDiagram
     NVT->>NdsPool: allocNdsDesc(batch_size)
     loop 每个 TransferRequest
         NVT->>NVT: 计算 slice 与 file_offset
-        NVT->>FileCtx: 查找/创建 NdsFileContext(file_path, device_id)
-        FileCtx->>NDS: nds_file_register(fd)
-        NDS-->>FileCtx: nds_Handle
+        NVT->>FileCtx: 查找/创建 NdsFileContext(file_path)
+        FileCtx->>NDS: ndsFileRegister(fd)
+        NDS-->>FileCtx: NdsHandle
         Note over NVT,NdsPool: addSliceToNdsBatch 将 Slice* 作为 cookie<br/>NdsDescPool::pushParams 关联 params 与 slice
-        NVT->>NdsPool: pushParams(idx, nds_batch_io_params_t, slice)
+        NVT->>NdsPool: pushParams(idx, NdsBatchIoParams, slice)
     end
-    NdsPool->>NDS: nds_batch_io_submit(handle, nr, params, 0)
+    NdsPool->>NDS: ndsBatchIoSubmit(handle, nr, params, 0)
     NDS-->>NdsPool: 0 (提交成功)
     NVT-->>App: Status::OK()
 
@@ -337,7 +332,7 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     Q["getTransferStatus(batch_id, task_id)"] --> CT{"USE_NVMEOF_NDS?"}
-    CT -->|ON| NDSGET["nds_batch_io_get_status<br/>返回 nds_batch_io_events_t"]
+    CT -->|ON| NDSGET["ndsBatchIoGetStatus<br/>返回 NdsBatchIoEvents"]
     NDSGET --> UPDATE["通过 cookie (Slice指针) 更新<br/>Slice::markSuccess / markFailed"]
     UPDATE --> MAP["解析 status / ret / error"]
     MAP --> OUT["返回 status"]
@@ -354,21 +349,21 @@ flowchart TD
 
 | 阶段         | GDS API (NVIDIA)                             | NDS API (Ascend)                             | 说明                                                    |
 | ------------ | -------------------------------------------- | -------------------------------------------- | ------------------------------------------------------- |
-| 驱动初始化   | `cuFileDriverOpen()`                       | `nds_init(device_id)`                      | NDS 显式接收`device_id`，与多卡场景对齐               |
-| 驱动释放     | `cuFileDriverClose()`                      | `nds_deinit(device_id)`                    | —                                                      |
-| 设备内存注册 | `cuFileBufRegister(addr, len, flags)`      | `nds_buf_register(device_id, buf, len)`    | NDS 同样以 HBM 地址为输入                               |
-| 设备内存注销 | `cuFileBufDeregister(addr)`                | `nds_buf_deregister(device_id, buf)`       | —                                                      |
-| 文件句柄注册 | `cuFileHandleRegister(&handle, &desc)`     | `nds_file_register(fd)`                    | NDS 直接接收 fd，返回`nds_Handle`                     |
-| 文件句柄注销 | `cuFileHandleDeregister(handle)`           | `nds_file_deregister(fd)`                  | NDS 以 fd 为索引                                        |
-| 批量提交     | `cuFileBatchIOSetUp / cuFileBatchIOSubmit` | `nds_batch_io_setup / nds_batch_io_submit` | 两者均支持批量异步 IO，参数结构不同                     |
-| 批量状态查询 | `cuFileBatchIOGetStatus`                   | `nds_batch_io_get_status`                  | NDS 返回`nds_batch_io_events_t`，含 cookie/status/ret |
-| 批量销毁     | `cuFileBatchIODestroy`                     | `nds_batch_io_destroy`                     | —                                                      |
+| 驱动初始化   | `cuFileDriverOpen()`                       | `ndsInit()`                            | 内部自动管理设备上下文，与 GDS 隐式确定设备的方式一致   |
+| 驱动释放     | `cuFileDriverClose()`                      | `ndsDeinit()`                           | —                                                      |
+| 设备内存注册 | `cuFileBufRegister(addr, len, flags)`      | `ndsBufRegister(buf, len)`              | NDS 同样以 HBM 地址为输入                               |
+| 设备内存注销 | `cuFileBufDeregister(addr)`                | `ndsBufDeregister(buf)`                 | —                                                      |
+| 文件句柄注册 | `cuFileHandleRegister(&handle, &desc)`     | `ndsFileRegister(fd)`                 | NDS 直接接收 fd，返回`NdsHandle`                  |
+| 文件句柄注销 | `cuFileHandleDeregister(handle)`           | `ndsFileDeregister(fd)`               | NDS 以 fd 为索引                                        |
+| 批量提交     | `cuFileBatchIOSetUp / cuFileBatchIOSubmit` | `ndsBatchIoSetup / ndsBatchIoSubmit`| 两者均支持批量异步 IO，参数结构不同                     |
+| 批量状态查询 | `cuFileBatchIOGetStatus`                   | `ndsBatchIoGetStatus`                   | NDS 返回`NdsBatchIoEvents`，含 cookie/status/ret  |
+| 批量销毁     | `cuFileBatchIODestroy`                     | `ndsBatchIoDestroy`                     | —                                                      |
 
 #### 4.3.2 设计差异说明
 
-- **设备标识**：GDS 通过 CUDA context 隐式确定设备；NDS 在每个 API 显式传入 `device_id`，便于在多 NPU 卡场景下精确路由。
-- **批量能力**：GDS 与 NDS 均提供完整的 batch 异步 IO API（`setup / submit / get_status / destroy`）。NDS 的 batch 参数通过 `nds_batch_io_params_t` 描述（含 `mode`、`nds_handle`、`opcode`、`cookie`、`device_id`），与 GDS 的 `CUfileIOParams_t` 语义对等。
-- **句柄语义**：GDS 的 `CUfileHandle_t` 是不透明指针；NDS 的 `nds_Handle` 同样为不透明指针，但其生命周期与 fd 绑定，注销时以 fd 为索引。
+- **设备标识**：GDS 通过 CUDA context 隐式确定设备；NDS 的 `NdsFileContext` 在构造时内部自动获取并管理设备上下文，接口层不暴露设备标识，与 GDS 隐式确定设备的方式一致。
+- **批量能力**：GDS 与 NDS 均提供完整的 batch 异步 IO API（`setup / submit / get_status / destroy`）。NDS 的 batch 参数通过 `NdsBatchIoParams` 描述（含 `mode`、`nds_handle`、`opcode`、`cookie`），与 GDS 的 `CUfileIOParams_t` 语义对等。
+- **句柄语义**：GDS 的 `CUfileHandle_t` 是不透明指针；NDS 的 `NdsHandle` 同样为不透明指针，但其生命周期与 fd 绑定，注销时以 fd 为索引。
 
 ## 5. Master 层 SSD Segment 管理与 NDS 路径接入
 
@@ -593,7 +588,7 @@ struct NoFSegment {
 ```
 
 - **`remote_path`（= `te_endpoint`）**：远端标识，格式为 `"远端ip:设备路径"`（如 `"10.0.0.1:/dev/nvme0n1"`）。用于确认 segment 的唯一性，同时作为 `SegmentDesc.name` 与 `nvmeof_buffers[].file_path` 供 `TransferEngine::openSegment()` 路由定位。
-- **`local_path`（= `device_path`）**：本地 NVMe 块设备路径，用于本地 NDS 读写——`NdsFileContext` 对其 `open()` 后经 `nds_file_register()` 建立 NDS 句柄。仅挂载该段的节点本地有效。
+- **`local_path`（= `device_path`）**：本地 NVMe 块设备路径，用于本地 NDS 读写——`NdsFileContext` 对其 `open()` 后经 `ndsFileRegister()` 建立 NDS 句柄。仅挂载该段的节点本地有效。
 
 | 字段                    | NDS 路径用途                                                                                                                                                                               | SPDK 路径                                                  |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------- |
@@ -675,7 +670,7 @@ sequenceDiagram
 
 master 层 SSD segment 的心跳参数（探测间隔、超时、失败阈值）通过 `MasterServiceConfig` 注入，默认值参见第 5.4 节。
 
-状态查询在 NDS 路径下通过 `nds_batch_io_get_status` 获取 `nds_batch_io_events_t`（含 `status`、`ret`、`error`），与 GDS 路径基于 `CUfileIOEvents_t` 的查询语义保持一致（参见第 4.2.3 节）。
+状态查询在 NDS 路径下通过 `ndsBatchIoGetStatus` 获取 `NdsBatchIoEvents`（含 `status`、`ret`、`error`），与 GDS 路径基于 `CUfileIOEvents_t` 的查询语义保持一致（参见第 4.2.3 节）。
 
 ## 7. 与社区路线的协同
 
