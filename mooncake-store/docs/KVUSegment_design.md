@@ -127,11 +127,21 @@ classDiagram
         +is_kvs_replica() bool
     }
 
+    class ObjectMetadata {
+        +UUID client_id
+        +string tenant_id
+        +string user_key
+        +size_t size
+        +time_point lease_timeout
+        +vector~Replica~ replicas_
+    }
+
     KVSegmentManager *-- MountedKVSegment
     MountedKVSegment *-- KVSegment
     KVSegmentManager --> ScopedKVSegmentAccess
     Replica o-- KVReplicaData
     Replica ..> KVDescriptor : 序列化为
+    ObjectMetadata *-- Replica : replicas_
 ```
 
 ScopedKVSegmentAccess 中方法入参的 `client_id` 用于 `client_refs` 元素增删。`ForceUnmountSegment` 为心跳故障专用，绕过 `client_refs` 检查直接强制卸载。
@@ -198,7 +208,42 @@ ScopedKVSegmentAccess 中方法入参的 `client_id` 用于 `client_refs` 元素
 
 分配策略通过 `Allocate()` 方法的 `strategy` 参数控制，逻辑内聚在 `ScopedKVSegmentAccess` 中直接操作 `remaining_size`。
 
-### 2.5 Replica 扩展（replica.h）
+### 2.5 ObjectMetadata 数据结构（Master 侧）
+
+KVS 副本挂载于 Master 现有对象元数据 `ObjectMetadata` 之上（`master_service.h`）。该结构为**对象级元数据**：一个原始 key 对应一条 `ObjectMetadata`，持有该 key 的全部副本。
+
+| 字段               | 类型                        | 说明                                                     |
+| ------------------ | --------------------------- | -------------------------------------------------------- |
+| `client_id`      | `UUID`                    | 最近一次写入该对象的 client                              |
+| `put_start_time` | `time_point`               | 最近一次 `PutStart` 时间                                |
+| `size`           | `size_t`                   | 对象大小（字节）                                         |
+| `data_type`      | `ObjectDataType`           | 对象数据类型                                             |
+| `group_id`       | `string`                   | 路由组 ID（同组 key 共享租约刷新/驱逐行为）            |
+| `tenant_id`      | `string`                   | 租户命名空间                                             |
+| `user_key`       | `string`                   | 原始 key                                                 |
+| `lease_timeout`  | `time_point`               | 硬租约到期时间，Get 时刷新                              |
+| `soft_pin_timeout` | `optional<time_point>`   | 软 pin 到期时间（VIP 对象防驱逐）                      |
+| `hard_pinned`    | `bool`                     | 硬 pin：对象不可驱逐                                     |
+| `replicas_`      | `vector<Replica>`（私有） | 该 key 的**全部副本**（可横跨多个 segment）            |
+
+`Replica::data_` 的 variant 区分副本类型：`MemoryReplicaData`（`AllocatedBuffer`）、`NoFReplicaData`（`AllocatedBuffer`）、`DiskReplicaData`（`file_path + object_size`）、`LocalDiskReplicaData`（`client_id + object_size + transport_endpoint`），以及本设计新增的 `KVReplicaData`（`device_name + object_size + hash_key`）。对外下发经 `get_descriptor()` 拷贝为对应 `*Descriptor`。
+
+**层级组织**：`ObjectMetadata` 按三层索引存放于 Master，与 segment 无关：
+
+```text
+metadata_shards_[1024]               ← 第 1 层：哈希分片（kNumShards = 1024）
+  └─ tenants[tenant_id]              ← 第 2 层：租户命名空间
+       └─ metadata[user_key]         ← 第 3 层：原始 key
+            └─ replicas_[]           ← 副本，可横跨多个 segment
+```
+
+- **shard_id（哈希分片，并发维度）**：按 `(tenant_id, user_key)`（或命中 `group_id` 时按组）哈希到 1024 个分片之一（`getShardIndex`，default tenant 为 `hash(user_key) % 1024`）。纯并发工具：每分片一把 `SharedMutex`，支持并行遍历（快照、失效句柄清理），同一 key 恒定落同一分片。不是数据分区，所有分片同属一个 Master 进程。
+- **tenant_id（命名空间，隔离维度）**：逻辑命名空间，空串归一化为 `"default"`。未显式指定时所有 client 同属 `"default"`，共享同一 key 命名空间（同名 key 为同一对象）；不同 tenant 下同名 key 相互独立、互不可见。隔离仅为命名空间级，不含认证/配额。指定方式：Client 初始化时绑定（Python `setup(..., tenant_id=...)` / C++ `MasterClient(..., tenant_id)`），此后所有 RPC 自动携带。
+- **key 不按 segment 独立存放**：一个 key 的元数据全局唯一（按 tenant+key 定位），其副本可分布在多个 segment；segment 只是副本的物理落点，不构成 key 的管理边界。相应地，`hash_key` 也是对象级、全局唯一，不与 segment 绑定（见第三章）。
+
+**序列化**：快照落盘时经 `MetadataSerializer` 打包为 msgpack 数组（`[client_id, put_start_time, size, lease_timeout, soft_pin 标志, soft_pin_timeout, replicas_count, replica_1..N, data_type, hard_pinned, group_id]`），各副本格式为 `[id, status, replica_type(int8), payload]`。KVS 副本的序列化扩展点详见第八章 8.2 节。
+
+### 2.6 Replica 扩展（replica.h）
 
 | 结构体            | 字段                                           | 说明                                                                    |
 | ----------------- | ---------------------------------------------- | ----------------------------------------------------------------------- |
@@ -209,11 +254,17 @@ ScopedKVSegmentAccess 中方法入参的 `client_id` 用于 `client_refs` 元素
 
 其中 `device_name` 与 `KVSegment.device_name` 一致（含 eid 前缀，格式 `eid:设备路径`），`hash_key` 为 `uint64_t`（8 字节），由随机哈希计算得出，碰撞时重新生成。
 
-### 2.6 key 到 hash_key 的映射
+### 2.7 ReplicateConfig 扩展
 
-KVS 硬件要求 key 长度为固定 8 字节（64-bit），而 Mooncake Store 中的原始 key 最长可达 64 字节。因此需要将原始 key 映射为 8 字节的 `hash_key`。
+新增 `kvs_replica_num` 字段（默认 0），控制 KVS 副本数量。
 
-由于 64 字节空间压缩到 8 字节空间必然发生碰撞，采用**随机哈希 + 全局去重表**方案。详见第三章 Hash 冲突处理机制。
+---
+
+## 三、key 到 hash_key 的映射与 Hash 冲突处理
+
+KVS 硬件要求 key 长度为固定 8 字节（64-bit），而 Mooncake Store 中的原始 key 最长可达 64 字节。因此需要将原始 key 映射为 8 字节的 `hash_key`；由于 64 字节空间压缩到 8 字节空间必然发生碰撞，映射采用**随机哈希 + 全局去重表**方案（见 3.2 节）。
+
+`hash_key` 为**对象级标识、全局唯一**（跨 tenant、跨 segment）：同一原始 key 的所有 KVS 副本共享同一 `hash_key`，仅 `device_name` 不同；不同 key 的 `hash_key` 经全局 `global_hash_set_` 去重，不与 segment 绑定、不按 segment 独立编号。
 
 **传递链路**：
 
@@ -238,17 +289,9 @@ flowchart TD
 - **Put 路径**：Client 从 `PutStart` 返回的 `KVDescriptor` 中获取 `hash_key`，将其传入 KV 硬件驱动替代原始 key。
 - **Get 路径**：Client 用原始 key 调用 `GetReplicaList` 查询元数据，从返回的 `KVDescriptor` 中取出 `hash_key`，再用 `hash_key` 从 KV 硬件读取数据。
 
-`hash_key` 随 `KVDescriptor` 一起存入 `ObjectMetadata`，通过现有的 key→ObjectMetadata 索引自然完成映射关系，无需额外存储 key→hash_key 映射表。
+`hash_key` 随 `KVDescriptor` 一起存入 `ObjectMetadata`（见 2.5 节），通过现有的 key→ObjectMetadata 索引自然完成映射关系，无需额外存储 key→hash_key 映射表。
 
-**持久化**：`hash_key` 作为 KVS 副本字段随 `ObjectMetadata` 落盘（快照 + OpLog），需要扩展 `Serializer<Replica>` 与 `Replica::Descriptor` 两个序列化点，详见第八章 8.2 节。`global_hash_set_` 不直接持久化，恢复时从元数据全量重建，详见第八章 8.3 节。
-
-### 2.7 ReplicateConfig 扩展
-
-新增 `kvs_replica_num` 字段（默认 0），控制 KVS 副本数量。
-
----
-
-## 三、Hash 冲突处理机制
+**持久化**：`hash_key` 作为 KVS 副本字段随 `ObjectMetadata` 落盘（快照 + OpLog），需要扩展 `Serializer<Replica>` 与 `Replica::Descriptor` 两个序列化点；`global_hash_set_` 不直接持久化，恢复时从元数据全量重建。详见第八章 8.2 / 8.3 节。
 
 ### 3.1 问题背景
 
