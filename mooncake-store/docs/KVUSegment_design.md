@@ -63,6 +63,8 @@ graph TB
 | `include/client_service.h`        | 修改 | 新增客户端挂载方法                                                                              |
 | `src/client_service.cpp`          | 修改 | 实现客户端 KVS 段挂载                                                                           |
 | `include/master_metric_manager.h` | 修改 | 新增 KVS 容量与心跳指标                                                                         |
+| `include/serialize/serializer.hpp` | 修改 | `Serializer<Replica>` 新增 KVS 分支声明（快照路径持久化，见 8.2 节）                          |
+| `src/serialize/serializer.cpp`    | 修改 | 实现 `Serializer<Replica>` KVS 分支的 serialize/deserialize                                  |
 
 **不修改：** `allocator.h`、`allocator.cpp`、`allocation_strategy.h`、`allocation_strategy.cpp`
 
@@ -155,7 +157,9 @@ ScopedKVSegmentAccess 中方法入参的 `client_id` 用于 `client_refs` 元素
 
 ### 2.2 枚举扩展（types.h）
 
-`ReplicaType` 新增 `KVS = 4`，用于在分配和传输路径中区分 KVS 副本。
+`ReplicaType` 新增 `KVS`，用于在分配和传输路径中区分 KVS 副本。
+
+> ⚠️ 现有枚举为 `MEMORY=0, DISK=1, LOCAL_DISK=2, NOF_SSD=3, ALL=4`，**`KVS` 必须追加在 `ALL` 之后（取 5）**，不能插在中间或复用 4。原因：`Serializer<Replica>` 将 `replica_type` 以 `int8` 数值落盘到快照/OpLog，改变已有枚举值会破坏旧数据的向后兼容（详见 8.2 节）。
 
 `BufferAllocatorType` 不需要新增值——KVSegmentManager 不创建任何 BufferAllocator。
 
@@ -236,6 +240,8 @@ flowchart TD
 
 `hash_key` 随 `KVDescriptor` 一起存入 `ObjectMetadata`，通过现有的 key→ObjectMetadata 索引自然完成映射关系，无需额外存储 key→hash_key 映射表。
 
+**持久化**：`hash_key` 作为 KVS 副本字段随 `ObjectMetadata` 落盘（快照 + OpLog），需要扩展 `Serializer<Replica>` 与 `Replica::Descriptor` 两个序列化点，详见第八章 8.2 节。`global_hash_set_` 不直接持久化，恢复时从元数据全量重建，详见第八章 8.3 节。
+
 ### 2.7 ReplicateConfig 扩展
 
 新增 `kvs_replica_num` 字段（默认 0），控制 KVS 副本数量。
@@ -285,6 +291,8 @@ std::unordered_set<uint64_t> global_hash_set_;
 std::shared_mutex global_hash_set_mutex_;
 ```
 
+**持久化策略**：`global_hash_set_` 不直接持久化（快照/OpLog 均不包含它）。它是可从 `ObjectMetadata` 全量推导的派生数据，主节点接管时遍历所有 KVS 副本重建即可，运行期随增删操作增量维护，详见第八章 8.3 节。
+
 ### 3.4 设计要点
 
 **无需 salt：** 随机哈希直接在内部使用随机 seed 生成不同的 `hash_key`。碰撞时重新随机生成即可，seed 是临时变量，无需持久化。`hash_key` 一旦确认无冲突并存入 `ObjectMetadata`，就是该 key 的权威映射。
@@ -314,7 +322,7 @@ struct KVDescriptor {
 YLT_REFL(KVDescriptor, device_name, object_size, hash_key);
 ```
 
-`hash_key` 类型为 `uint64_t`，与 KVS 硬件的 8 字节 key 直接对应。`KVReplicaData` 同步。fv
+`hash_key` 类型为 `uint64_t`，与 KVS 硬件的 8 字节 key 直接对应。`KVReplicaData` 同步。
 
 ---
 
@@ -437,73 +445,159 @@ flowchart TD
 
 ---
 
-## 七、Client 端读写流程
+## 七、读写流程（Master 侧）
 
-### 7.1 Put 流程
+> 本设计只覆盖 **Master 的管理职责**以及 **Master→Client 的接口契约**。Client 收到 descriptor 之后如何通过 te（TransferEngine）构造具体的读写请求、如何访问 KVS 硬件，属于 Client 侧实现细节，不在本设计范围内，本章不做展开。
+
+### 7.1 Put 路径（Master 侧）
 
 ```mermaid
 sequenceDiagram
-    participant App as 应用层
     participant Client as StoreClient
     participant MS as MasterService
-    participant KVS as KVS 硬件
-
-    App->>Client: put(key, slices, config)
-    Note over Client: config.kvs_replica_num = 1
 
     Client->>MS: PutStart(key, config)
-    MS-->>Client: Replica::Descriptor[]
+    Note over Client: config.kvs_replica_num = 1
 
-    Client->>Client: 遍历 descriptors
-    alt descriptor.is_kvs_replica()
-        Client->>Client: 解析 KVDescriptor{device_name, object_size, hash_key}
-        Client->>KVS: KVTransport.put(hash_key, value, device_name)
-    else 其他类型
-        Client->>Client: 走现有 Memory/NOF/Disk 传输逻辑
-    end
+    MS->>MS: AllocateAndInsertMetadata
+    Note over MS: 生成 hash_key（随机哈希 + global_hash_set_ 去重，见第三章）
+    Note over MS: kvs_segment_manager_.Allocate() 分配 KVS 副本<br/>扣减 remaining_size
+    MS->>MS: 构造 Replica: KVReplicaData{device_name, object_size, hash_key}
+    MS-->>Client: Replica::Descriptor[]<br/>（KVS 副本为 KVDescriptor{device_name, object_size, hash_key}）
 
-    Client->>MS: PutEnd(key, ...)
+    Client->>MS: PutEnd(key, ...)（Client 完成数据写入后提交）
     MS-->>Client: OK
 ```
 
-KVTransport 以 `device_name`（含 eid 前缀）定位远端 KVS 设备：eid 用于确认目标设备，设备路径用于本地访问。
+Master 侧职责：
 
-### 7.2 Get 流程
+1. `PutStart` 中分配 KVS 副本：生成 `hash_key`、选择 OK 状态的段、构造 `KVReplicaData`
+2. `get_descriptor()` 将 `KVReplicaData` 拷贝为 `KVDescriptor` 返回 Client
+3. `PutEnd` 提交对象：将包含 KVS 副本的 `ObjectMetadata` 持久化（见第八章）
+
+### 7.2 Get 路径（Master 侧）
 
 ```mermaid
 sequenceDiagram
-    participant App as 应用层
     participant Client as StoreClient
     participant MS as MasterService
-    participant KVS as KVS 硬件
 
-    App->>Client: get(key, slices)
     Client->>MS: GetReplicaList(key)
-    MS-->>Client: Replica::Descriptor[]
-
-    Client->>Client: 遍历 descriptors
-    alt descriptor.is_kvs_replica()
-        Client->>Client: 解析 KVDescriptor{device_name, object_size, hash_key}
-        Client->>KVS: KVTransport.get(hash_key, slices, device_name)
-    else 其他类型
-        Client->>Client: 走现有 Memory/NOF/Disk 读取逻辑
-    end
+    MS->>MS: 通过原始 key 索引 ObjectMetadata
+    MS-->>Client: Replica::Descriptor[]<br/>（KVS 副本为 KVDescriptor{device_name, object_size, hash_key}）
 ```
 
-Get 流程说明：
+Master 侧职责：通过 key 索引 `ObjectMetadata`，将每个副本经 `get_descriptor()` 返回；KVS 副本的 `hash_key` 随 `KVDescriptor` 一并下发。
 
-1. Client 用**原始 key** 向 Master 查询元数据（`GetReplicaList`）
-2. Master 通过 key 索引 `ObjectMetadata`，返回所有副本描述符
-3. 对于 KVS 副本，`KVDescriptor` 中携带了 `hash_key`
-4. Client 用 `hash_key` 从 KV 硬件读取数据
+### 7.3 Master→Client 接口契约
 
-**key→hash_key 的映射无需额外存储**：Master 在 PutStart 时已将 `hash_key` 存入 `KVDescriptor`，并随 `ObjectMetadata` 一起持久化（快照 + OpLog）。Get 时通过原始 key 查元数据即可获得。
+`KVDescriptor` 是 Master 下发给 Client 的 KVS 副本唯一契约：
+
+| 字段          | 类型       | 说明                                                                 |
+| ------------- | ---------- | -------------------------------------------------------------------- |
+| `device_name` | `string` | 含 eid 前缀的远端设备标识（`eid:设备路径`），Client 据此定位 KVS 设备 |
+| `object_size` | `uint64_t` | 对象大小                                                             |
+| `hash_key`    | `uint64_t` | 8 字节 key，Client 访问 KVS 硬件时替代原始 key                        |
+
+Client 侧拿到 `KVDescriptor` 后即可独立完成 KVS 硬件读写，无需向 Master 再发起任何请求；Master 也不关心 Client 内部的数据面实现。
+
+**key→hash_key 的映射无需额外存储**：Master 在 PutStart 时已将 `hash_key` 存入 `KVDescriptor`，并随 `ObjectMetadata` 一起持久化（见第八章）。Get 时通过原始 key 查元数据即可获得，无需额外的 key→hash_key 映射表。
 
 ---
 
-## 八、Segment 卸载流程
+## 八、元数据持久化与恢复
 
-### 8.1 正常卸载（Client 主动调用）
+### 8.1 现有持久化机制
+
+Master 元数据通过 **快照（Snapshot）+ OpLog（操作日志）** 两套机制持久化，用于故障切换 / Standby 恢复：
+
+| 机制   | 内容                                                                                                                    | 存储后端             |
+| ------ | ----------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| 快照   | 全量 `ObjectMetadata`（每个副本经 `Serializer<Replica>` 序列化，msgpack 格式），携带 `snapshot_sequence_id`           | S3 / 本地文件        |
+| OpLog  | `PUT_END`（payload 为完整 `MetadataPayload{client_id, size, replicas: Replica::Descriptor[]}`）、`PUT_REVOKE`、`REMOVE` | etcd / 本地文件      |
+
+恢复流程：加载最近快照 → 将 OpLog 应用位置定位到 `snapshot_sequence_id` → 顺序重放 `sequence_id > snapshot_sequence_id` 的日志。
+
+### 8.2 KVS 副本（含 hash_key）的持久化
+
+`hash_key` 作为 KVS 副本的普通字段随 `ObjectMetadata` 一起持久化。KVS 副本的持久化覆盖两条既有序列化路径：
+
+1. **快照路径**：`Serializer<Replica>::serialize/deserialize`（`serialize/serializer.cpp`）新增 KVS 分支。副本序列化格式为 `[id, status, replica_type(int8), payload]`，KVS 分支的 payload 格式为 `[device_name, object_size, hash_key]`。
+2. **OpLog / RPC 路径**：`Replica::Descriptor` 的 `descriptor_variant` 新增 `KVDescriptor` 分支（`YLT_REFL` 反射自动序列化）。`MetadataPayload`（OpLog 持久化）与 `PutStart`/`GetReplicaList` 返回值共用该结构。
+
+实现约束：现有 `Serializer<Replica>` 仅实现了 `MEMORY` / `DISK` / `LOCAL_DISK` 三个分支，未覆盖的副本类型（`NOF_SSD`、新增的 `KVS`）会落入 default 分支——序列化时 pack 255 + nil，反序列化时直接失败。KVS 分支必须显式实现，否则快照/OpLog 恢复将丢失或拒绝 KVS 副本。
+
+### 8.3 global_hash_set_ 的持久化策略
+
+`global_hash_set_` 不随快照/OpLog 持久化。它是当前所有活跃 KVS 副本 hash_key 的集合，可从 `ObjectMetadata` 全量推导（遍历所有对象的 KVS 副本即可重建），属于派生数据。若将其直接写入持久化存储，会形成"集合"与"元数据"两个独立真相源：两处写入、崩溃窗口不一致，恢复后无法判定一致性。
+
+持久化策略为**恢复时全量重建 + 运行期增量维护**：
+
+1. **全量重建**：主节点接管（快照加载 + OpLog 重放完成）后，遍历所有 `ObjectMetadata`，将每个 KVS 副本的 `hash_key` 插入 `global_hash_set_`，复杂度 O(N)。
+2. **运行期增量维护**（与既有增删操作挂钩，不引入新的持久化写入）：
+   - `PutStart` 分配新 `hash_key` → 插入集合
+   - 对象删除 / 驱逐（KVS 副本 delete）→ 移除对应 `hash_key`
+   - `PUT_REVOKE`（PutStart 后未 PutEnd 即撤销）→ 移除
+   - 心跳故障 `ForceUnmountSegment` 清理 KVS 副本 → 移除
+3. **恢复后的副本有效性校验**：KVS 副本反序列化后校验 `device_name` 对应段仍处于挂载状态（`status == OK`）；已卸载段的副本视为无效并清理（与现有 `has_invalid_mem_handle` 校验一致），避免 `GetReplicaList` 返回失效设备的 descriptor。
+
+### 8.4 崩溃时序的边界情况
+
+`PutStart` 分配 `hash_key`（插入 `global_hash_set_` 并构造临时 `ObjectMetadata`）之后、`PutEnd` 提交之前主节点崩溃的场景：
+
+- 该 `hash_key` 对应的对象从未提交，快照/OpLog 中不存在；恢复后集合中自然缺失该 `hash_key`，可被后续新 key 复用
+- 若 Client 已将数据写入 KVS 硬件，则残留无元数据索引的孤儿数据，不可见、不会被 Get 命中
+
+该行为与现有 memory/NOF 副本在 `PutEnd` 前崩溃的语义一致；孤儿 hash_key 被复用导致的碰撞概率为 N/2^64（见 3.5 节），可忽略。
+
+### 8.5 快照与 OpLog 的启用与触发
+
+快照与 OpLog 均为 Master 现有能力，KVS 元数据（含 hash_key）随 `ObjectMetadata` 一起由两者承载，无需新增开关。两者相互独立、均可选配。
+
+**快照（Snapshot）**
+
+通过 Master 启动参数启用：
+
+| 参数                                  | 默认值 | 说明                                                           |
+| ------------------------------------- | ------ | -------------------------------------------------------------- |
+| `--enable_snapshot`                   | false  | 周期快照总开关                                                 |
+| `--snapshot_object_store_type`        | ""     | 快照对象存储：`local`（本地文件）或 `s3`；启用快照/恢复时必填 |
+| `--snapshot_catalog_store_type`       | ""     | 快照目录存储：`embedded` 或 `redis`（空则用 embedded）       |
+| `--snapshot_catalog_store_connstring` | ""     | redis 连接串                                              |
+| `--snapshot_interval_seconds`         | 600    | 周期快照间隔（秒）                                             |
+| `--snapshot_retention_count`          | 2      | 保留最近 N 份快照（必须 > 0）                                  |
+| `--enable_snapshot_restore`           | false  | 启动时从最新快照恢复                                           |
+
+触发机制：
+
+1. **周期生成**：Master 启动时若 `enable_snapshot` 且内存分配器为 OFFSET 类型，启动 `SnapshotThreadFunc` 后台线程；每 `snapshot_interval_seconds` 秒醒来一次，fork 子进程调用 `PersistState()`，将全量状态（各 shard 的 `ObjectMetadata`、segment 信息、discarded replicas）序列化写入快照对象存储，随后按 `snapshot_retention_count` 清理过期快照。
+2. **启动恢复**：`enable_snapshot_restore` 时，MasterService 构造阶段调用 `RestoreState()` 加载最新快照，重建各 shard 的 `ObjectMetadata`。
+
+限制：周期快照线程仅在 OFFSET 内存分配器配置下启动；使用其他分配器（如 CACHELIB）时周期生成不生效，但启动恢复不受此限制。
+
+**OpLog（HA 热备）**
+
+通过 Master 启动参数启用：
+
+| 参数                     | 默认值 | 说明                                                         |
+| ------------------------ | ------ | ------------------------------------------------------------ |
+| `--enable_ha`            | false  | HA 总开关，开启后走 `MasterServiceSupervisor` 监督流程     |
+| `--ha_backend_type`      | etcd   | OpLog 后端：`etcd` 或本地文件系统                          |
+| `--ha_backend_connstring` | ""    | etcd endpoints 或本地目录路径                              |
+
+触发机制：
+
+1. **主节点写入**：`PUT_END` / `PUT_REVOKE` / `REMOVE` 等对象变更经 `OpLogManager` 追加到 OpLog（`PUT_END` 携带完整 `MetadataPayload`，`REMOVE`/`PUT_REVOKE` 仅记录 key）。
+2. **Standby 跟随**：Standby 启动时先加载快照基线（若 `enable_snapshot_restore`），将 `OpLogApplier` 定位到 `snapshot_sequence_id`，再由 `OpLogReplicator` 通过后端通知（etcd watch / 轮询）持续拉取并应用后续日志，保持与主节点一致。
+3. **提升**：Standby 被提升（`PromoteStandby`）后成为新主节点，恢复自主服务并继续写 OpLog。
+
+**对 KVS 的意义**：KVS 副本（含 hash_key）随上述机制自动持久化；新主节点接管后需执行 8.3 节的全量重建，并按 8.3 第 3 点校验 KVS 副本对应段的存活状态。
+
+---
+
+## 九、Segment 卸载流程
+
+### 9.1 正常卸载（Client 主动调用）
 
 ```mermaid
 sequenceDiagram
@@ -536,7 +630,7 @@ sequenceDiagram
     MS-->>Client: OK
 ```
 
-### 8.2 强制卸载（心跳故障触发）
+### 9.2 强制卸载（心跳故障触发）
 
 心跳连续失败超阈值后，设备已不可达，无法读取数据迁移，直接强制卸载：
 
@@ -561,7 +655,7 @@ flowchart TD
 
 **为何不 Drain？** Drain 机制的前提是源段仍可读（DRAINING = 可读不可写）。KVS 硬件故障后设备不可达，读操作直接失败，数据无法迁移。强制卸载是硬件故障场景下的唯一正确选择。
 
-### 8.3 卸载对 Client 的影响
+### 9.3 卸载对 Client 的影响
 
 | 影响项                | 正常卸载             | 强制卸载                            |
 | --------------------- | -------------------- | ----------------------------------- |
@@ -575,12 +669,12 @@ flowchart TD
 Client **不需要**感知 KVSegment 的卸载。原因：
 
 1. Client 每次操作都向 Master 请求 descriptor，Master 返回什么就用什么
-2. Client 的 KVTransport 只认 `device_name`（含 eid 前缀），死设备的 descriptor 会被 `ClearInvalidHandles` 清理掉
+2. Client 侧 KV 访问路径只认 `device_name`（含 eid 前缀），死设备的 descriptor 会被 `ClearInvalidHandles` 清理掉
 3. 与内存段不同，Client 不需要为 KVSegment 做 `registerLocalMemory`，无本地映射需清理
 
 ---
 
-## 九、Client 过期清理流程
+## 十、Client 过期清理流程
 
 ```mermaid
 flowchart TD
@@ -613,7 +707,7 @@ KVS 段清理的关键差异：**不是直接销毁过期 client 的所有段，
 
 ---
 
-## 十、生命周期状态机
+## 十一、生命周期状态机
 
 ```mermaid
 stateDiagram-v2
@@ -674,15 +768,15 @@ stateDiagram-v2
 
 ---
 
-## 十一、心跳与健康检查机制
+## 十二、心跳与健康检查机制
 
-### 11.1 设计思路
+### 12.1 设计思路
 
 KVSegment 对应物理 KVS 设备，设备故障会导致所有读写操作失败。需要后台心跳线程定期探测设备健康状态，故障后快速隔离异常段，使新写入自动流向健康段。
 
 设计参考现有 `NofHeartbeatThreadFunc` 模式：后台线程 + 探测函数注入 + 连续失败计数 + 阈值触发强制卸载。
 
-### 11.2 配置项（types.h）
+### 12.2 配置项（types.h）
 
 ```cpp
 static constexpr int64_t DEFAULT_KVS_HEARTBEAT_INTERVAL_SEC = 10;
@@ -692,7 +786,7 @@ static constexpr uint32_t DEFAULT_KVS_HEARTBEAT_FAILURES_THRESHOLD = 3;
 
 通过 `MasterServiceConfig`（`master_config.h`）注入，支持运行时配置。
 
-### 11.3 数据结构（master_service.h）
+### 12.3 数据结构（master_service.h）
 
 ```mermaid
 classDiagram
@@ -726,7 +820,7 @@ classDiagram
 
 `KVSProbeFn` 为探针函数类型，签名为 `bool(const string& device_name, uint32_t timeout_ms, string* error_reason)`，其中 `device_name` 为含 eid 前缀的设备标识（格式 `eid:设备路径`）。`kvs_heartbeat_states_` 以 `device_name` 为 key，`kvs_heartbeat_mutex_` 保护其访问，`kvs_probe_fn_mutex_` 保护 `kvs_probe_fn_` 的读写。
 
-### 11.4 心跳线程主循环
+### 12.4 心跳线程主循环
 
 ```mermaid
 flowchart TD
@@ -750,7 +844,7 @@ flowchart TD
 
 其中 `alive_timeout = interval * threshold`（默认 10s × 3 = 30s）。
 
-### 11.5 探针函数
+### 12.5 探针函数
 
 ```mermaid
 sequenceDiagram
@@ -775,9 +869,9 @@ sequenceDiagram
     end
 ```
 
-探针函数通过 `KVSProbeFn` 注入，Master 不依赖具体驱动实现。超时控制由 `kvs_heartbeat_probe_timeout_ms_` 保证，探针实现由 KVTransport 层提供。
+探针函数通过 `KVSProbeFn` 注入，Master 不依赖具体驱动实现。超时控制由 `kvs_heartbeat_probe_timeout_ms_` 保证，探针实现由 KV 传输层提供。
 
-### 11.6 故障处理
+### 12.6 故障处理
 
 ```mermaid
 flowchart TD
@@ -807,7 +901,7 @@ flowchart TD
 - 有冗余的对象自动降级（清理失效副本，保留健康副本）
 - 无冗余的对象返回 `OBJECT_NOT_FOUND`
 
-### 11.7 故障后的自动恢复
+### 12.7 故障后的自动恢复
 
 Client **不需要**显式处理 KVSegment 故障，通过现有机制自然切换：
 
@@ -831,7 +925,7 @@ flowchart TD
     end
 
     subgraph 场景3_在途读操作
-        C1["Client 已拿到指向故障段的 descriptor"] --> C2["KVTransport.get() 硬件报错"]
+        C1["Client 已拿到指向故障段的 descriptor"] --> C2["Client 读操作在 KVS 硬件层报错"]
         C2 --> C3["Client 收到传输错误"]
         C3 --> C4["重试 GetReplicaList 获取新副本"]
     end
@@ -839,9 +933,9 @@ flowchart TD
 
 ---
 
-## 十二、KVS 驱逐机制
+## 十三、KVS 驱逐机制
 
-### 12.1 与普通 Segment 驱逐的差异
+### 13.1 与普通 Segment 驱逐的差异
 
 RAM / NOF / Disk 等普通 Segment 的空间管理基于**地址分配器（BufferAllocator）**，驱逐时通过**覆盖写**释放空间：将新数据写入被驱逐对象占用的地址，原有数据被直接覆写。
 
@@ -867,7 +961,7 @@ flowchart TD
     end
 ```
 
-### 12.2 驱逐触发条件
+### 13.2 驱逐触发条件
 
 KVSegment 的驱逐触发条件与普通 Segment 一致，复用现有驱逐框架：
 
@@ -891,7 +985,7 @@ if (results.size() < kvs_replica_num) {
 }
 ```
 
-### 12.3 驱逐执行流程
+### 13.3 驱逐执行流程
 
 驱逐在专用的 KVS 驱逐线程中执行，与现有 `EvictionThreadFunc` 并行但独立：
 
@@ -925,7 +1019,7 @@ sequenceDiagram
     ET->>ET: need_kvs_eviction_ = false
 ```
 
-### 12.4 驱逐对象选择策略
+### 13.4 驱逐对象选择策略
 
 与普通 Segment 驱逐一致，按 **租约到期时间（lease_timeout）升序**选择驱逐对象——租约最早到期的对象优先驱逐。
 
@@ -935,7 +1029,7 @@ sequenceDiagram
 2. 按 `lease_timeout` 排序，选择租约最早到期的一批
 3. 对于每个选中的对象，驱逐其 KVS 副本而非整个对象（其他类型副本保留）
 
-### 12.5 RPC 与接口扩展
+### 13.5 RPC 与接口扩展
 
 为支持 KVS 驱逐，需新增以下 RPC 和接口：
 
@@ -960,7 +1054,7 @@ struct EvictKVSObjectResponse {
 YLT_REFL(EvictKVSObjectResponse, error_code);
 ```
 
-### 12.6 Master 侧新增数据结构
+### 13.6 Master 侧新增数据结构
 
 ```cpp
 // master_service.h
@@ -975,7 +1069,7 @@ std::atomic<bool> kvs_eviction_running_{false};
 - 驱逐频率和节奏可能不同（KVS 硬件 delete 延迟可能较高）
 - 故障隔离：TE 侧 NDS 故障不影响 RAM/NOF 驱逐
 
-### 12.7 驱逐失败处理
+### 13.7 驱逐失败处理
 
 | 失败场景                          | 处理策略                                                                    |
 | --------------------------------- | --------------------------------------------------------------------------- |
@@ -985,7 +1079,7 @@ std::atomic<bool> kvs_eviction_running_{false};
 
 驱逐失败不会阻塞系统——`need_kvs_eviction_` 保持为 true，下一轮驱逐继续尝试。若连续失败超过阈值，触发告警。
 
-### 12.8 Metrics 扩展
+### 13.8 Metrics 扩展
 
 | 指标                                    | 触发时机                            |
 | --------------------------------------- | ----------------------------------- |
@@ -994,7 +1088,7 @@ std::atomic<bool> kvs_eviction_running_{false};
 | `inc_kvs_eviction_objects_total()`    | 驱逐的 KVS 对象总数                 |
 | `observe_kvs_eviction_latency_ms(ms)` | KVS 驱逐延迟直方图                  |
 
-### 12.9 设计决策
+### 13.9 设计决策
 
 | 决策                                       | 理由                                                                                             |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------ |
@@ -1006,7 +1100,7 @@ std::atomic<bool> kvs_eviction_running_{false};
 
 ---
 
-## 十三、RPC 消息定义
+## 十四、RPC 消息定义
 
 | RPC                  | Request                                   | Response               |
 | -------------------- | ----------------------------------------- | ---------------------- |
@@ -1018,7 +1112,7 @@ std::atomic<bool> kvs_eviction_running_{false};
 
 ---
 
-## 十四、Metrics 扩展
+## 十五、Metrics 扩展
 
 | 指标                                                | 触发时机                                       |
 | --------------------------------------------------- | ---------------------------------------------- |
@@ -1036,7 +1130,7 @@ std::atomic<bool> kvs_eviction_running_{false};
 
 ---
 
-## 十五、关键设计决策
+## 十六、关键设计决策
 
 | 决策                                                                  | 理由                                                                                                                    |
 | --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
@@ -1058,12 +1152,14 @@ std::atomic<bool> kvs_eviction_running_{false};
 | **Client 不感知 KVSegment 卸载**                                | Client 每次操作向 Master 请求 descriptor，死设备的 descriptor 会被`ClearInvalidHandles` 清理。无需额外通知机制        |
 | **Master 决策驱逐 + TE 执行 NDS delete**                        | KVS 无地址概念，无法覆盖写驱逐。Master 持有元数据决策驱逐对象，将 hash_key 透传到 TE，TE 调用 NDS delete 语义物理删除   |
 | **独立 KVS 驱逐线程**                                           | KVS 驱逐走 NDS delete 而非 BufferAllocator，IO 路径和故障模式不同，独立线程避免相互拖累                                 |
+| **hash_key 随 ObjectMetadata 持久化**                           | KVS 副本（含 hash_key）经 `Serializer<Replica>`（快照）与 `Replica::Descriptor`（OpLog/RPC）两个序列化点落盘，恢复后映射完整 |
+| **global_hash_set_ 不持久化，恢复时全量重建**                   | 集合是 ObjectMetadata 的派生数据，直接持久化会产生双真相源；主节点接管后遍历全部 KVS 副本重建，运行期增量维护          |
 
 ---
 
-## 十六、ScopedKVSegmentAccess 接口定义
+## 十七、ScopedKVSegmentAccess 接口定义
 
-### 16.1 方法总览
+### 17.1 方法总览
 
 | 方法                      | 与`ScopedSegmentAccess` 的差异                                                                                                      |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1079,7 +1175,7 @@ std::atomic<bool> kvs_eviction_running_{false};
 | `QuerySegments`         | 实现不同：通过`remaining_size` 计算，而非 `allocator_manager_`                                                                    |
 | `GetRefCount`           | **新增**，查询 `client_refs` 大小                                                                                             |
 
-### 16.2 方法详细说明
+### 17.2 方法详细说明
 
 #### `MountSegment`
 
