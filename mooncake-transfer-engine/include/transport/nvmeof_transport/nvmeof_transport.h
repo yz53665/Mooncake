@@ -161,7 +161,7 @@ class NVMeoFTransport : public Transport {
     std::condition_variable nds_queue_cv_;
     std::atomic<bool> nds_running_{false};
     size_t nds_thread_pool_size_ = kDefaultNdsThreadPoolSize;
-    static constexpr size_t kDefaultNdsThreadPoolSize = 4;
+    static constexpr size_t kDefaultNdsThreadPoolSize = 8;
 #endif
 };
 }  // namespace mooncake
