@@ -68,6 +68,28 @@ typedef enum {
 } nds_batch_io_status_t;
 
 /**
+ * @brief Batch I/O library errors reported through nds_batch_io_events_t.error.
+ *
+ * Values at or below -4096 are NDS user-space processing stages. Values in
+ * the Linux errno range (-1 through -4095) are returned unchanged by system
+ * calls and io_uring CQEs.
+ */
+typedef enum {
+    NDS_BATCH_ERROR_INVALID_PARAM = -4096,
+    NDS_BATCH_ERROR_RESOLVE_TARGET = -4097,
+    NDS_BATCH_ERROR_BUILD_IO = -4098,
+    NDS_BATCH_ERROR_RESOLVE_NAMESPACE = -4099,
+    NDS_BATCH_ERROR_OPEN_NAMESPACE = -4100, /* legacy, no longer emitted */
+    NDS_BATCH_ERROR_NAMESPACE_MISMATCH = -4101, /* legacy, no longer emitted */
+    NDS_BATCH_ERROR_ALLOC = -4102,
+    NDS_BATCH_ERROR_ACQUIRE_LINK = -4103,
+    NDS_BATCH_ERROR_QUEUE = -4104,
+    NDS_BATCH_ERROR_PREPARE_SQE = -4105,
+    NDS_BATCH_ERROR_INTERNAL = -4106,
+    NDS_BATCH_ERROR_URING_FD_NOT_REGISTERED = -4107,
+} nds_batch_error_t;
+
+/**
  * @brief Submit parameter for one batch async I/O entry.
  */
 typedef struct {
@@ -87,8 +109,21 @@ typedef struct {
     void *cookie;
     nds_batch_io_status_t status;
     ssize_t ret;
-    int error;
+    int error; /* 0, -errno, nds_batch_error_t, or command result */
 } nds_batch_io_events_t;
+
+/**
+ * @brief Configuration for a batch async I/O context.
+ *
+ * queue_depth limits the number of internal NVMe commands in flight on this
+ * handle's io_uring. One public I/O entry may expand to more than one internal
+ * command.
+ */
+typedef struct {
+    unsigned max_io_count;
+    unsigned queue_depth;
+    unsigned flags;
+} nds_batch_io_config_t;
 
 /**
  * @brief Initialize NDS user-space library
@@ -162,9 +197,22 @@ int nds_get_segment_info(void *buf, nds_segment_infos_t *out);
 nds_Handle nds_file_register(int fd);
 
 /**
+ * @brief Register a caller-owned NVMe generic namespace fd for batch io_uring.
+ * @param nds_handle NDS file handle returned by nds_file_register.
+ * @param uring_fd Open fd for the matching /dev/ngXnY device.
+ * @return 0 on success, -1 on failure.
+ * @note NDS does not dup or close uring_fd. The caller must keep it open until
+ * all batch I/O using nds_handle has completed and must close it afterwards.
+ * Registering the same fd repeatedly is allowed; replacing it is not.
+ */
+int nds_file_register_uring_fd(nds_Handle nds_handle, int uring_fd);
+
+/**
  * @brief 取消文件注册，并释放文件fd对应NDS句柄nds_handle资源
  * @param fd 文件fd
  * @return 0 on success, -1 on failure
+ * @note This function does not close the caller-owned uring fd registered on
+ * the corresponding nds_handle.
  */
 int nds_file_deregister(int fd);
 
@@ -248,9 +296,21 @@ ssize_t nds_write_imported(nds_Handle nds_handle, const nds_segment_info_t *segm
  * @brief Create a batch async I/O context.
  * @param handle Output batch handle.
  * @param max_io_count Maximum number of I/O entries supported by this batch handle.
+ * This handle's io_uring queue depth is also set to max_io_count. Use
+ * nds_batch_io_setup_ex when batch capacity and queue depth differ.
  * @return 0 on success, -1 on failure
  */
 int nds_batch_io_setup(nds_batch_handle_t *handle, unsigned max_io_count);
+
+/**
+ * @brief Create a batch async I/O context with an explicit queue depth.
+ * @param handle Output batch handle.
+ * @param config Context configuration. flags must be 0.
+ * Each submitted nds_handle must have a caller-owned NVMe generic namespace
+ * fd registered through nds_file_register_uring_fd.
+ * @return 0 on success, -1 on failure
+ */
+int nds_batch_io_setup_ex(nds_batch_handle_t *handle, const nds_batch_io_config_t *config);
 
 /**
  * @brief Submit a batch of async I/O entries.
@@ -258,17 +318,23 @@ int nds_batch_io_setup(nds_batch_handle_t *handle, unsigned max_io_count);
  * @param io_count Number of I/O entries to submit.
  * @param params I/O parameter array.
  * @param flags Reserved, must be 0 for now.
+ * A handle accepts one batch before it is reset. If this handle's queue is
+ * full, this call waits for one of its completions and continues submitting.
+ * Returning 0 means every valid internal command produced by this call was
+ * accepted by io_uring; the commands may still be in flight.
+ * @note Calls operating on the same handle must be serialized by the caller.
  * @return 0 on submit accepted, -1 on failure
  */
 int nds_batch_io_submit(nds_batch_handle_t handle, unsigned io_count,
     nds_batch_io_params_t *params, unsigned flags);
 
 /**
- * @brief Query completion events for a submitted batch.
+ * @brief Query a status snapshot for the batch submitted on this handle.
  * @param handle Batch handle returned by nds_batch_io_setup.
  * @param min_complete Reserved, must be 0 for now.
  * @param event_count Input event capacity, output number of returned events.
- * @param events Completion output array.
+ * @param events Status output array in submission order. Incomplete entries
+ * are returned with NDS_BATCH_IO_WAITING. Querying does not consume entries.
  * @param timeout Reserved, must be NULL for now.
  * @return 0 on success, -1 on failure
  */
@@ -284,6 +350,8 @@ int nds_batch_io_reset(nds_batch_handle_t handle);
 
 /**
  * @brief Destroy a batch async I/O context and release related resources.
+ * This call waits for submitted io_uring commands before releasing their
+ * payload buffers.
  * @param handle Batch handle returned by nds_batch_io_setup.
  * @return 0 on success, -1 on failure
  */
