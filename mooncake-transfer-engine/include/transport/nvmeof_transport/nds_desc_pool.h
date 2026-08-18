@@ -49,7 +49,7 @@ struct NdsBatchDesc {
 
 class NdsDescPool {
    public:
-    explicit NdsDescPool(size_t max_batch_size = 512);
+    explicit NdsDescPool(size_t max_batch_size = 256);
     ~NdsDescPool();
 
     NdsDescPool(const NdsDescPool &) = delete;
@@ -83,7 +83,7 @@ class NdsDescPool {
     NdsBatchDesc *getDesc(int idx);
 
    private:
-    static const size_t MAX_NR_DESC = 256;  // Max number of descriptors
+    static const size_t MAX_NR_DESC = 512;  // Max number of descriptors
     size_t max_batch_size_;
 
     // Object pool for NdsBatchHandle to avoid frequent
