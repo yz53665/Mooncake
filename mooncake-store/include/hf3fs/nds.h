@@ -37,6 +37,11 @@ typedef struct nds_segment_info {
     uint32_t token_id;
 } nds_segment_info_t;
 
+typedef struct nds_segment_infos {
+    nds_segment_info_t h2d_segment_info;
+    nds_segment_info_t rh2d_segment_info;
+} nds_segment_infos_t;
+
 /**
  * @brief nds read/write 输入参数
  */
@@ -110,7 +115,7 @@ int nds_buf_deregister(int32_t device_id, void *buf);
  *          the corresponding NDS device and buffer registration alive.
  * @see nds_buf_register, nds_read_imported, nds_write_imported
  */
-int nds_get_segment_info(void *buf, nds_segment_info_t *out);
+int nds_get_segment_info(void *buf, nds_segment_infos_t *out);
 
 /**
  * @brief 注册文件信息
