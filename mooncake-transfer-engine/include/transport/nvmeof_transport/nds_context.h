@@ -47,6 +47,8 @@ class NdsFileContext {
             return;
         }
         handle_ = nds_file_register(fd_);
+        uring_fd_ = open("/dev/ng2n1", O_RDWR | O_CLOEXEC);
+        nds_file_register_uring_fd(handle_, uring_fd_);
         if (!handle_) {
             LOG(ERROR) << "NdsFileContext: nds_file_register failed for "
                        << filename;
@@ -77,6 +79,7 @@ class NdsFileContext {
     nds_Handle handle_ = nullptr;
     int fd_ = -1;
     int32_t device_id_;
+    int uring_fd_ = -1;
 };
 
 }  // namespace mooncake
