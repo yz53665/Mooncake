@@ -30,6 +30,13 @@ target_link_libraries(
   allocation_strategy_bench PRIVATE mooncake_store cachelib_memory_allocator
                                     gflags::gflags glog::glog pthread)
 
+# Add hash container benchmark executable
+# Pure STL benchmark (no mooncake_store dependency): measures insert/lookup
+# throughput and memory of the used_hash_keys_ dedup set (std::unordered_set
+# vs open-addressing) and the key->hash_key map for the KVSegment design.
+add_executable(hash_container_bench hash_container_bench.cpp)
+target_link_libraries(hash_container_bench PRIVATE gflags::gflags)
+
 # Add NoF worker pool benchmark executable
 if(USE_NOF)
   add_executable(nof_worker_pool_bench nof_worker_pool_bench.cpp)

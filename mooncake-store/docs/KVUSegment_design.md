@@ -365,7 +365,42 @@ std::unordered_set<uint64_t> used_hash_keys_;
 
 在可预见的部署规模下（单段百万~十亿级，且按段分桶后 N 更小），碰撞概率远低于硬件故障率。即使碰撞，重新生成一次即可解决，开销可忽略不计。
 
-### 3.6 KVDescriptor 字段
+### 3.6 容量与性能评估
+
+**容量估算**（极端场景：单段 10 亿对象、最多 16 段）：
+
+| 容器 | 存放位置 | 极端规模 | 单容器内存 |
+| --- | --- | --- | --- |
+| `used_hash_keys_`（开放寻址，负载因子 0.5） | 每段一个 | 10 亿条/段 | ~16 GB/段 |
+| `used_hash_keys_`（`std::unordered_set`） | 每段一个 | 10 亿条/段 | ~32-50 GB/段 |
+| ObjectMetadata 索引（key → 各副本 hash_key） | 全局 1024 个 shard map | 总条数 = 全系统唯一 key 数 | 每 map = 总量 ÷ 1024 |
+
+ObjectMetadata 总量由副本因子决定：`kvs_replica_num=1` 时 160 亿条，物理分布到 1024 个 shard map，**每 map ≈ 1563 万条**（约 3-4.7 GB/分片）；`kvs_replica_num=16` 时 10 亿条，每 map ≈ 98 万条。单分片 map 规模可控；全量合计达 TB 级属于容量规划问题（分片 Master / 提高副本因子），而非单容器结构问题。
+
+**读写性能实测**（参考基准：30 GB 内存、O2、单线程、随机 uint64 key 模拟随机哈希、lookup 50% 命中；数值随机器波动，用于量级判断）：
+
+| 容器 | 容量 | insert ops/s | lookup ops/s | avg 延迟/op | max 延迟/op |
+| --- | --- | --- | --- | --- | --- |
+| 开放寻址 set | 1,000 | 24.4M | 23.8M | ~0.04 μs | 1 μs |
+| 开放寻址 set | 1M | 7.8M | 7.9M | ~0.13 μs | 170 μs |
+| 开放寻址 set | 10M | 5.9M | 5.8M | ~0.17 μs | 282 μs |
+| `std::unordered_set` | 1,000 | 13.3M | 17.2M | ~0.06-0.08 μs | 3 μs |
+| `std::unordered_set` | 1M | 4.8M | 4.0M | ~0.21-0.25 μs | 92 μs |
+| `std::unordered_set` | 10M | 3.7M | 3.2M | ~0.27-0.31 μs | 267 μs |
+| `std::unordered_map`（key 32B） | 1,000 | 8.7M | 14.9M | ~0.07-0.12 μs | 4 μs |
+| `std::unordered_map`（key 32B） | 1M | 3.2M | 3.2M | ~0.31 μs | 266 μs |
+| `std::unordered_map`（key 32B） | 10M | 2.7M | 2.5M | ~0.37-0.39 μs | 334 μs |
+
+观察与设计启示：
+
+1. 小容量（千级）全 cache 命中，吞吐最高；容量到百万级后吞吐下降 2-3 倍（超 L3 cache、链地址法指针跳转）
+2. **最大延迟随容量显著上升**（1 μs → 170-340 μs）：rehash 停顿、缺页、随机内存访问，是 10 亿级场景的主要风险，avg 延迟不足以反映
+3. 内存效率：开放寻址 ~16 B/条 ≈ `std::unordered_set` 的一半；`unordered_map`（32B key）~208 B/条
+4. 设计启示：hash_key 由随机哈希生成、分布均匀，契合开放寻址（聚类风险低）；单段 10 亿场景应选用开放寻址实现，并建议每段独立进程部署，规避 16 段合计约 256 GB 的单机内存占用
+
+> 上表由 `mooncake-store/benchmarks/hash_container_bench.cpp` 测得（`open_set` / `unordered_set` / `unordered_map` 三种容器，可按 `--num_elements` 分档复测）。
+
+### 3.7 KVDescriptor 字段
 
 ```cpp
 struct KVDescriptor {
