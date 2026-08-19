@@ -86,6 +86,7 @@ classDiagram
         +SegmentStatus status
         +size_t remaining_size
         +set~UUID~ client_refs
+        +unordered_set~uint64_t~ used_hash_keys_
     }
 
     class KVSegmentManager {
@@ -181,6 +182,7 @@ ScopedKVSegmentAccess 中方法入参的 `client_id` 用于 `client_refs` 元素
 | `status`         | `SegmentStatus`  | 复用现有状态机                           |
 | `remaining_size` | `size_t`         | 剩余容量，直接跟踪，替代 BufferAllocator |
 | `client_refs`    | `std::set<UUID>` | 当前正在使用该 segment 的 client 集合    |
+| `used_hash_keys_` | `std::unordered_set<uint64_t>` | 段内已用 hash_key 集合，分配时去重（见 3.3 节） |
 
 `client_refs` 的核心作用：
 
@@ -206,7 +208,7 @@ ScopedKVSegmentAccess 中方法入参的 `client_id` 用于 `client_refs` 元素
 - ~~`AllocatorManager`~~ — KVS 无 BufferAllocator
 - ~~`memory_allocator_`~~ — 同上
 
-分配策略通过 `Allocate()` 方法的 `strategy` 参数控制，逻辑内聚在 `ScopedKVSegmentAccess` 中直接操作 `remaining_size`。
+分配策略通过 `Allocate()` 方法的 `strategy` 参数控制，逻辑内聚在 `ScopedKVSegmentAccess` 中直接操作 `remaining_size`。段内 hash_key 去重集（`used_hash_keys_`）同样由 Manager 维护：`Allocate()` 分配 KVS 副本时生成段内唯一的 `hash_key`（见第三章），副本删除/驱逐时释放。
 
 ### 2.5 ObjectMetadata 数据结构（Master 侧）
 
@@ -239,7 +241,7 @@ metadata_shards_[1024]               ← 第 1 层：哈希分片（kNumShards =
 
 - **shard_id（哈希分片，并发维度）**：按 `(tenant_id, user_key)`（或命中 `group_id` 时按组）哈希到 1024 个分片之一（`getShardIndex`，default tenant 为 `hash(user_key) % 1024`）。纯并发工具：每分片一把 `SharedMutex`，支持并行遍历（快照、失效句柄清理），同一 key 恒定落同一分片。不是数据分区，所有分片同属一个 Master 进程。
 - **tenant_id（命名空间，隔离维度）**：逻辑命名空间，空串归一化为 `"default"`。未显式指定时所有 client 同属 `"default"`，共享同一 key 命名空间（同名 key 为同一对象）；不同 tenant 下同名 key 相互独立、互不可见。隔离仅为命名空间级，不含认证/配额。指定方式：Client 初始化时绑定（Python `setup(..., tenant_id=...)` / C++ `MasterClient(..., tenant_id)`），此后所有 RPC 自动携带。
-- **key 不按 segment 独立存放**：一个 key 的元数据全局唯一（按 tenant+key 定位），其副本可分布在多个 segment；segment 只是副本的物理落点，不构成 key 的管理边界。相应地，`hash_key` 也是对象级、全局唯一，不与 segment 绑定（见第三章）。
+- **key 不按 segment 独立存放**：一个 key 的元数据全局唯一（按 tenant+key 定位），其副本可分布在多个 segment；segment 只是副本的物理落点，不构成 key 的管理边界。`hash_key` 由各副本所在段**独立分配、段内唯一**，副本之间可以不同；ObjectMetadata 全局持有"key → 每个 KVS 副本 (device_name, hash_key)"的映射（见第三章）。
 
 **序列化**：快照落盘时经 `MetadataSerializer` 打包为 msgpack 数组（`[client_id, put_start_time, size, lease_timeout, soft_pin 标志, soft_pin_timeout, replicas_count, replica_1..N, data_type, hard_pinned, group_id]`），各副本格式为 `[id, status, replica_type(int8), payload]`。KVS 副本的序列化扩展点详见第八章 8.2 节。
 
@@ -252,7 +254,7 @@ metadata_shards_[1024]               ← 第 1 层：哈希分片（kNumShards =
 
 `Replica` 类需新增：`KVReplicaData` variant 分支、`KVDescriptor` variant 分支、对应构造函数、`is_kvs_replica()` 判断方法、`get_descriptor()` 中的 KVS 分支。
 
-其中 `device_name` 与 `KVSegment.device_name` 一致（含 eid 前缀，格式 `eid:设备路径`），`hash_key` 为 `uint64_t`（8 字节），由随机哈希计算得出，碰撞时重新生成。
+其中 `device_name` 与 `KVSegment.device_name` 一致（含 eid 前缀，格式 `eid:设备路径`），`hash_key` 为 `uint64_t`（8 字节），由随机哈希计算得出，碰撞时重新生成。`hash_key` 只在**副本所在段（设备）内唯一**：同一对象的多个 KVS 副本分布在不同段时，各自持有本段分配的 hash_key，互不要求一致。
 
 ### 2.7 ReplicateConfig 扩展
 
@@ -262,16 +264,19 @@ metadata_shards_[1024]               ← 第 1 层：哈希分片（kNumShards =
 
 ## 三、key 到 hash_key 的映射与 Hash 冲突处理
 
-KVS 硬件要求 key 长度为固定 8 字节（64-bit），而 Mooncake Store 中的原始 key 最长可达 64 字节。因此需要将原始 key 映射为 8 字节的 `hash_key`；由于 64 字节空间压缩到 8 字节空间必然发生碰撞，映射采用**随机哈希 + 全局去重表**方案（见 3.2 节）。
+KVS 硬件要求 key 长度为固定 8 字节（64-bit），而 Mooncake Store 中的原始 key 最长可达 64 字节。因此需要将原始 key 映射为 8 字节的 `hash_key`；由于 64 字节空间压缩到 8 字节空间必然发生碰撞，映射采用**随机哈希 + 段内去重集**方案（见 3.2 节）。
 
-`hash_key` 为**对象级标识、全局唯一**（跨 tenant、跨 segment）：同一原始 key 的所有 KVS 副本共享同一 `hash_key`，仅 `device_name` 不同；不同 key 的 `hash_key` 经全局 `global_hash_set_` 去重，不与 segment 绑定、不按 segment 独立编号。
+**`hash_key` 的语义：段（设备）内唯一，不是全局唯一。** KVS 硬件按 `(device_name, hash_key)` 访问数据，冲突只可能发生在**同一设备内**两个不同对象使用了相同的 `hash_key`；不同设备上的相同 `hash_key` 互不干扰（不同物理设备、不同数据）。因此去重范围只需要覆盖单个 segment，不需要跨段全局去重。
+
+- 同一对象的多个 KVS 副本分布在不同段时，各自持有**本段独立分配**的 hash_key，副本之间不要求一致
+- `key → 各副本 hash_key` 的映射由全局 `ObjectMetadata` 统一提供（2.5 节），客户端每次操作都从 `KVDescriptor` 拿到目标段的 hash_key，不依赖"同 key 同 hash_key"的假设
 
 **传递链路**：
 
 ```mermaid
 flowchart TD
     subgraph PutStart
-        A1[Master 计算 hash_key] --> A2[KVReplicaData]
+        A1[Master 按段生成 hash_key] --> A2[KVReplicaData]
         A2 --> A3[get_descriptor 拷贝]
         A3 --> A4[KVDescriptor]
         A4 --> A5[随 Descriptor 返回 Client]
@@ -286,65 +291,71 @@ flowchart TD
     A5 --> C[Client 用 hash_key 访问 KVS 硬件]
 ```
 
-- **Put 路径**：Client 从 `PutStart` 返回的 `KVDescriptor` 中获取 `hash_key`，将其传入 KV 硬件驱动替代原始 key。
-- **Get 路径**：Client 用原始 key 调用 `GetReplicaList` 查询元数据，从返回的 `KVDescriptor` 中取出 `hash_key`，再用 `hash_key` 从 KV 硬件读取数据。
+- **Put 路径**：Master 为每个 KVS 副本在其所在段内分配 `hash_key`（查该段 `used_hash_keys_` 去重）；Client 从 `PutStart` 返回的 `KVDescriptor` 中获取目标段的 `hash_key`，将其传入 KV 硬件驱动替代原始 key。
+- **Get 路径**：Client 用原始 key 调用 `GetReplicaList` 查询元数据，从返回的 `KVDescriptor` 中取出对应副本的 `hash_key`，再用 `hash_key` 从 KV 硬件读取数据。
 
-`hash_key` 随 `KVDescriptor` 一起存入 `ObjectMetadata`（见 2.5 节），通过现有的 key→ObjectMetadata 索引自然完成映射关系，无需额外存储 key→hash_key 映射表。
+`hash_key` 随 `KVDescriptor` 一起存入 `ObjectMetadata`（见 2.5 节），通过现有的 key→ObjectMetadata 索引自然完成"key → 各副本 hash_key"的定向映射，无需额外存储 key→hash_key 映射表。
 
-**持久化**：`hash_key` 作为 KVS 副本字段随 `ObjectMetadata` 落盘（快照 + OpLog），需要扩展 `Serializer<Replica>` 与 `Replica::Descriptor` 两个序列化点；`global_hash_set_` 不直接持久化，恢复时从元数据全量重建。详见第八章 8.2 / 8.3 节。
+**持久化**：`hash_key` 作为 KVS 副本字段随 `ObjectMetadata` 落盘（快照 + OpLog），需要扩展 `Serializer<Replica>` 与 `Replica::Descriptor` 两个序列化点；各段的 `used_hash_keys_` 不直接持久化，恢复时按段从元数据重建。详见第八章 8.2 / 8.3 节。
 
 ### 3.1 问题背景
 
-KVS 硬件要求 key 为固定 **8 字节（64-bit）**，而 Mooncake Store 中原始 key 最长可达 **64 字节**。从 64 字节空间映射到 8 字节空间，无论在数学上选择何种哈希算法，碰撞都**不可避免**。
+KVS 硬件要求 key 为固定 **8 字节（64-bit）**，而 Mooncake Store 中原始 key 最长可达 **64 字节**。从 64 字节空间映射到 8 字节空间，无论在数学上选择何种哈希算法，碰撞都**不可避免**。但冲突只发生在**同一设备（segment）内**：不同设备上的相同 `hash_key` 对应不同物理存储，互不影响，因此去重范围只需覆盖单个 segment。
 
 若使用确定性哈希（如 SHA-256 截断），两个不同的原始 key 可能产生相同的 `hash_key`，导致后写入的数据覆盖先写入的数据，且 Get 时无法区分——这是不可接受的。
 
-### 3.2 方案：随机哈希 + 轻量级全局去重集
+### 3.2 方案：随机哈希 + 段内去重集
 
-采用**随机哈希 + 全局 hash 集**方案：
+采用**随机哈希 + 段内 hash 集**方案：
 
 1. 对原始 key 计算随机哈希得到 `hash_key`
-2. 查全局 `unordered_set<uint64_t>` 检测是否与已有 key 冲突
-3. 若冲突，**重新随机生成** `hash_key`（不依赖外部 salt），直到无冲突
-4. **同 key 覆写**场景：先查 `ObjectMetadata`，若该 key 已有 KVS 副本，直接复用已有 `hash_key`——避免在全局集中产生不必要的冲突
+2. 查**目标段**的 `used_hash_keys_` 检测是否与段内已有 key 冲突
+3. 若冲突，**重新随机生成** `hash_key`（不依赖外部 salt），直到段内无冲突
+4. **同 key 覆写**（同 size，in-place）：先查 `ObjectMetadata`，若该 key 已有 KVS 副本且仍落在同段，直接复用该副本的 `hash_key`——避免在段内集中产生不必要的冲突；若覆写导致换段（变 size 重分配），旧副本随 `discarded_replicas_` 释放，新副本在新段重新分配 hash_key
 
 ```mermaid
 flowchart TD
     A["PutStart: 收到原始 key"] --> A1{"ObjectMetadata 中<br/>该 key 已有 KVS 副本?"}
 
-    A1 -->|是（同 key 覆写）| G["复用已有 hash_key"]
-    A1 -->|否（新 key）| B["随机生成 hash_key<br/>（如 xxhash64 + 随机 seed）"]
+    A1 -->|"是（同 size 覆写，in-place）"| G["复用该副本原 hash_key"]
+    A1 -->|"否（新 key）或变 size 覆写"| B["在目标段随机生成 hash_key<br/>（如 xxhash64 + 随机 seed）"]
 
-    B --> C{"hash_key 在全局集中?"}
-    C -->|否（无冲突）| D["将 hash_key 加入全局集"]
+    B --> C{"hash_key 在目标段<br/>used_hash_keys_ 中?"}
+    C -->|否（段内无冲突）| D["将 hash_key 加入段内集"]
     C -->|是（哈希碰撞）| B
 
-    D --> E["构造 KVReplicaData{hash_key}"]
+    D --> E["构造 KVReplicaData{device_name, hash_key}"]
     G --> E
     E --> F["PutStart 返回 KVDescriptor{hash_key}"]
 ```
 
-### 3.3 全局 hash 集
+### 3.3 段内 hash 集
 
-Master 中新增轻量级数据结构：
+每个 `MountedKVSegment` 维护自己的去重集合，代替全局集合：
 
 ```cpp
-// 全局 hash_key 集合，用于碰撞检测
-std::unordered_set<uint64_t> global_hash_set_;
-std::shared_mutex global_hash_set_mutex_;
+// MountedKVSegment 成员：段内已用 hash_key 集合，用于段内碰撞检测
+std::unordered_set<uint64_t> used_hash_keys_;
+// 由 KVSegmentManager 的 segment_mutex_（写锁）保护，无需额外锁
 ```
 
-**持久化策略**：`global_hash_set_` 不直接持久化（快照/OpLog 均不包含它）。它是可从 `ObjectMetadata` 全量推导的派生数据，主节点接管时遍历所有 KVS 副本重建即可，运行期随增删操作增量维护，详见第八章 8.3 节。
+集合按段隔离，天然分段加锁，无全局锁竞争。副本增删的维护点：
+
+- **分配**：`ScopedKVSegmentAccess::Allocate()` 为该段新副本生成段内唯一 hash_key 并插入集合
+- **释放**：对象删除 / 驱逐 / `PUT_REVOKE` / 心跳故障 `ForceUnmountSegment`（整段销毁，集合随之销毁）时移除对应 hash_key
+- **变 size 覆写**：旧副本从 `ObjectMetadata` 移除后，其 hash_key 从原段集合释放，可被后续新 key 复用
+
+**持久化策略**：各段的 `used_hash_keys_` 不直接持久化（快照/OpLog 均不包含它）。它是可从 `ObjectMetadata` 推导的派生数据——主节点接管时遍历所有 `ObjectMetadata`，按副本的 `device_name` 将 hash_key 归入对应段的集合即可；运行期随增删操作增量维护。详见第八章 8.3 节。
 
 ### 3.4 设计要点
 
-**无需 salt：** 随机哈希直接在内部使用随机 seed 生成不同的 `hash_key`。碰撞时重新随机生成即可，seed 是临时变量，无需持久化。`hash_key` 一旦确认无冲突并存入 `ObjectMetadata`，就是该 key 的权威映射。
+**无需 salt：** 随机哈希直接在内部使用随机 seed 生成不同的 `hash_key`。碰撞时重新随机生成即可，seed 是临时变量，无需持久化。`hash_key` 一旦确认段内无冲突并存入 `ObjectMetadata`，就是"该 key 在本副本所在段的权威映射"。
 
-**无需存储原始 key：** 全局集的唯一作用是回答"这个 `hash_key` 是否已被占用"。同 key 覆写由 `ObjectMetadata` 处理，不属于全局集的职责。
+**无需存储原始 key：** 段内集的唯一作用是回答"这个 `hash_key` 在该段是否已被占用"。key → 各副本 hash_key 的映射由 `ObjectMetadata` 提供，不属于段内集的职责。
 
 ### 3.5 碰撞重哈希的开销
 
-碰撞概率 = 已用 hash_key 数 / 总空间，即 N / 2^64。对于 64-bit 空间：
+碰撞概率 = 段内已用 hash_key 数 / 总空间，即 N / 2^64，其中 **N 为单个 segment（设备）内的对象数**，而非全系统对象数。对于 64-bit 空间：
 
 | 场景                | 碰撞概率         | 说明   |
 | ------------------- | ---------------- | ------ |
@@ -352,7 +363,7 @@ std::shared_mutex global_hash_set_mutex_;
 | N = 10^9（十亿级）  | ≈ 5.4×10⁻¹¹ | 可忽略 |
 | N = 10^12（万亿级） | ≈ 5.4×10⁻⁸   | 极低   |
 
-在可预见的部署规模下（百万~十亿级），碰撞概率远低于硬件故障率。即使碰撞，重新生成一次即可解决，开销可忽略不计。
+在可预见的部署规模下（单段百万~十亿级，且按段分桶后 N 更小），碰撞概率远低于硬件故障率。即使碰撞，重新生成一次即可解决，开销可忽略不计。
 
 ### 3.6 KVDescriptor 字段
 
@@ -446,7 +457,7 @@ flowchart TD
     F --> G["nof_segment_manager_ -> AllocatorManager -> AllocationStrategy -> BufferAllocator"]
 
     B --> I[分配 KVS 副本]
-    I --> H["计算 hash_key: 随机生成（xxhash64 + 随机 seed）<br/>查 global_hash_set_ 去重，碰撞则重新生成"]
+    I --> H["计算 hash_key: 在目标段随机生成（xxhash64 + 随机 seed）<br/>查该段 used_hash_keys_ 去重，碰撞则重新生成"]
     H --> J["kvs_segment_manager_.getKVSegmentAccess().Allocate()"]
 
     J --> K["遍历 mounted_segments_ 筛选 status==OK<br/>不过滤 client，所有 OK 段都是候选"]
@@ -503,7 +514,7 @@ sequenceDiagram
     Note over Client: config.kvs_replica_num = 1
 
     MS->>MS: AllocateAndInsertMetadata
-    Note over MS: 生成 hash_key（随机哈希 + global_hash_set_ 去重，见第三章）
+    Note over MS: 生成 hash_key（在目标段随机生成 + 段内 used_hash_keys_ 去重，见第三章）
     Note over MS: kvs_segment_manager_.Allocate() 分配 KVS 副本<br/>扣减 remaining_size
     MS->>MS: 构造 Replica: KVReplicaData{device_name, object_size, hash_key}
     MS-->>Client: Replica::Descriptor[]<br/>（KVS 副本为 KVDescriptor{device_name, object_size, hash_key}）
@@ -570,23 +581,23 @@ Master 元数据通过 **快照（Snapshot）+ OpLog（操作日志）** 两套�
 
 实现约束：现有 `Serializer<Replica>` 仅实现了 `MEMORY` / `DISK` / `LOCAL_DISK` 三个分支，未覆盖的副本类型（`NOF_SSD`、新增的 `KVS`）会落入 default 分支——序列化时 pack 255 + nil，反序列化时直接失败。KVS 分支必须显式实现，否则快照/OpLog 恢复将丢失或拒绝 KVS 副本。
 
-### 8.3 global_hash_set_ 的持久化策略
+### 8.3 段内 hash 集（used_hash_keys_）的持久化策略
 
-`global_hash_set_` 不随快照/OpLog 持久化。它是当前所有活跃 KVS 副本 hash_key 的集合，可从 `ObjectMetadata` 全量推导（遍历所有对象的 KVS 副本即可重建），属于派生数据。若将其直接写入持久化存储，会形成"集合"与"元数据"两个独立真相源：两处写入、崩溃窗口不一致，恢复后无法判定一致性。
+各段的 `used_hash_keys_` 不随快照/OpLog 持久化。它是"该段当前所有活跃 KVS 副本 hash_key 的集合"，可从 `ObjectMetadata` 推导（遍历所有对象的 KVS 副本，按 `device_name` 归入对应段的集合即可重建），属于派生数据。若将其直接写入持久化存储，会形成"集合"与"元数据"两个独立真相源：两处写入、崩溃窗口不一致，恢复后无法判定一致性。
 
-持久化策略为**恢复时全量重建 + 运行期增量维护**：
+持久化策略为**恢复时按段重建 + 运行期增量维护**：
 
-1. **全量重建**：主节点接管（快照加载 + OpLog 重放完成）后，遍历所有 `ObjectMetadata`，将每个 KVS 副本的 `hash_key` 插入 `global_hash_set_`，复杂度 O(N)。
+1. **按段重建**：主节点接管（快照加载 + OpLog 重放完成）后，遍历所有 `ObjectMetadata`，将每个 KVS 副本的 `hash_key` 按其 `device_name` 插入对应 `MountedKVSegment.used_hash_keys_`，复杂度 O(N)。
 2. **运行期增量维护**（与既有增删操作挂钩，不引入新的持久化写入）：
-   - `PutStart` 分配新 `hash_key` → 插入集合
-   - 对象删除 / 驱逐（KVS 副本 delete）→ 移除对应 `hash_key`
+   - `PutStart` 分配新 `hash_key` → 插入目标段集合
+   - 对象删除 / 驱逐（KVS 副本 delete）→ 从所在段集合移除
    - `PUT_REVOKE`（PutStart 后未 PutEnd 即撤销）→ 移除
-   - 心跳故障 `ForceUnmountSegment` 清理 KVS 副本 → 移除
+   - 心跳故障 `ForceUnmountSegment` 清理 KVS 副本 → 整段集合随段销毁
 3. **恢复后的副本有效性校验**：KVS 副本反序列化后校验 `device_name` 对应段仍处于挂载状态（`status == OK`）；已卸载段的副本视为无效并清理（与现有 `has_invalid_mem_handle` 校验一致），避免 `GetReplicaList` 返回失效设备的 descriptor。
 
 ### 8.4 崩溃时序的边界情况
 
-`PutStart` 分配 `hash_key`（插入 `global_hash_set_` 并构造临时 `ObjectMetadata`）之后、`PutEnd` 提交之前主节点崩溃的场景：
+`PutStart` 分配 `hash_key`（插入目标段 `used_hash_keys_` 并构造临时 `ObjectMetadata`）之后、`PutEnd` 提交之前主节点崩溃的场景：
 
 - 该 `hash_key` 对应的对象从未提交，快照/OpLog 中不存在；恢复后集合中自然缺失该 `hash_key`，可被后续新 key 复用
 - 若 Client 已将数据写入 KVS 硬件，则残留无元数据索引的孤儿数据，不可见、不会被 Get 命中
@@ -634,7 +645,7 @@ Master 元数据通过 **快照（Snapshot）+ OpLog（操作日志）** 两套�
 2. **Standby 跟随**：Standby 启动时先加载快照基线（若 `enable_snapshot_restore`），将 `OpLogApplier` 定位到 `snapshot_sequence_id`，再由 `OpLogReplicator` 通过后端通知（etcd watch / 轮询）持续拉取并应用后续日志，保持与主节点一致。
 3. **提升**：Standby 被提升（`PromoteStandby`）后成为新主节点，恢复自主服务并继续写 OpLog。
 
-**对 KVS 的意义**：KVS 副本（含 hash_key）随上述机制自动持久化；新主节点接管后需执行 8.3 节的全量重建，并按 8.3 第 3 点校验 KVS 副本对应段的存活状态。
+**对 KVS 的意义**：KVS 副本（含 hash_key）随上述机制自动持久化；新主节点接管后需执行 8.3 节的按段重建，并按 8.3 第 3 点校验 KVS 副本对应段的存活状态。
 
 ---
 
@@ -1056,7 +1067,7 @@ sequenceDiagram
         Note over MS: remaining_size += object_size
   
         ET->>MS: 从 ObjectMetadata 中移除该 KVS 副本
-        ET->>MS: 从 global_hash_set_ 中移除 hash_key
+        ET->>MS: 从所在段 used_hash_keys_ 中移除 hash_key
     end
   
     ET->>ET: need_kvs_eviction_ = false
@@ -1118,7 +1129,7 @@ std::atomic<bool> kvs_eviction_running_{false};
 | --------------------------------- | --------------------------------------------------------------------------- |
 | NDS delete 超时/失败              | 重试 N 次，仍失败则标记该 KVS 段异常，走心跳故障路径（ForceUnmountSegment） |
 | TE 不可达（Client 断开）          | 该 Client 的 KVS 段引用已在过期清理中移除，驱逐跳过该对象                   |
-| hash_key 不在 global_hash_set_ 中 | 可能已被其他驱逐线程清理，跳过                                              |
+| hash_key 不在段内 used_hash_keys_ 中 | 可能已被其他驱逐线程清理，跳过                                              |
 
 驱逐失败不会阻塞系统——`need_kvs_eviction_` 保持为 true，下一轮驱逐继续尝试。若连续失败超过阈值，触发告警。
 
@@ -1138,7 +1149,7 @@ std::atomic<bool> kvs_eviction_running_{false};
 | **Master 决策驱逐 + TE 执行 delete** | KVS 硬件无地址概念，无法覆盖写。Master 持有元数据和租约信息做驱逐决策，TE 持有硬件连接做物理删除 |
 | **hash_key 透传到 TE**               | TE 只认 hash_key，不持有原始 key。Master 将 hash_key 随驱逐指令下发，TE 原样传给 NDS             |
 | **独立 KVS 驱逐线程**                | IO 路径、延迟特征、故障模式均不同，独立线程避免相互拖累                                          |
-| **驱逐后清理 global_hash_set_**      | 释放 hash_key 给后续新 key 使用，避免 hash 空间浪费                                              |
+| **驱逐后清理所在段 used_hash_keys_** | 释放 hash_key 给该段后续新 key 使用，避免 hash 空间浪费                                        |
 | **复用 lease_timeout 排序**          | 驱逐策略与现有框架一致，减少维护复杂度                                                           |
 
 ---
@@ -1183,8 +1194,9 @@ std::atomic<bool> kvs_eviction_running_{false};
 | **KVReplicaData 直接持有 device_name + object_size + hash_key** | Master 分配时随机生成 hash_key，`get_descriptor()` 拷贝到 KVDescriptor。不需要 AllocatedBuffer 包装                   |
 | **独立 KVSegmentManager**                                       | 与 SegmentManager/NoFSegmentManager 平级，架构一致                                                                      |
 | **不修改 allocator.h / allocation_strategy.h**                  | KVS 不经过这些组件，改动范围最小                                                                                        |
-| **随机哈希 + 全局 hash 集**                                     | 64 字节→8 字节必然碰撞。随机哈希生成 hash_key，Master 维护`unordered_set<uint64_t>` 去重，碰撞则重新生成             |
-| **hash_key 存入 KVDescriptor**                                  | hash_key 持久化到 ObjectMetadata，Get 路径通过现有 key→元数据索引自然完成映射，无需额外映射表                          |
+| **随机哈希 + 段内 hash 集**                                     | 64 字节→8 字节必然碰撞，但冲突只发生在同一设备内。随机哈希生成 hash_key，每个 `MountedKVSegment` 维护 `used_hash_keys_` 段内去重，碰撞则重新生成。天然分段加锁，无全局锁竞争 |
+| **hash_key 段内唯一，副本间不要求一致**                        | KVS 硬件按 (device_name, hash_key) 访问，跨设备无冲突；key → 各副本 hash_key 的映射由 ObjectMetadata 全局提供，客户端从 KVDescriptor 定向获取                                |
+| **hash_key 存入 KVDescriptor**                                  | hash_key 持久化到 ObjectMetadata，Get 路径通过现有 key→元数据索引自然完成"key → 各副本 hash_key"定向映射，无需额外映射表 |
 | **mounted_segments_ 以 device_name 为 key**                     | `device_name` 含 eid 前缀（格式 `eid:设备路径`），是远端设备的唯一标识；`segment.id` 随机生成不具确定性，不适合做索引 |
 | **引入 client_refs 引用计数**                                   | 一个物理 SSD 设备可被多个 client 共享，使用引用计数管理生命周期                                                         |
 | **分配不过滤 client**                                           | 所有 client 共享同一组物理设备，任何 OK 状态的段都可分配                                                                |
@@ -1196,7 +1208,7 @@ std::atomic<bool> kvs_eviction_running_{false};
 | **Master 决策驱逐 + TE 执行 NDS delete**                        | KVS 无地址概念，无法覆盖写驱逐。Master 持有元数据决策驱逐对象，将 hash_key 透传到 TE，TE 调用 NDS delete 语义物理删除   |
 | **独立 KVS 驱逐线程**                                           | KVS 驱逐走 NDS delete 而非 BufferAllocator，IO 路径和故障模式不同，独立线程避免相互拖累                                 |
 | **hash_key 随 ObjectMetadata 持久化**                           | KVS 副本（含 hash_key）经 `Serializer<Replica>`（快照）与 `Replica::Descriptor`（OpLog/RPC）两个序列化点落盘，恢复后映射完整 |
-| **global_hash_set_ 不持久化，恢复时全量重建**                   | 集合是 ObjectMetadata 的派生数据，直接持久化会产生双真相源；主节点接管后遍历全部 KVS 副本重建，运行期增量维护          |
+| **段内 used_hash_keys_ 不持久化，恢复时按段重建**               | 集合是 ObjectMetadata 的派生数据，直接持久化会产生双真相源；主节点接管后遍历全部 KVS 副本按 device_name 归入对应段重建，运行期增量维护 |
 
 ---
 
