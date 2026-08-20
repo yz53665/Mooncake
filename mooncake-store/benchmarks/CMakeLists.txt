@@ -32,8 +32,9 @@ target_link_libraries(
 
 # Add hash container benchmark executable
 # Pure STL benchmark (no mooncake_store dependency): measures insert/lookup
-# throughput and memory of the used_hash_keys_ dedup set (std::unordered_set
-# vs open-addressing) and the key->hash_key map for the KVSegment design.
+# throughput and memory of the used_hash_keys_ dedup set (std::unordered_set,
+# open-addressing, and 128-bucket sharded_set) and the key->hash_key map for
+# the KVSegment design.
 add_executable(hash_container_bench hash_container_bench.cpp)
 target_link_libraries(hash_container_bench PRIVATE gflags::gflags)
 

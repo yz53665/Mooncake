@@ -1,6 +1,7 @@
 // Benchmark for the hash containers used in the KVSegment hash_key design:
 //   1. used_hash_keys_  : per-segment dedup set of uint64_t hash_key
-//      (std::unordered_set vs. open-addressing linear-probe set)
+//      (std::unordered_set vs. open-addressing linear-probe set vs.
+//       128-bucket sharded_set)
 //   2. key->hash_key map: ObjectMetadata-style index
 //      (std::unordered_map<string, uint64_t>)
 //
@@ -11,6 +12,7 @@
 //
 // Usage examples:
 //   ./hash_container_bench --container=open_set --operation=insert --num_elements=100000000
+//   ./hash_container_bench --container=sharded_set --operation=insert --num_elements=100000000
 //   ./hash_container_bench --container=unordered_map --operation=lookup --num_elements=10000000 --key_len=32
 //
 // Memory is reported from mallinfo2 (glibc) + explicit container sizing.
@@ -18,6 +20,7 @@
 #include <gflags/gflags.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -39,7 +42,7 @@ DEFINE_uint64(num_threads, 1, "Number of worker threads");
 DEFINE_string(operation, "insert",
               "insert / lookup / mixed (insert then 50% hit lookup)");
 DEFINE_string(container, "open_set",
-              "unordered_set | open_set | unordered_map");
+              "unordered_set | open_set | sharded_set | unordered_map");
 DEFINE_uint64(key_len, 32, "String key length for unordered_map mode");
 DEFINE_uint64(lookups_per_element, 1,
               "Lookup probes per element for lookup/mixed ops");
@@ -85,6 +88,37 @@ class OpenSet {
    private:
     std::vector<uint64_t> slots_;
     size_t mask_;
+};
+
+// ---------------------------------------------------------------------------
+// Sharded set: split a per-segment dedup set into 128 buckets, mirroring the
+// way ObjectMetadata is sharded. Random hash_key values are uniformly
+// distributed, so taking the low 7 bits is sufficient to pick a bucket.
+// Each bucket is a std::unordered_set; this keeps each rehash local to one
+// bucket and avoids a single huge hash table per segment.
+// ---------------------------------------------------------------------------
+class ShardedSet {
+   public:
+    static constexpr size_t kShardBits = 7;
+    static constexpr size_t kShardCount = 1 << kShardBits;
+
+    explicit ShardedSet(size_t capacity) {
+        const size_t per_shard = std::max<size_t>(1, capacity / kShardCount);
+        for (auto& shard : shards_) {
+            shard.reserve(static_cast<size_t>(per_shard * 1.2));
+        }
+    }
+
+    bool insert(uint64_t key) {
+        return shards_[key & (kShardCount - 1)].insert(key).second;
+    }
+
+    bool contains(uint64_t key) const {
+        return shards_[key & (kShardCount - 1)].count(key) > 0;
+    }
+
+   private:
+    std::array<std::unordered_set<uint64_t>, kShardCount> shards_;
 };
 
 // ---------------------------------------------------------------------------
@@ -173,7 +207,8 @@ int main(int argc, char** argv) {
     const bool is_map = (FLAGS_container == "unordered_map");
     const bool is_open = (FLAGS_container == "open_set");
     const bool is_std = (FLAGS_container == "unordered_set");
-    if (!is_map && !is_open && !is_std) {
+    const bool is_sharded = (FLAGS_container == "sharded_set");
+    if (!is_map && !is_open && !is_std && !is_sharded) {
         std::cerr << "unknown container: " << FLAGS_container << "\n";
         return 1;
     }
@@ -207,6 +242,20 @@ int main(int argc, char** argv) {
     std::vector<uint64_t> keys = GenerateKeys(n);
     std::vector<uint64_t> probe = keys;
     for (uint64_t i = n / 2; i < n; ++i) probe[i] = keys[i] ^ 0xDEADBEEFCAFEF00DULL;
+
+    if (is_sharded) {
+        ShardedSet set(n);
+        auto ins = RunTimed(n, [&](uint64_t i) { set.insert(keys[i]); });
+        auto lkp = RunTimed(n, [&](uint64_t i) {
+            volatile bool hit = set.contains(probe[i]);
+            (void)hit;
+        });
+        std::cout << "  sharded_set shards=" << ShardedSet::kShardCount << "\n";
+        ReportOps("insert", ins);
+        ReportOps("lookup(50% hit)", lkp);
+        std::cout << "  bytes/entry(approx)=" << (PeakRssBytes() / n) << "\n";
+        return 0;
+    }
 
     if (is_open) {
         OpenSet set(n);
