@@ -86,7 +86,7 @@ classDiagram
         +SegmentStatus status
         +size_t remaining_size
         +set~UUID~ client_refs
-        +unordered_set~uint64_t~ used_hash_keys_
+        +ShardedHashSet~uint64_t~ used_hash_keys_
     }
 
     class KVSegmentManager {
@@ -182,7 +182,7 @@ ScopedKVSegmentAccess 中方法入参的 `client_id` 用于 `client_refs` 元素
 | `status`          | `SegmentStatus`                | 复用现有状态机                                  |
 | `remaining_size`  | `size_t`                       | 剩余容量，直接跟踪，替代 BufferAllocator        |
 | `client_refs`     | `std::set<UUID>`               | 当前正在使用该 segment 的 client 集合           |
-| `used_hash_keys_` | `std::unordered_set<uint64_t>` | 段内已用 hash_key 集合，分配时去重（见 3.3 节） |
+| `used_hash_keys_` | `std::array<std::unordered_set<uint64_t>, 128>` | 段内已用 hash_key 集合，按 hash_key 低 7 bit 分成 128 个桶，分配时去重（见 3.3 节） |
 
 `client_refs` 的核心作用：
 
@@ -331,15 +331,23 @@ flowchart TD
 
 ### 3.3 段内 hash 集
 
-每个 `MountedKVSegment` 维护自己的去重集合，代替全局集合：
+每个 `MountedKVSegment` 维护自己的去重集合，代替全局集合。为了控制单段在亿级/十亿级 key 下的 rehash 停顿和最大延迟，参考 `ObjectMetadata` 的 map 分片思路，将段内 set 拆成 **128 个桶**：
 
 ```cpp
 // MountedKVSegment 成员：段内已用 hash_key 集合，用于段内碰撞检测
-std::unordered_set<uint64_t> used_hash_keys_;
+// 参考 ObjectMetadata 的 shard map，按 hash_key 低 7 bit 分 128 个桶。
+static constexpr size_t kUsedHashKeyShardBits = 7;   // 2^7 = 128
+static constexpr size_t kUsedHashKeyShardCount = 1 << kUsedHashKeyShardBits;
+std::array<std::unordered_set<uint64_t>, kUsedHashKeyShardCount> used_hash_keys_;
+
+// hash_key 是随机生成的 64-bit 值，分布均匀，可直接用低 7 bit 选桶。
+size_t ShardIndex(uint64_t hash_key) const {
+    return hash_key & (kUsedHashKeyShardCount - 1);
+}
 // 由 KVSegmentManager 的 segment_mutex_（写锁）保护，无需额外锁
 ```
 
-集合按段隔离，天然分段加锁，无全局锁竞争。副本增删的维护点：
+集合按段隔离，天然分段加锁，无全局锁竞争；段内再按 128 个桶分散，单次 rehash 只影响其中一个桶，降低大容量下的尾部延迟。副本增删的维护点：
 
 - **分配**：`ScopedKVSegmentAccess::Allocate()` 为该段新副本生成段内唯一 hash_key 并插入集合
 - **释放**：对象删除 / 驱逐 / `PUT_REVOKE` / 心跳故障 `ForceUnmountSegment`（整段销毁，集合随之销毁）时移除对应 hash_key
@@ -373,6 +381,7 @@ std::unordered_set<uint64_t> used_hash_keys_;
 | --------------------------------------------- | ---------------------- | -------------------------- | --------------------- |
 | `used_hash_keys_`（开放寻址，负载因子 0.5） | 每段一个               | 10 亿条/段                 | ~16 GB/段             |
 | `used_hash_keys_`（`std::unordered_set`） | 每段一个               | 10 亿条/段                 | ~32-50 GB/段          |
+| `used_hash_keys_`（128 桶 `std::unordered_set`） | 每段 128 个桶    | 10 亿条/段，每桶约 781 万条 | ≈ 单 `unordered_set` 总量 + 128 个桶的少量表头开销 |
 | ObjectMetadata 索引（key → 各副本 hash_key） | 全局 1024 个 shard map | 总条数 = 全系统唯一 key 数 | 每 map = 总量 ÷ 1024 |
 
 ObjectMetadata 总量由副本因子决定：`kvs_replica_num=1` 时 160 亿条，物理分布到 1024 个 shard map，**每 map ≈ 1563 万条**（约 3-4.7 GB/分片）；`kvs_replica_num=16` 时 10 亿条，每 map ≈ 98 万条。单分片 map 规模可控；全量合计达 TB 级属于容量规划问题（分片 Master / 提高副本因子），而非单容器结构问题。
@@ -397,8 +406,9 @@ ObjectMetadata 总量由副本因子决定：`kvs_replica_num=1` 时 160 亿条�
 2. **最大延迟随容量显著上升**（1 μs → 170-340 μs）：rehash 停顿、缺页、随机内存访问，是 10 亿级场景的主要风险，avg 延迟不足以反映
 3. 内存效率：开放寻址 ~16 B/条 ≈ `std::unordered_set` 的一半；`unordered_map`（32B key）~208 B/条
 4. 设计启示：hash_key 由随机哈希生成、分布均匀，契合开放寻址（聚类风险低）；单段 10 亿场景应选用开放寻址实现，并建议每段独立进程部署，规避 16 段合计约 256 GB 的单机内存占用
+5. 若继续使用链地址 `std::unordered_set`，建议按 128 桶分片（`sharded_set`），将 rehash 限制在单个桶内，缓解 10 亿级容量下最大延迟随表增长而显著上升的问题；分片粒度后续也可作为独立调参项
 
-> 上表由 `mooncake-store/benchmarks/hash_container_bench.cpp` 测得（`open_set` / `unordered_set` / `unordered_map` 三种容器，可按 `--num_elements` 分档复测）。
+> 上表为 `mooncake-store/benchmarks/hash_container_bench.cpp` 中 `open_set` / `unordered_set` / `unordered_map` 三种容器的实测数据；新增的 128 桶 `sharded_set` 可用 `--container=sharded_set` 单独复测后补入该表。
 
 ### 3.7 KVDescriptor 字段
 
@@ -653,9 +663,12 @@ Master 元数据通过 **快照（Snapshot）+ OpLog（操作日志）** 两套�
 | `--snapshot_object_store_type`        | ""     | 快照对象存储：`local`（本地文件）或 `s3`；启用快照/恢复时必填 |
 | `--snapshot_catalog_store_type`       | ""     | 快照目录存储：`embedded` 或 `redis`（空则用 embedded）        |
 | `--snapshot_catalog_store_connstring` | ""     | redis 连接串                                                      |
-| `--snapshot_interval_seconds`         | 600    | 周期快照间隔（秒）                                                |
-| `--snapshot_retention_count`          | 2      | 保留最近 N 份快照（必须 > 0）                                     |
+| `--snapshot_interval_seconds`         | 600    | 周期快照间隔（秒），默认 600 秒 = 10 分钟                         |
+| `--snapshot_child_timeout_seconds`    | 300    | 快照子进程超时（秒），默认 300 秒 = 5 分钟                        |
+| `--snapshot_retention_count`          | 2      | 保留最近 N 份快照（必须 > 0），默认保留 2 份                      |
 | `--enable_snapshot_restore`           | false  | 启动时从最新快照恢复                                              |
+
+因此默认配置为：**快照总开关关闭**；若开启周期快照，默认每 **600 秒（10 分钟）** 生成一次，子进程超时 **300 秒（5 分钟）**，并保留最近 **2 份**快照。
 
 触发机制：
 
@@ -1229,7 +1242,7 @@ std::atomic<bool> kvs_eviction_running_{false};
 | **KVReplicaData 直接持有 device_name + object_size + hash_key** | Master 分配时随机生成 hash_key，`get_descriptor()` 拷贝到 KVDescriptor。不需要 AllocatedBuffer 包装                                                                            |
 | **独立 KVSegmentManager**                                       | 与 SegmentManager/NoFSegmentManager 平级，架构一致                                                                                                                               |
 | **不修改 allocator.h / allocation_strategy.h**                  | KVS 不经过这些组件，改动范围最小                                                                                                                                                 |
-| **随机哈希 + 段内 hash 集**                                     | 64 字节→8 字节必然碰撞，但冲突只发生在同一设备内。随机哈希生成 hash_key，每个`MountedKVSegment` 维护 `used_hash_keys_` 段内去重，碰撞则重新生成。天然分段加锁，无全局锁竞争 |
+| **随机哈希 + 段内 hash 集（128 桶）**                           | 64 字节→8 字节必然碰撞，但冲突只发生在同一设备内。随机哈希生成 hash_key，每个`MountedKVSegment` 维护 128 桶分片的 `used_hash_keys_` 段内去重，碰撞则重新生成。天然分段加锁，无全局锁竞争；段内 128 桶降低单表 rehash 尾部延迟 |
 | **hash_key 段内唯一，副本间不要求一致**                         | KVS 硬件按 (device_name, hash_key) 访问，跨设备无冲突；key → 各副本 hash_key 的映射由 ObjectMetadata 全局提供，客户端从 KVDescriptor 定向获取                                   |
 | **hash_key 存入 KVDescriptor**                                  | hash_key 持久化到 ObjectMetadata，Get 路径通过现有 key→元数据索引自然完成"key → 各副本 hash_key"定向映射，无需额外映射表                                                       |
 | **mounted_segments_ 以 device_name 为 key**                     | `device_name` 含 eid 前缀（格式 `eid:设备路径`），是远端设备的唯一标识；`segment.id` 随机生成不具确定性，不适合做索引                                                      |
