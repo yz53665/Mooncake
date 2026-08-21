@@ -387,6 +387,10 @@ Client::~Client() {
     // Stop hot cache handler and hot cache
     hot_cache_handler_.reset();
     hot_cache_.reset();
+
+    // Dump accumulated BatchPut SubmitTransfers/WaitForTransfers duration
+    // statistics.
+    PrintTransferStageStats();
 }
 
 static std::optional<bool> get_auto_discover() {
@@ -2510,16 +2514,67 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
+    auto t1 = std::chrono::steady_clock::now();
     WaitForTransfers(ops);
-    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - t0)
+    auto t2 = std::chrono::steady_clock::now();
+    auto submit_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                         t1 - t0)
+                         .count();
+    auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                       t2 - t1)
+                       .count();
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t0)
                   .count();
+    RecordTransferStageDuration(submit_us, wait_us);
+    LOG(INFO) << "Client::BatchPut SubmitTransfers=" << submit_us
+              << " us, WaitForTransfers=" << wait_us
+              << " us, total=" << us << " us";
     if (metrics_) {
         metrics_->transfer_metric.batch_put_latency_us.observe(us);
     }
 
     FinalizeBatchPut(ops);
     return CollectResults(ops);
+}
+
+void Client::RecordTransferStageDuration(uint64_t submit_us,
+                                         uint64_t wait_us) {
+    uint64_t total_us = submit_us + wait_us;
+    transfer_stage_count_.fetch_add(1, std::memory_order_relaxed);
+    transfer_submit_total_us_.fetch_add(submit_us, std::memory_order_relaxed);
+    transfer_wait_total_us_.fetch_add(wait_us, std::memory_order_relaxed);
+    transfer_stage_total_us_.fetch_add(total_us, std::memory_order_relaxed);
+    uint64_t cur_max = transfer_stage_max_us_.load(std::memory_order_relaxed);
+    while (cur_max < total_us &&
+           !transfer_stage_max_us_.compare_exchange_weak(
+               cur_max, total_us, std::memory_order_relaxed)) {
+    }
+}
+
+void Client::PrintTransferStageStats() const {
+    uint64_t count = transfer_stage_count_.load();
+    if (count == 0) {
+        LOG(INFO) << "Client: no BatchPut SubmitTransfers/WaitForTransfers "
+                     "duration recorded";
+        return;
+    }
+    double submit_avg_us =
+        static_cast<double>(transfer_submit_total_us_.load()) /
+        static_cast<double>(count);
+    double wait_avg_us =
+        static_cast<double>(transfer_wait_total_us_.load()) /
+        static_cast<double>(count);
+    double total_avg_us =
+        static_cast<double>(transfer_stage_total_us_.load()) /
+        static_cast<double>(count);
+    LOG(INFO) << "Client BatchPut transfer stages stats: calls=" << count
+              << ", SubmitTransfers avg=" << submit_avg_us << " us ("
+              << submit_avg_us / 1000.0 << " ms), WaitForTransfers avg="
+              << wait_avg_us << " us (" << wait_avg_us / 1000.0
+              << " ms), total avg=" << total_avg_us << " us ("
+              << total_avg_us / 1000.0 << " ms), total max="
+              << transfer_stage_max_us_.load() << " us ("
+              << transfer_stage_max_us_.load() / 1000.0 << " ms)";
 }
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {

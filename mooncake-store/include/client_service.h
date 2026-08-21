@@ -873,6 +873,17 @@ class Client {
     // Frequency admission: only cache keys whose CMS count >= threshold
     std::unique_ptr<CountMinSketch> admission_sketch_;
     uint8_t admission_threshold_ = 2;
+
+    // Duration statistics (us) for the SubmitTransfers() + WaitForTransfers()
+    // stages of BatchPut. Updated atomically (BatchPut may run concurrently)
+    // and printed in the destructor.
+    std::atomic<uint64_t> transfer_stage_count_{0};
+    std::atomic<uint64_t> transfer_submit_total_us_{0};
+    std::atomic<uint64_t> transfer_wait_total_us_{0};
+    std::atomic<uint64_t> transfer_stage_total_us_{0};
+    std::atomic<uint64_t> transfer_stage_max_us_{0};
+    void RecordTransferStageDuration(uint64_t submit_us, uint64_t wait_us);
+    void PrintTransferStageStats() const;
 };
 
 }  // namespace mooncake
