@@ -54,6 +54,10 @@ struct NdsBatchDesc {
     // Set to true once the whole batch is observed completed, so the transfer
     // latency is recorded exactly once per batch.
     std::atomic<bool> completion_recorded{false};
+    // Opcode of the batch, taken from its first slice (set in pushParams).
+    // Used to split the latency statistics by READ/WRITE. If a batch mixes
+    // both opcodes (unusual), it is attributed to the first slice's opcode.
+    nds_batch_io_op_t opcode{NDS_BATCH_IO_READ};
 };
 
 class NdsDescPool {
@@ -133,10 +137,12 @@ class NdsDescPool {
     };
 
     // Submit-to-completion latency of a whole batch: recorded exactly once per
-    // batch when getTransferStatus observes all slices in a terminal state.
-    LatencyStats transfer_latency_;
-    // Execution time of the nds_batch_io_submit() call itself.
-    LatencyStats submit_call_time_;
+    // batch when the caller observes all tasks finished. Indexed by
+    // nds_batch_io_op_t (READ=0, WRITE=1) to split stats by opcode.
+    LatencyStats transfer_latency_[2];
+    // Execution time of the nds_batch_io_submit() call itself. Indexed by
+    // nds_batch_io_op_t (READ=0, WRITE=1) to split stats by opcode.
+    LatencyStats submit_call_time_[2];
 };
 
 }  // namespace mooncake

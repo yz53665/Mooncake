@@ -51,8 +51,10 @@ NdsDescPool::~NdsDescPool() {
     handle_pool_.clear();
 
     // Dump accumulated latency statistics.
-    if (transfer_latency_.count.load() > 0 ||
-        submit_call_time_.count.load() > 0) {
+    if (transfer_latency_[0].count.load() > 0 ||
+        transfer_latency_[1].count.load() > 0 ||
+        submit_call_time_[0].count.load() > 0 ||
+        submit_call_time_[1].count.load() > 0) {
         printTransferStats();
     }
 }
@@ -158,6 +160,12 @@ int NdsDescPool::pushParams(int idx, const nds_batch_io_params_t &io_params,
         return -1;
     }
 
+    // Take the batch opcode from its first slice; used to split the latency
+    // statistics by READ/WRITE.
+    if (desc->params.empty()) {
+        desc->opcode = io_params.opcode;
+    }
+
     desc->params.push_back(io_params);
     desc->slices.push_back(slice);
     return 0;
@@ -188,9 +196,8 @@ int NdsDescPool::submitBatch(int idx) {
         std::chrono::duration_cast<std::chrono::microseconds>(submit_end -
                                                               submit_start)
             .count();
-    submit_call_time_.record(submit_elapsed_us > 0
-                                 ? static_cast<uint64_t>(submit_elapsed_us)
-                                 : 0);
+    submit_call_time_[static_cast<size_t>(desc->opcode)].record(
+        submit_elapsed_us > 0 ? static_cast<uint64_t>(submit_elapsed_us) : 0);
     submit_end = std::chrono::steady_clock::now();
     if (submit_ret != 0) {
         LOG(ERROR) << "NdsDescPool: nds_batch_io_submit failed for " << nr
@@ -336,40 +343,49 @@ void NdsDescPool::recordTransferCompleted(int idx) {
     uint64_t now_ns = static_cast<uint64_t>(
         std::chrono::steady_clock::now().time_since_epoch().count());
     uint64_t dur_ns = now_ns > start_ns ? now_ns - start_ns : 0;
-    transfer_latency_.record(dur_ns / 1000);  // ns -> us
+    transfer_latency_[static_cast<size_t>(desc->opcode)].record(dur_ns /
+                                                                1000);  // ns -> us
 }
 
 void NdsDescPool::printTransferStats() const {
-    // Submit-to-completion latency of whole batches.
-    uint64_t transfer_count = transfer_latency_.count.load();
-    if (transfer_count > 0) {
-        double transfer_avg_us =
-            static_cast<double>(transfer_latency_.total_us.load()) /
-            static_cast<double>(transfer_count);
-        LOG(INFO) << "NdsDescPool batch submit-to-completion stats: batches="
-                  << transfer_count << ", avg=" << transfer_avg_us << " us ("
-                  << transfer_avg_us / 1000.0 << " ms), max="
-                  << transfer_latency_.max_us.load() << " us ("
-                  << transfer_latency_.max_us.load() / 1000.0 << " ms)";
-    } else {
-        LOG(INFO) << "NdsDescPool batch submit-to-completion stats: no "
-                     "completed batch recorded";
+    static const char *kOpName[2] = {"READ", "WRITE"};
+
+    // Submit-to-completion latency of whole batches, per opcode.
+    for (int op = 0; op < 2; ++op) {
+        uint64_t count = transfer_latency_[op].count.load();
+        if (count > 0) {
+            double avg_us =
+                static_cast<double>(transfer_latency_[op].total_us.load()) /
+                static_cast<double>(count);
+            LOG(INFO) << "NdsDescPool batch submit-to-completion stats ["
+                      << kOpName[op] << "]: batches=" << count
+                      << ", avg=" << avg_us << " us (" << avg_us / 1000.0
+                      << " ms), max=" << transfer_latency_[op].max_us.load()
+                      << " us (" << transfer_latency_[op].max_us.load() / 1000.0
+                      << " ms)";
+        } else {
+            LOG(INFO) << "NdsDescPool batch submit-to-completion stats ["
+                      << kOpName[op] << "]: no completed batch recorded";
+        }
     }
 
-    // Execution time of the nds_batch_io_submit() call itself.
-    uint64_t submit_count = submit_call_time_.count.load();
-    if (submit_count > 0) {
-        double submit_avg_us =
-            static_cast<double>(submit_call_time_.total_us.load()) /
-            static_cast<double>(submit_count);
-        LOG(INFO) << "NdsDescPool nds_batch_io_submit call stats: calls="
-                  << submit_count << ", avg=" << submit_avg_us << " us ("
-                  << submit_avg_us / 1000.0 << " ms), max="
-                  << submit_call_time_.max_us.load() << " us ("
-                  << submit_call_time_.max_us.load() / 1000.0 << " ms)";
-    } else {
-        LOG(INFO) << "NdsDescPool nds_batch_io_submit call stats: no call "
-                     "recorded";
+    // Execution time of the nds_batch_io_submit() call itself, per opcode.
+    for (int op = 0; op < 2; ++op) {
+        uint64_t count = submit_call_time_[op].count.load();
+        if (count > 0) {
+            double avg_us =
+                static_cast<double>(submit_call_time_[op].total_us.load()) /
+                static_cast<double>(count);
+            LOG(INFO) << "NdsDescPool nds_batch_io_submit call stats ["
+                      << kOpName[op] << "]: calls=" << count
+                      << ", avg=" << avg_us << " us (" << avg_us / 1000.0
+                      << " ms), max=" << submit_call_time_[op].max_us.load()
+                      << " us (" << submit_call_time_[op].max_us.load() / 1000.0
+                      << " ms)";
+        } else {
+            LOG(INFO) << "NdsDescPool nds_batch_io_submit call stats ["
+                      << kOpName[op] << "]: no call recorded";
+        }
     }
 }
 
