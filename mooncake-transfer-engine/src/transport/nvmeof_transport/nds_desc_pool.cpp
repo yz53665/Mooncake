@@ -18,6 +18,7 @@
 
 #include <glog/logging.h>
 
+#include <chrono>
 #include <cstddef>
 #include <mutex>
 
@@ -48,6 +49,12 @@ NdsDescPool::~NdsDescPool() {
         delete batch_handle;
     }
     handle_pool_.clear();
+
+    // Dump accumulated latency statistics.
+    if (transfer_latency_.count.load() > 0 ||
+        submit_call_time_.count.load() > 0) {
+        printTransferStats();
+    }
 }
 
 int NdsDescPool::allocNdsDesc(size_t batch_size) {
@@ -170,10 +177,22 @@ int NdsDescPool::submitBatch(int idx) {
         return 0;
     }
 
-    // Submit all params in this descriptor
+    // Measure the nds_batch_io_submit() call itself: take a timestamp right
+    // before and right after the call (recorded on both success and failure).
     unsigned nr = static_cast<unsigned>(desc->params.size());
-    if (nds_batch_io_submit(desc->batch_handle->handle, nr,
-                         desc->params.data(), 0) != 0) {
+    auto submit_start = std::chrono::steady_clock::now();
+    int submit_ret = nds_batch_io_submit(desc->batch_handle->handle, nr,
+                                         desc->params.data(), 0);
+    auto submit_end = std::chrono::steady_clock::now();
+    auto submit_elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(submit_end -
+                                                              submit_start)
+            .count();
+    submit_call_time_.record(submit_elapsed_us > 0
+                                 ? static_cast<uint64_t>(submit_elapsed_us)
+                                 : 0);
+    submit_end = std::chrono::steady_clock::now();
+    if (submit_ret != 0) {
         LOG(ERROR) << "NdsDescPool: nds_batch_io_submit failed for " << nr
                    << " slices";
         desc->submit_failed.store(true);
@@ -181,6 +200,14 @@ int NdsDescPool::submitBatch(int idx) {
         return -1;
     }
     desc->batch_submitted.store(true);
+
+    // The transfer duration is measured from right after the submit call
+    // returns, so its start point is submit_end. The end point is determined
+    // by the caller (NVMeoFTransport::getTransferStatus) when the whole batch
+    // is finished, via recordTransferCompleted().
+    desc->transfer_start_ns_.store(
+        static_cast<uint64_t>(submit_end.time_since_epoch().count()),
+        std::memory_order_release);
     return 0;
 }
 
@@ -286,6 +313,64 @@ NdsBatchDesc *NdsDescPool::getDesc(int idx) {
         return nullptr;
     }
     return descs_[idx];
+}
+
+void NdsDescPool::recordTransferCompleted(int idx) {
+    if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
+        LOG(ERROR) << "Invalid descriptor index: " << idx;
+        return;
+    }
+    auto *desc = descs_[idx];
+    uint64_t start_ns =
+        desc->transfer_start_ns_.load(std::memory_order_acquire);
+    if (start_ns == 0) {
+        // The batch was never submitted successfully (e.g. submit failed), so
+        // there is no transfer duration to record.
+        return;
+    }
+    // Record exactly once per batch, even if multiple polling threads
+    // concurrently observe the batch as finished.
+    if (desc->completion_recorded.exchange(true)) {
+        return;
+    }
+    uint64_t now_ns = static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    uint64_t dur_ns = now_ns > start_ns ? now_ns - start_ns : 0;
+    transfer_latency_.record(dur_ns / 1000);  // ns -> us
+}
+
+void NdsDescPool::printTransferStats() const {
+    // Submit-to-completion latency of whole batches.
+    uint64_t transfer_count = transfer_latency_.count.load();
+    if (transfer_count > 0) {
+        double transfer_avg_us =
+            static_cast<double>(transfer_latency_.total_us.load()) /
+            static_cast<double>(transfer_count);
+        LOG(INFO) << "NdsDescPool batch submit-to-completion stats: batches="
+                  << transfer_count << ", avg=" << transfer_avg_us << " us ("
+                  << transfer_avg_us / 1000.0 << " ms), max="
+                  << transfer_latency_.max_us.load() << " us ("
+                  << transfer_latency_.max_us.load() / 1000.0 << " ms)";
+    } else {
+        LOG(INFO) << "NdsDescPool batch submit-to-completion stats: no "
+                     "completed batch recorded";
+    }
+
+    // Execution time of the nds_batch_io_submit() call itself.
+    uint64_t submit_count = submit_call_time_.count.load();
+    if (submit_count > 0) {
+        double submit_avg_us =
+            static_cast<double>(submit_call_time_.total_us.load()) /
+            static_cast<double>(submit_count);
+        LOG(INFO) << "NdsDescPool nds_batch_io_submit call stats: calls="
+                  << submit_count << ", avg=" << submit_avg_us << " us ("
+                  << submit_avg_us / 1000.0 << " ms), max="
+                  << submit_call_time_.max_us.load() << " us ("
+                  << submit_call_time_.max_us.load() / 1000.0 << " ms)";
+    } else {
+        LOG(INFO) << "NdsDescPool nds_batch_io_submit call stats: no call "
+                     "recorded";
+    }
 }
 
 }  // namespace mooncake

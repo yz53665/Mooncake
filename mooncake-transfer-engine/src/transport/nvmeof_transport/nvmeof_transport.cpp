@@ -160,6 +160,20 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     }
     if (transfer_status.s == COMPLETED || transfer_status.s == FAILED) {
         task.is_finished = true;
+        // Reuse the existing per-task completion judgment (task.is_finished)
+        // above: when the last unfinished task of the batch finishes, the
+        // whole batch has completed. Record the transfer duration
+        // (submit-to-completion) right here, without any extra NDS polling.
+        bool all_finished = true;
+        for (auto &t : batch_desc.task_list) {
+            if (!t.is_finished) {
+                all_finished = false;
+                break;
+            }
+        }
+        if (all_finished) {
+            nds_desc_pool_->recordTransferCompleted(nvmeof_desc.desc_idx_);
+        }
     }
     status = transfer_status;
     return Status::OK();
