@@ -18,6 +18,7 @@
 #ifdef USE_NDS
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -45,6 +46,14 @@ struct NdsBatchDesc {
     // Submit status (atomic for lock-free polling in getTransferStatus)
     std::atomic<bool> batch_submitted{false};
     std::atomic<bool> submit_failed{false};
+    // Start of the transfer duration measurement (steady_clock time in ns,
+    // set right after nds_batch_io_submit returns successfully). 0 means the
+    // batch was never submitted successfully. Atomic because it is written by
+    // the submit worker thread and read by getTransferStatus polling threads.
+    std::atomic<uint64_t> transfer_start_ns_{0};
+    // Set to true once the whole batch is observed completed, so the transfer
+    // latency is recorded exactly once per batch.
+    std::atomic<bool> completion_recorded{false};
 };
 
 class NdsDescPool {
@@ -82,6 +91,17 @@ class NdsDescPool {
     // Get descriptor by index
     NdsBatchDesc *getDesc(int idx);
 
+    // Record the transfer duration (submit-to-completion) of the batch once,
+    // after the caller has determined that the whole batch is finished. The
+    // caller (NVMeoFTransport::getTransferStatus) performs the completion
+    // judgment using its existing per-task logic; this method only computes
+    // and accumulates the latency and is safe to call concurrently.
+    void recordTransferCompleted(int idx);
+
+    // Print accumulated submit-to-completion latency statistics (completed
+    // batch count, average and max duration) to the log.
+    void printTransferStats() const;
+
    private:
     static const size_t MAX_NR_DESC = 512;  // Max number of descriptors
     size_t max_batch_size_;
@@ -94,6 +114,29 @@ class NdsDescPool {
     // Array of descriptors (nullptr = free slot)
     NdsBatchDesc *descs_[MAX_NR_DESC];
     RWSpinlock mutex_;
+
+    // Duration statistics (count, total and max in microseconds), updated
+    // atomically and thus safe to record from multiple threads.
+    struct LatencyStats {
+        std::atomic<uint64_t> count{0};      // number of samples
+        std::atomic<uint64_t> total_us{0};   // sum of all durations in us
+        std::atomic<uint64_t> max_us{0};     // max duration in us
+        void record(uint64_t us) {
+            count.fetch_add(1, std::memory_order_relaxed);
+            total_us.fetch_add(us, std::memory_order_relaxed);
+            uint64_t cur_max = max_us.load(std::memory_order_relaxed);
+            while (cur_max < us &&
+                   !max_us.compare_exchange_weak(cur_max, us,
+                                                 std::memory_order_relaxed)) {
+            }
+        }
+    };
+
+    // Submit-to-completion latency of a whole batch: recorded exactly once per
+    // batch when getTransferStatus observes all slices in a terminal state.
+    LatencyStats transfer_latency_;
+    // Execution time of the nds_batch_io_submit() call itself.
+    LatencyStats submit_call_time_;
 };
 
 }  // namespace mooncake
