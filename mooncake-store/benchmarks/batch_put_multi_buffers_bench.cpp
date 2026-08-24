@@ -127,7 +127,7 @@ int main(int argc, char** argv) {
             client->unregister_buffer(p);
         }
         for (void* p : registered_buffers) {
-            std::free(p);
+            aclrtFree(p);
         }
     };
 
@@ -155,16 +155,16 @@ int main(int argc, char** argv) {
         sizes.reserve(FLAGS_addrs_per_key);
         for (uint64_t j = 0; j < FLAGS_addrs_per_key; ++j) {
             void* p = nullptr;
-            int ret = aclrtMalloc(&p, size, ACL_MEM_MALLOC_HUGE_FIRST);
-            if (ret != ACL_SUCCESS || buf == nullptr) {
-                LOG(ERROR) << "Failed to allocate NPU HBM memory, ret=" << ret << ", size=" << size;
-                return nullptr;
+            int ret = aclrtMalloc(&p, FLAGS_addr_size, ACL_MEM_MALLOC_HUGE_FIRST);
+            if (ret != ACL_SUCCESS || p == nullptr) {
+                LOG(ERROR) << "Failed to allocate NPU HBM memory, ret=" << ret << ", size=" << FLAGS_addr_size;
+                return 1;
             }
             ret = client->register_buffer(p, FLAGS_addr_size);
             if (ret != 0) {
                 LOG(ERROR) << "register_buffer failed for key=" << i
                            << " addr=" << j << " retcode=" << ret;
-                std::free(p);
+                aclrtFree(p);
                 cleanup_buffers();
                 return 1;
             }
