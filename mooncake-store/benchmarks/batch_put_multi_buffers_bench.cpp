@@ -123,21 +123,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Allocate and register one contiguous buffer.
-    void* buffer = nullptr;
-    if (posix_memalign(&buffer, 4096, total_bytes) != 0) {
-        LOG(ERROR) << "Failed to allocate aligned buffer of "
-                   << total_bytes << " bytes";
-        return 1;
-    }
-    std::memset(buffer, 0xAB, total_bytes);
-
-    ret = client->register_buffer(buffer, total_bytes);
-    if (ret != 0) {
-        LOG(ERROR) << "register_buffer failed, retcode=" << ret;
-        std::free(buffer);
-        return 1;
-    }
+    // In real usage, each addr may be a separate non-contiguous buffer, so
+    // allocate and register each addr independently.
+    std::vector<void*> registered_buffers;
+    auto cleanup_buffers = [&]() {
+        for (void* p : registered_buffers) {
+            client->unregister_buffer(p);
+        }
+        for (void* p : registered_buffers) {
+            std::free(p);
+        }
+    };
 
     // Pre-build all argument lists before the profiling loop. Each iteration
     // uses a unique key set so repeated Put calls do not hit
@@ -156,17 +152,31 @@ int main(int argc, char** argv) {
 
     std::vector<std::vector<void*>> all_buffers(FLAGS_num_keys);
     std::vector<std::vector<size_t>> all_sizes(FLAGS_num_keys);
-    char* base = static_cast<char*>(buffer);
     for (uint64_t i = 0; i < FLAGS_num_keys; ++i) {
         auto& ptrs = all_buffers[i];
         auto& sizes = all_sizes[i];
         ptrs.reserve(FLAGS_addrs_per_key);
         sizes.reserve(FLAGS_addrs_per_key);
         for (uint64_t j = 0; j < FLAGS_addrs_per_key; ++j) {
-            const size_t offset =
-                (i * FLAGS_addrs_per_key + j) * FLAGS_addr_size;
-            ptrs.emplace_back(base + offset);
-            sizes.emplace_back(FLAGS_addr_size);
+            void* p = nullptr;
+            if (posix_memalign(&p, 4096, FLAGS_addr_size) != 0) {
+                LOG(ERROR) << "Failed to allocate aligned buffer for key=" << i
+                           << " addr=" << j << " size=" << FLAGS_addr_size;
+                cleanup_buffers();
+                return 1;
+            }
+            std::memset(p, 0xAB, FLAGS_addr_size);
+            ret = client->register_buffer(p, FLAGS_addr_size);
+            if (ret != 0) {
+                LOG(ERROR) << "register_buffer failed for key=" << i
+                           << " addr=" << j << " retcode=" << ret;
+                std::free(p);
+                cleanup_buffers();
+                return 1;
+            }
+            registered_buffers.push_back(p);
+            ptrs.push_back(p);
+            sizes.push_back(FLAGS_addr_size);
         }
     }
 
@@ -182,8 +192,7 @@ int main(int argc, char** argv) {
             if (results[i] != 0) {
                 LOG(ERROR) << "Warmup failed: key=" << keys_by_iteration[it][i]
                            << " ret=" << results[i];
-                client->unregister_buffer(buffer);
-                std::free(buffer);
+                cleanup_buffers();
                 return 1;
             }
         }
@@ -199,15 +208,13 @@ int main(int argc, char** argv) {
                 LOG(ERROR) << "Iteration failed: key="
                            << keys_by_iteration[warmup + it][i]
                            << " ret=" << results[i];
-                client->unregister_buffer(buffer);
-                std::free(buffer);
+                cleanup_buffers();
                 return 1;
             }
         }
     }
 
-    client->unregister_buffer(buffer);
-    std::free(buffer);
+    cleanup_buffers();
     std::cout << "batch_put_from_multi_buffers benchmark finished\n";
 
     google::ShutdownGoogleLogging();
