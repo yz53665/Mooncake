@@ -28,6 +28,15 @@ target_link_libraries(
   allocation_strategy_bench PRIVATE mooncake_store cachelib_memory_allocator
                                     gflags::gflags glog::glog pthread)
 
+# Add batch_put_from_multi_buffers benchmark
+add_executable(batch_put_multi_buffers_bench
+               batch_put_multi_buffers_bench.cpp)
+target_link_libraries(
+  batch_put_multi_buffers_bench
+  PRIVATE mooncake_store transfer_engine cachelib_memory_allocator
+          ${ETCD_WRAPPER_LIB} mooncake_common glog::glog gflags::gflags
+          pthread)
+
 # Add NoF worker pool benchmark executable
 if(USE_NOF)
   add_executable(nof_worker_pool_bench nof_worker_pool_bench.cpp)
