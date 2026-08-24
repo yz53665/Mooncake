@@ -37,6 +37,10 @@ target_link_libraries(
           ${ETCD_WRAPPER_LIB} mooncake_common glog::glog gflags::gflags
           pthread)
 
+if(USE_NDS)
+  target_link_libraries(batch_put_multi_buffers_bench PRIVATE ascendcl)
+endif()
+
 # Add NoF worker pool benchmark executable
 if(USE_NOF)
   add_executable(nof_worker_pool_bench nof_worker_pool_bench.cpp)

@@ -22,6 +22,7 @@
 //       --master_server=127.0.0.1:50051 \
 //       --metadata_server=http://127.0.0.1:8080/metadata \
 //       --protocol=tcp \
+//       --device_id=0 \
 //       --num_keys=1000 \
 //       --addrs_per_key=8 \
 //       --addr_size=4096 \
@@ -39,6 +40,10 @@
 #include <string>
 #include <vector>
 
+#ifdef USE_NDS
+#include "acl/acl.h"
+#endif
+
 #include "real_client.h"
 
 DEFINE_string(master_server, "127.0.0.1:50051", "Master server address");
@@ -47,6 +52,8 @@ DEFINE_string(metadata_server, "http://127.0.0.1:8080/metadata",
 DEFINE_string(protocol, "tcp", "Transfer protocol: tcp|rdma");
 DEFINE_string(device_name, "", "Device name for RDMA");
 DEFINE_string(local_hostname, "localhost", "Local hostname");
+DEFINE_int32(device_id, 0,
+             "Device ID passed to aclrtSetDevice before running benchmark");
 DEFINE_uint64(global_segment_size_mb, 3200,
               "Global segment size in MB");
 DEFINE_uint64(local_buffer_size_mb, 512, "Local buffer size in MB");
@@ -69,6 +76,15 @@ int main(int argc, char** argv) {
     FLAGS_logtostderr = true;
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
+#ifdef USE_NDS
+    int acl_ret = aclrtSetDevice(FLAGS_device_id);
+    if (acl_ret != ACL_SUCCESS) {
+        LOG(ERROR) << "aclrtSetDevice failed for device_id="
+                   << FLAGS_device_id << ", ret=" << acl_ret;
+        return 1;
+    }
+#endif
+
     const size_t total_bytes =
         static_cast<size_t>(FLAGS_num_keys * FLAGS_addrs_per_key *
                             FLAGS_addr_size);
@@ -79,7 +95,8 @@ int main(int argc, char** argv) {
               << " total_buffer_bytes=" << total_bytes
               << " iterations=" << FLAGS_iterations << "\n";
     std::cout << "protocol=" << FLAGS_protocol
-              << " device_name=" << FLAGS_device_name << "\n";
+              << " device_name=" << FLAGS_device_name
+              << " device_id=" << FLAGS_device_id << "\n";
 
     if (FLAGS_num_keys == 0 || FLAGS_addrs_per_key == 0 ||
         FLAGS_addr_size == 0 || FLAGS_iterations == 0) {
