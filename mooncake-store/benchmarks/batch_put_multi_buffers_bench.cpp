@@ -155,13 +155,11 @@ int main(int argc, char** argv) {
         sizes.reserve(FLAGS_addrs_per_key);
         for (uint64_t j = 0; j < FLAGS_addrs_per_key; ++j) {
             void* p = nullptr;
-            if (posix_memalign(&p, 4096, FLAGS_addr_size) != 0) {
-                LOG(ERROR) << "Failed to allocate aligned buffer for key=" << i
-                           << " addr=" << j << " size=" << FLAGS_addr_size;
-                cleanup_buffers();
-                return 1;
+            int ret = aclrtMalloc(&p, size, ACL_MEM_MALLOC_HUGE_FIRST);
+            if (ret != ACL_SUCCESS || buf == nullptr) {
+                LOG(ERROR) << "Failed to allocate NPU HBM memory, ret=" << ret << ", size=" << size;
+                return nullptr;
             }
-            std::memset(p, 0xAB, FLAGS_addr_size);
             ret = client->register_buffer(p, FLAGS_addr_size);
             if (ret != 0) {
                 LOG(ERROR) << "register_buffer failed for key=" << i
