@@ -40,9 +40,7 @@
 #include <string>
 #include <vector>
 
-#ifdef USE_NDS
 #include "acl/acl.h"
-#endif
 
 #include "real_client.h"
 
@@ -76,14 +74,12 @@ int main(int argc, char** argv) {
     FLAGS_logtostderr = true;
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-#ifdef USE_NDS
     int acl_ret = aclrtSetDevice(FLAGS_device_id);
     if (acl_ret != ACL_SUCCESS) {
         LOG(ERROR) << "aclrtSetDevice failed for device_id="
                    << FLAGS_device_id << ", ret=" << acl_ret;
         return 1;
     }
-#endif
 
     const size_t total_bytes =
         static_cast<size_t>(FLAGS_num_keys * FLAGS_addrs_per_key *
