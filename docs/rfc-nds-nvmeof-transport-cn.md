@@ -280,30 +280,32 @@ sequenceDiagram
     MS-->>Client: OK
 ```
 
-### 5.4 心跳与健康检查
+### 5.4 探针函数设计
 
-`NoFProbeFn` 以函数注入方式提供，master 层不依赖具体驱动。NDS 路径下基于轻量 `nds_read` 实现。
+`NoFProbeFn` 以函数注入方式解耦 master 层与具体驱动，master 层仅通过该抽象判断设备健康状态，不关心底层实现。
 
-```mermaid
-flowchart TD
-    A[HeartbeatThreadFunc 每 100ms 醒来] --> B[同步 heartbeat_states_ 表<br/>新增段加入/已卸载段移除]
-    B --> C[筛选 next_probe_at <= now 的段]
-    C --> D{有待探测段?}
-    D -->|否| F[sleep 100ms]
-    D -->|是| E[对每段调用 ProbeFn]
-    E --> G{探测结果}
-    G -->|成功| H[consecutive_failures=0<br/>更新 last_success_at]
-    G -->|失败| I[consecutive_failures++]
-    I --> J{now - last_success_at >= alive_timeout?}
-    J -->|否| K[记录失败，等待下次]
-    J -->|是| L[HandleFailure → ForceUnmountSegment]
-    H --> M[更新 next_probe_at = now + interval]
-    K --> M
-    L --> M
-    M --> F
+```cpp
+// 函数签名
+using NoFProbeFn = std::function<bool(
+    const std::string& device_name,  // 设备标识
+    int timeout_ms,                   // 单次探测超时
+    std::string* error                // 错误信息输出
+)>;
 ```
 
-默认 `alive_timeout = 10s × 3 = 30s`。
+**返回值语义**：
+- `true`：设备可达，segment 健康
+- `false`：设备不可达，需通过 `error` 输出原因
+
+**NDS 路径实现**（默认绑定）：
+1. 打开 `device_name` 对应的本地块设备 fd
+2. 发起一次轻量 `nds_read`（仅读取 1 字节，不关心数据内容）
+3. 超时控制：`timeout_ms` 内未返回即视为失败
+4. 若 `nds_read` 返回错误码，将错误信息填入 `error`，返回 `false`
+
+**SPDK 路径实现**：直接调用 `SpdkWrapper::ProbeNofSegment(device_name, timeout_ms, error)`。
+
+**心跳线程**（master 层已有逻辑，本提案不修改）：每 100ms 轮询，对 OK 状态的 segment 调用 `ProbeFn`，连续失败超过阈值（默认 `10s × 3`）触发 `ForceUnmountSegment`。
 
 ### 5.5 故障处理
 

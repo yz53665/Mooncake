@@ -280,30 +280,32 @@ sequenceDiagram
     MS-->>Client: OK
 ```
 
-### 5.4 Heartbeat and Health Check
+### 5.4 Probe Function Design
 
-`NoFProbeFn` is provided via function injection; the master layer does not depend on a specific driver. Under NDS, it uses a lightweight `nds_read`.
+`NoFProbeFn` is injected as a function to decouple the master layer from the specific driver. The master layer only uses this abstraction to determine device health, without knowledge of the underlying implementation.
 
-```mermaid
-flowchart TD
-    A[HeartbeatThreadFunc wakes every 100ms] --> B[Sync heartbeat_states_ table<br/>Add new segments / Remove unmounted ones]
-    B --> C[Filter segments with next_probe_at <= now]
-    C --> D{Any segments to probe?}
-    D -->|No| F[sleep 100ms]
-    D -->|Yes| E[Call ProbeFn for each segment]
-    E --> G{Probe result}
-    G -->|Success| H[consecutive_failures=0<br/>Update last_success_at]
-    G -->|Failure| I[consecutive_failures++]
-    I --> J{now - last_success_at >= alive_timeout?}
-    J -->|No| K[Log failure, wait for next probe]
-    J -->|Yes| L[HandleFailure → ForceUnmountSegment]
-    H --> M[Update next_probe_at = now + interval]
-    K --> M
-    L --> M
-    M --> F
+```cpp
+// Function signature
+using NoFProbeFn = std::function<bool(
+    const std::string& device_name,  // Device identifier
+    int timeout_ms,                   // Single probe timeout
+    std::string* error                // Error message output
+)>;
 ```
 
-Default `alive_timeout = 10s × 3 = 30s`.
+**Return value semantics**:
+- `true`: Device reachable, segment healthy
+- `false`: Device unreachable, reason provided via `error`
+
+**NDS path implementation** (default binding):
+1. Open the local block device fd corresponding to `device_name`
+2. Issue a lightweight `nds_read` (read 1 byte, data content ignored)
+3. Timeout control: failure if no response within `timeout_ms`
+4. If `nds_read` returns an error code, populate `error` and return `false`
+
+**SPDK path implementation**: Direct call to `SpdkWrapper::ProbeNofSegment(device_name, timeout_ms, error)`.
+
+**Heartbeat thread** (existing master-layer logic, unmodified by this proposal): Polls every 100ms, invokes `ProbeFn` for OK-status segments, triggers `ForceUnmountSegment` when consecutive failures exceed the threshold (default `10s × 3`).
 
 ### 5.5 Fault Handling
 
