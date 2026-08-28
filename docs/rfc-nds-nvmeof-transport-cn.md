@@ -1,4 +1,4 @@
-# RFC: 引入 NDS 分支并扩展 Master 层 SSD Segment 管理以支持昇腾 NPU 直连 NVMe-oF 存储
+# RFC: 引入 NDS 分支以支持昇腾 NPU 直连 NVMe-oF 存储，并扩展 Master 层 SSD Segment 管理框架
 
 ## 1. 引言
 

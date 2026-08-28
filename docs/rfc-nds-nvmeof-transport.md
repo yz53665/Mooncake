@@ -1,11 +1,11 @@
-# RFC: Introduce NDS Branch and Extend Master-Layer SSD Segment Management to Support Ascend NPU Direct-Attached NVMe-oF Storage
+# RFC: Introduce NDS Branch for Ascend NPU Direct-Attached NVMe-oF Storage and Extend Master SSD Segment Management Framework
 
 ## 1. Introduction
 
 This RFC extends NVMe-oF direct-attached storage for Ascend NPU scenarios with two coordinated changes:
 
 1. **Transport-layer NDS Branch**: Add an **NDS (NPU Direct Storage)** branch parallel to GDS in `nvmeof_transport`, enabling Ascend NPU inference/training to directly access remote SSD pools via NVMe-oF, expanding KV Cache capacity.
-2. **Master-layer SSD Segment Management Extension**: Extend the existing `NoFSegmentManager` with multi-client sharing (`client_refs` reference counting) and probe injection (`NoFProbeFn`), reusing the existing fault force-unmount and replica cleanup chain. Both NDS and SPDK paths share the same segment lifecycle management framework.
+2. **Master SSD Segment Management Extension**: Extend the existing `NoFSegmentManager` with multi-client sharing (`client_refs` reference counting) and probe injection (`NoFProbeFn`), reusing the existing fault force-unmount and replica cleanup chain. Both NDS and SPDK paths share the same segment lifecycle management framework.
 
 This proposal complements the existing SPDK NoF path ([#1940](https://github.com/kvcache-ai/Mooncake/issues/1940), [#2084](https://github.com/kvcache-ai/Mooncake/pull/2084)) without overlap, and is enabled via the compile-time macro `USE_NVMEOF_NDS`. NPU HBM performs DMA directly between NDS and the NVMe-oF target, eliminating the need for host-side DMA buffers required by the SPDK path.
 
@@ -44,9 +44,9 @@ Two existing NVMe-oF paths both target NVIDIA GPUs:
 
 Common issue: both require CUDA, unavailable in Ascend environments. The Ascend platform provides the equivalent NDS library, enabling a direct-attached path. This proposal introduces an NDS branch parallel to GDS at the transport layer.
 
-### 2.4 Master-Layer SSD Lifecycle Management
+### 2.4 Master SSD Lifecycle Management
 
-The transport layer only handles "initiate a DMA on a given fd + offset." It does not track mount ownership, health status, or capacity. The `NoFSegmentManager` at the master layer handles these responsibilities. Two mismatches exist:
+The transport layer only handles "initiate a DMA on a given fd + offset." It does not track mount ownership, health status, or capacity. The `NoFSegmentManager` at the master handles these responsibilities. Two mismatches exist:
 
 1. **1:1 mount semantics vs. multi-client sharing**: A physical SSD is often mounted by multiple clients simultaneously. **This proposal extends `client_refs` reference counting**: remounting the same `device_name` only increments the reference count without creating a new segment.
 2. **Heartbeat probe tied to SPDK**: The existing heartbeat calls `SpdkWrapper::ProbeNofSegment`, unavailable under NDS. **This proposal abstracts the probe as `NoFProbeFn` function injection**, with transport-layer implementations per path.
@@ -63,7 +63,7 @@ Three paths are enabled by independent compile-time macros:
 | Storage Backend | SPDK user-space driver | NDS C API |
 | Host Memory | Allocates host-side DMA buffers | Not involved; HBM directly to disk via NDS |
 | Segment Management | Independent `NoFSegmentManager` + heartbeat | Extends existing `NoFSegmentManager` (sharing/probe/fault isolation) |
-| Transport Changes | New store-layer module | Transport-layer parallel branch + master-layer extension |
+| Transport Changes | New store-layer module | Transport-layer parallel branch + master extension |
 | Cluster Coexistence | GPU nodes compile `USE_NOF`, NPU nodes compile `USE_NVMEOF_NDS`, sharing master and segment pool |
 
 ## 3. Overall Architecture
@@ -72,7 +72,7 @@ Three paths are enabled by independent compile-time macros:
 
 ```mermaid
 graph TB
-    subgraph Store["Master Layer"]
+    subgraph Store["Master"]
         MS[MasterService] --> NSM[NoFSegmentManager<br/>Extended by this proposal]
         NSM -->|Mount/Unmount/Heartbeat| SEG[(SSD Segment)]
     end
@@ -90,7 +90,7 @@ graph TB
     SEG -. fd+offset .-> NVT
 ```
 
-The NDS path covers two layers: the transport-layer NDS branch (replacing GDS for data transfer) and master-layer segment management (extending sharing/heartbeat/fault isolation). SSDs use block-device address-offset addressing (`base + offset`), with the master dispatching via fd + offset.
+The NDS path covers two layers: the transport-layer NDS branch (replacing GDS for data transfer) and master segment management (extending sharing/heartbeat/fault isolation). SSDs use block-device address-offset addressing (`base + offset`), with the master dispatching via fd + offset.
 
 ### 3.2 Compile-Time Branches
 
@@ -98,7 +98,7 @@ The NDS path covers two layers: the transport-layer NDS branch (replacing GDS fo
 |---|---|
 | `USE_NVMEOF` (existing) | Enable transport-layer GDS branch (`CuFileContext`/`CUFileDescPool`) |
 | `USE_NOF` (existing) | Enable store-layer SPDK NoF path (`SpdkWrapper` + `SpdkNofWorkerPool`) |
-| `USE_NVMEOF_NDS` (new) | Enable NDS branch: master-layer NoF segment management + transport-layer NDS transport |
+| `USE_NVMEOF_NDS` (new) | Enable NDS branch: master NoF segment management + transport-layer NDS transport |
 
 `USE_NVMEOF_NDS=ON` compiles the NDS branch of `nvmeof_transport.cpp` + `nds_desc_pool.cpp`, linking against `libnds.so` and `CANN`.
 
@@ -196,7 +196,7 @@ sequenceDiagram
 | Status Query | `cuFileBatchIOGetStatus` | `ndsBatchIoGetStatus` | NDS returns `NdsBatchIoEvents` |
 | Batch Destroy | `cuFileBatchIODestroy` | `ndsBatchIoDestroy` | — |
 
-## 5. Master-Layer SSD Segment Management
+## 5. Master SSD Segment Management
 
 ### 5.1 Design Points
 
@@ -282,7 +282,7 @@ sequenceDiagram
 
 ### 5.4 Probe Function Design
 
-`NoFProbeFn` is injected as a function to decouple the master layer from the specific driver. The master layer only uses this abstraction to determine device health, without knowledge of the underlying implementation.
+`NoFProbeFn` is injected as a function to decouple the master from the specific driver. The master only uses this abstraction to determine device health, without knowledge of the underlying implementation.
 
 ```cpp
 // Function signature
@@ -305,7 +305,7 @@ using NoFProbeFn = std::function<bool(
 
 **SPDK path implementation**: Direct call to `SpdkWrapper::ProbeNofSegment(device_name, timeout_ms, error)`.
 
-**Heartbeat thread** (existing master-layer logic, unmodified by this proposal): Polls every 100ms, invokes `ProbeFn` for OK-status segments, triggers `ForceUnmountSegment` when consecutive failures exceed the threshold (default `10s × 3`).
+**Heartbeat thread** (existing master logic, unmodified by this proposal): Polls every 100ms, invokes `ProbeFn` for OK-status segments, triggers `ForceUnmountSegment` when consecutive failures exceed the threshold (default `10s × 3`).
 
 ### 5.5 Fault Handling
 
@@ -430,10 +430,10 @@ Heartbeat parameters (interval, timeout, threshold) are injected via `MasterServ
 Split by PR granularity, 5 items:
 
 1. **Merge transport-layer NDS branch**: `NdsFileContext`, `NdsDescPool`, NDS compile branch of `NVMeoFTransport` — standalone PR into `mooncake-transfer-engine`.
-2. **Extend master-layer NoF segment management**: Multi-client sharing (`client_refs`), probe abstraction (`NoFProbeFn`), bind NDS default probe.
+2. **Extend master NoF segment management**: Multi-client sharing (`client_refs`), probe abstraction (`NoFProbeFn`), bind NDS default probe.
 3. **Client-side integration**: Implement `submitNdsNofOperation` and `TransferSubmitter` routing branch; add `device_path` to `NoFSegment`; add `nof_device_path` list param to `store.setup()`; `NVMeoFTransport::install()` handles device validation and SegmentDesc registration; `setup_internal()` calls `MountNoFSegment()`.
 4. **Complete transport-layer QoS flow control**: Parity with `SpdkNofQos`.
-5. **Evaluate common abstract base classes**: Unify GDS/NDS handle management (`NvmeOfFileContext`) and master-layer reference counting/heartbeat interfaces.
+5. **Evaluate common abstract base classes**: Unify GDS/NDS handle management (`NvmeOfFileContext`) and master reference counting/heartbeat interfaces.
 
 ## 9. References
 
