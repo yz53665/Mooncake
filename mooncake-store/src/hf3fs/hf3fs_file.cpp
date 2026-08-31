@@ -109,7 +109,7 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::write(std::span<const char> data,
                       << " chunk_size=" << chunk_size;
 
             ret = hf3fs_prep_npu_direct_io(
-                &ior_write, false, fd_, current_offset, chunk_size,
+                &ior_write, &threefs_iov, false, fd_, current_offset, chunk_size,
                 &segment_infos, reinterpret_cast<void*>(hbm_buf),
                 chunk_size, nullptr);
             if (ret < 0) {
@@ -299,7 +299,7 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov,
                       << " len=" << avail_in_iov;
 
             ret = hf3fs_prep_npu_direct_io(
-                &ior_write, false, fd_, current_offset, avail_in_iov,
+                &ior_write, &threefs_iov, false, fd_, current_offset, avail_in_iov,
                 &segment_infos, reinterpret_cast<void*>(hbm_buf),
                 avail_in_iov, nullptr);
             if (ret < 0) {
@@ -447,7 +447,7 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_read(const iovec* iov,
                       << " len=" << avail_in_iov;
 
             ret = hf3fs_prep_npu_direct_io(
-                &ior_read, true, fd_, current_offset, avail_in_iov,
+                &ior_read, &threefs_iov, true, fd_, current_offset, avail_in_iov,
                 &segment_infos, reinterpret_cast<void*>(hbm_buf),
                 avail_in_iov, nullptr);
             if (ret < 0) {
