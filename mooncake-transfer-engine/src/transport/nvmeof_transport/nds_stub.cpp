@@ -36,7 +36,7 @@ struct nds_file_ctx_t {
 
 struct nds_batch_context {
     unsigned max_nr;
-    std::vector<ndsBatchIOParams_t> params;
+    std::vector<nds_batch_io_params_t> params;
     bool submitted;
 };
 
@@ -78,7 +78,7 @@ extern "C" int nds_buf_deregister(int32_t device_id, void *buf) {
 // NDS segment info stub
 // ============================================================================
 
-extern "C" int nds_get_segment_info(void *buf, nds_segment_info_t *out) {
+extern "C" int nds_get_segment_info(void *buf, nds_segment_infos_t *out) {
     (void)buf;
     if (out) {
         memset(out, 0, sizeof(*out));
@@ -157,7 +157,7 @@ extern "C" ssize_t nds_write_imported(nds_Handle nds_handle,
 // NDS async batch I/O stubs
 // ============================================================================
 
-extern "C" int ndsBatchIOSetUp(ndsBatchHandle_t *handle, unsigned max_nr) {
+extern "C" int nds_batch_io_setup(nds_batch_handle_t *handle, unsigned max_nr) {
     if (!handle) return -1;
     auto *ctx = new nds_batch_context();
     ctx->max_nr = max_nr;
@@ -166,8 +166,8 @@ extern "C" int ndsBatchIOSetUp(ndsBatchHandle_t *handle, unsigned max_nr) {
     return 0;
 }
 
-extern "C" int ndsBatchIOSubmit(ndsBatchHandle_t handle, unsigned nr,
-                                ndsBatchIOParams_t *params, unsigned flags) {
+extern "C" int nds_batch_io_submit(nds_batch_handle_t handle, unsigned nr,
+                                nds_batch_io_params_t *params, unsigned flags) {
     (void)flags;
     if (!handle || !params) return -1;
     handle->params.assign(params, params + nr);
@@ -175,8 +175,8 @@ extern "C" int ndsBatchIOSubmit(ndsBatchHandle_t handle, unsigned nr,
     return 0;
 }
 
-extern "C" int ndsBatchIOGetStatus(ndsBatchHandle_t handle, unsigned min_nr,
-                                   unsigned *nr, ndsBatchIOEvents_t *events,
+extern "C" int nds_batch_io_get_status(nds_batch_handle_t handle, unsigned min_nr,
+                                   unsigned *nr, nds_batch_io_events_t *events,
                                    const struct timespec *timeout) {
     (void)min_nr;
     (void)timeout;
@@ -198,7 +198,7 @@ extern "C" int ndsBatchIOGetStatus(ndsBatchHandle_t handle, unsigned min_nr,
     return 0;
 }
 
-extern "C" int ndsBatchIODestroy(ndsBatchHandle_t handle) {
+extern "C" int nds_batch_io_destroy(nds_batch_handle_t handle) {
     if (handle) {
         delete handle;
     }

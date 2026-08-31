@@ -28,10 +28,10 @@
 
 namespace mooncake {
 
-// Wrapper for reusable ndsBatchHandle_t.
-// ndsBatchIOSetUp is expensive, so we reuse handles (similar to GDS transport)
+// Wrapper for reusable nds_batch_handle_t.
+// nds_batch_io_setup is expensive, so we reuse handles (similar to GDS transport)
 struct NdsBatchHandle {
-    ndsBatchHandle_t handle;
+    nds_batch_handle_t handle;
     unsigned max_nr;  // max number of batch entries
 };
 
@@ -39,8 +39,8 @@ struct NdsBatchHandle {
 // Each allocation gets a fresh descriptor to avoid parameter confusion.
 struct NdsBatchDesc {
     NdsBatchHandle *batch_handle;  // Pointer to reusable handle from pool
-    std::vector<ndsBatchIOParams_t> params;
-    std::vector<ndsBatchIOEvents_t> events;
+    std::vector<nds_batch_io_params_t> params;
+    std::vector<nds_batch_io_events_t> events;
     std::vector<Transport::Slice *> slices;
 };
 
@@ -58,17 +58,17 @@ class NdsDescPool {
     int allocNdsDesc(size_t batch_size);
 
     // Add params and associated slice to the descriptor
-    int pushParams(int idx, const ndsBatchIOParams_t &io_params,
+    int pushParams(int idx, const nds_batch_io_params_t &io_params,
                    Transport::Slice *slice);
 
     // Submit the batch
     int submitBatch(int idx);
 
     // Get transfer status for a specific slice.
-    // Triggers a full ndsBatchIOGetStatus poll and returns the event for
+    // Triggers a full nds_batch_io_get_status poll and returns the event for
     // slice_id. Updates the corresponding Slice's status via markSuccess /
     // markFailed.
-    ndsBatchIOEvents_t getTransferStatus(int idx, int slice_id);
+    nds_batch_io_events_t getTransferStatus(int idx, int slice_id);
 
     // Get current number of slices in the descriptor
     int getSliceNum(int idx);
@@ -84,7 +84,7 @@ class NdsDescPool {
     size_t max_batch_size_;
 
     // Object pool for NdsBatchHandle to avoid frequent
-    // ndsBatchIOSetUp/Destroy
+    // nds_batch_io_setup/Destroy
     std::vector<NdsBatchHandle *> handle_pool_;
     std::mutex handle_pool_lock_;
 

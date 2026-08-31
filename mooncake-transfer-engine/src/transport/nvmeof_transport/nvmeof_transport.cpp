@@ -135,17 +135,17 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             nds_desc_pool_->getDesc(nvmeof_desc.desc_idx_)->slices[i];
         if (slice && slice->status != Slice::SUCCESS &&
             slice->status != Slice::FAILED) {
-            if (event.status == NDS_BATCH_IO_COMPLETED) {
+            if (event.status == NDS_BATCH_MODE_IO_COMPLETED) {
                 slice->markSuccess();
-            } else if (event.status == NDS_BATCH_IO_FAILED) {
+            } else if (event.status == NDS_BATCH_MODE_IO_FAILED) {
                 slice->markFailed();
             }
         }
 
-        if (event.status == NDS_BATCH_IO_COMPLETED) {
+        if (event.status == NDS_BATCH_MODE_IO_COMPLETED) {
             transfer_status.s = Transport::COMPLETED;
             transfer_status.transferred_bytes += event.ret;
-        } else if (event.status == NDS_BATCH_IO_FAILED) {
+        } else if (event.status == NDS_BATCH_MODE_IO_FAILED) {
             transfer_status.s = Transport::FAILED;
             break;
         } else {
@@ -516,15 +516,15 @@ void NVMeoFTransport::addSliceToNdsBatch(
     void *source_addr, uint64_t file_offset, uint64_t slice_len,
     int desc_id, TransferRequest::OpCode op, nds_Handle nds_handle,
     Slice *slice) {
-    ndsBatchIOParams_t params;
-    params.mode = NDS_BATCH;
+    nds_batch_io_params_t params;
+    params.mode = NDS_BATCH_MODE;
     params.u.batch.buf = source_addr;
     params.u.batch.file_offset = file_offset;
     params.u.batch.size = slice_len;
     params.nds_handle = nds_handle;
     params.opcode = (op == Transport::TransferRequest::READ)
-                        ? NDS_BATCH_IO_READ
-                        : NDS_BATCH_IO_WRITE;
+                        ? NDS_BATCH_MODE_IO_READ
+                        : NDS_BATCH_MODE_IO_WRITE;
     params.cookie = slice;
     params.device_id = nds_device_id_;
     nds_desc_pool_->pushParams(desc_id, params, slice);
