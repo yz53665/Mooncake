@@ -7,7 +7,25 @@
 
 #ifdef USE_NDS
 #include <hf3fs/nds.h>
+#include <sstream>
 #include "gpu_staging_utils.h"
+
+namespace {
+
+std::string SegmentInfoStr(const nds_segment_info_t& info) {
+    char eid_hex[33] = {0};
+    for (int i = 0; i < 16; ++i) {
+        snprintf(eid_hex + i * 2, 3, "%02x", info.eid[i]);
+    }
+    std::ostringstream oss;
+    oss << "eid=0x" << eid_hex
+        << " uasid=" << info.uasid
+        << " jetty_id=" << info.jetty_id
+        << " token_id=" << info.token_id;
+    return oss.str();
+}
+
+}  // anonymous namespace
 #endif
 
 namespace mooncake {
@@ -73,35 +91,26 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::write(std::span<const char> data,
             // HBM direct write: skip memcpy, use hf3fs_prep_npu
             uint64_t hbm_buf = reinterpret_cast<uint64_t>(
                 data_ptr + total_bytes_written);
-            nds_segment_info_t segment_info;
-            char eid_hex[33] = {0};
-            for (int i = 0; i < 16; ++i) {
-                snprintf(eid_hex + i * 2, 3, "%02x", segment_info.eid[i]);
-            }
-            int ret = nds_get_segment_info(reinterpret_cast<void*>(hbm_buf), &segment_info);
+            nds_segment_infos_t segment_infos;
+            int ret = nds_get_segment_info(reinterpret_cast<void*>(hbm_buf), &segment_infos);
             if (ret != 0) {
-                LOG(ERROR) << "nds_get_segment_info failed, errno: " << ret;
-                LOG(ERROR) << "eid=0x" << eid_hex
-                    << " uasid=" << segment_info.uasid
-                    << " jetty_id=" << segment_info.jetty_id
-                    << " token_id=" << segment_info.token_id
-                    << " addr=0x" << std::hex << hbm_buf << std::dec
-                    << " offset=" << current_offset
-                    << " chunk_size=" << chunk_size;
+                LOG(ERROR) << "nds_get_segment_info failed, errno: " << ret
+                           << " addr=0x" << std::hex << hbm_buf << std::dec
+                           << " offset=" << current_offset
+                           << " chunk_size=" << chunk_size;
                 return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
             }
 
-            LOG(INFO) << "NDS segment_info: eid=0x" << eid_hex
-                      << " uasid=" << segment_info.uasid
-                      << " jetty_id=" << segment_info.jetty_id
-                      << " token_id=" << segment_info.token_id
+            LOG(INFO) << "NDS segment_infos: h2d {"
+                      << SegmentInfoStr(segment_infos.h2d_segment_info) << "} rh2d {"
+                      << SegmentInfoStr(segment_infos.rh2d_segment_info) << "}"
                       << " addr=0x" << std::hex << hbm_buf << std::dec
                       << " offset=" << current_offset
                       << " chunk_size=" << chunk_size;
 
             ret = hf3fs_prep_npu_direct_io(
                 &ior_write, false, fd_, current_offset, chunk_size,
-                &segment_info, reinterpret_cast<void*>(hbm_buf),
+                &segment_infos, reinterpret_cast<void*>(hbm_buf),
                 chunk_size, nullptr);
             if (ret < 0) {
                 return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
@@ -273,34 +282,25 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov,
             uint64_t hbm_buf = reinterpret_cast<uint64_t>(
                 static_cast<char*>(current_iov->iov_base) +
                 current_iov_offset);
-            nds_segment_info_t segment_info;
-            int ret = nds_get_segment_info(reinterpret_cast<void*>(hbm_buf), &segment_info);
-            char eid_hex[33] = {0};
-            for (int i = 0; i < 16; ++i) {
-                snprintf(eid_hex + i * 2, 3, "%02x", segment_info.eid[i]);
-            }
+            nds_segment_infos_t segment_infos;
+            int ret = nds_get_segment_info(reinterpret_cast<void*>(hbm_buf), &segment_infos);
             if (ret != 0) {
-                LOG(ERROR) << "nds_get_segment_info failed, errno: " << ret;
-                LOG(ERROR) << "eid=0x" << eid_hex
-                    << " uasid=" << segment_info.uasid
-                    << " jetty_id=" << segment_info.jetty_id
-                    << " token_id=" << segment_info.token_id
-                    << " addr=0x" << std::hex << hbm_buf << std::dec
-                    << " offset=" << current_offset;
+                LOG(ERROR) << "nds_get_segment_info failed, errno: " << ret
+                           << " addr=0x" << std::hex << hbm_buf << std::dec
+                           << " offset=" << current_offset;
                 return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
             }
 
-            LOG(INFO) << "NDS segment_info: eid=0x" << eid_hex
-                      << " uasid=" << segment_info.uasid
-                      << " jetty_id=" << segment_info.jetty_id
-                      << " token_id=" << segment_info.token_id
+            LOG(INFO) << "NDS segment_infos: h2d {"
+                      << SegmentInfoStr(segment_infos.h2d_segment_info) << "} rh2d {"
+                      << SegmentInfoStr(segment_infos.rh2d_segment_info) << "}"
                       << " addr=0x" << std::hex << hbm_buf << std::dec
                       << " offset=" << current_offset
                       << " len=" << avail_in_iov;
 
             ret = hf3fs_prep_npu_direct_io(
                 &ior_write, false, fd_, current_offset, avail_in_iov,
-                &segment_info, reinterpret_cast<void*>(hbm_buf),
+                &segment_infos, reinterpret_cast<void*>(hbm_buf),
                 avail_in_iov, nullptr);
             if (ret < 0) {
                 return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
@@ -431,33 +431,24 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_read(const iovec* iov,
             uint64_t hbm_buf = reinterpret_cast<uint64_t>(
                 static_cast<char*>(current_iov->iov_base) +
                 current_iov_offset);
-            nds_segment_info_t segment_info;
-            char eid_hex[33] = {0};
-            for (int i = 0; i < 16; ++i) {
-                snprintf(eid_hex + i * 2, 3, "%02x", segment_info.eid[i]);
-            }
-            int ret = nds_get_segment_info(reinterpret_cast<void*>(hbm_buf), &segment_info);
+            nds_segment_infos_t segment_infos;
+            int ret = nds_get_segment_info(reinterpret_cast<void*>(hbm_buf), &segment_infos);
             if (ret != 0) {
-                LOG(ERROR) << "nds_get_segment_info failed, errno: " << ret;
-                LOG(ERROR) << "eid=0x" << eid_hex
-                    << " uasid=" << segment_info.uasid
-                    << " jetty_id=" << segment_info.jetty_id
-                    << " token_id=" << segment_info.token_id
-                    << " addr=0x" << std::hex << hbm_buf << std::dec
-                    << " offset=" << current_offset;
+                LOG(ERROR) << "nds_get_segment_info failed, errno: " << ret
+                           << " addr=0x" << std::hex << hbm_buf << std::dec
+                           << " offset=" << current_offset;
                 return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
             }
-            LOG(INFO) << "NDS segment_info: eid=0x" << eid_hex
-                      << " uasid=" << segment_info.uasid
-                      << " jetty_id=" << segment_info.jetty_id
-                      << " token_id=" << segment_info.token_id
+            LOG(INFO) << "NDS segment_infos: h2d {"
+                      << SegmentInfoStr(segment_infos.h2d_segment_info) << "} rh2d {"
+                      << SegmentInfoStr(segment_infos.rh2d_segment_info) << "}"
                       << " addr=0x" << std::hex << hbm_buf << std::dec
                       << " offset=" << current_offset
                       << " len=" << avail_in_iov;
 
             ret = hf3fs_prep_npu_direct_io(
                 &ior_read, true, fd_, current_offset, avail_in_iov,
-                &segment_info, reinterpret_cast<void*>(hbm_buf),
+                &segment_infos, reinterpret_cast<void*>(hbm_buf),
                 avail_in_iov, nullptr);
             if (ret < 0) {
                 return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
