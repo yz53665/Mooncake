@@ -21,12 +21,20 @@ store.setup(
 dim1 = 7
 dim2 = 4
 dim3 = 4
+min_bytes = 4096  # 注册/传输的 buffer 大小不能小于 4096 字节
+
 total_size = dim1 * dim2 * dim3
 
 #tensor = torch.randint(0, 50, (dim1, dim2, dim3), dtype=torch.uint8).npu()
 tensor = torch.randn(dim1, dim2, dim3).npu()
 data_ptr = tensor.data_ptr()
 total_bytes = tensor.element_size() * tensor.numel()
+
+if total_bytes < min_bytes:
+    raise ValueError(
+        f"buffer 大小 {total_bytes} 字节小于最小要求 {min_bytes} 字节，"
+        f"请增大 tensor 维度（当前元素数 {total_size}）"
+    )
 store.register_buffer(data_ptr, total_bytes)
 store.register_nds_buffer(data_ptr, total_bytes)
 
