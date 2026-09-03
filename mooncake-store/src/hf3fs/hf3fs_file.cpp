@@ -7,6 +7,7 @@
 
 #ifdef USE_NDS
 #include <hf3fs/nds.h>
+#include "hf3fs/nds_cache.h"
 #include <sstream>
 #include "gpu_staging_utils.h"
 
@@ -92,10 +93,10 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::write(std::span<const char> data,
             uint64_t hbm_buf = reinterpret_cast<uint64_t>(
                 data_ptr + total_bytes_written);
             nds_segment_infos_t segment_infos;
-            int ret = nds_get_segment_info(reinterpret_cast<void*>(hbm_buf), &segment_infos);
-            if (ret != 0) {
-                LOG(ERROR) << "nds_get_segment_info failed, errno: " << ret
-                           << " addr=0x" << std::hex << hbm_buf << std::dec
+            if (!nds_cache::GetSegmentInfo(reinterpret_cast<void*>(hbm_buf),
+                                           &segment_infos)) {
+                LOG(ERROR) << "NDS segment info not cached, addr=0x"
+                           << std::hex << hbm_buf << std::dec
                            << " offset=" << current_offset
                            << " chunk_size=" << chunk_size;
                 return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
@@ -283,10 +284,10 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_write(const iovec* iov,
                 static_cast<char*>(current_iov->iov_base) +
                 current_iov_offset);
             nds_segment_infos_t segment_infos;
-            int ret = nds_get_segment_info(reinterpret_cast<void*>(hbm_buf), &segment_infos);
-            if (ret != 0) {
-                LOG(ERROR) << "nds_get_segment_info failed, errno: " << ret
-                           << " addr=0x" << std::hex << hbm_buf << std::dec
+            if (!nds_cache::GetSegmentInfo(reinterpret_cast<void*>(hbm_buf),
+                                           &segment_infos)) {
+                LOG(ERROR) << "NDS segment info not cached, addr=0x"
+                           << std::hex << hbm_buf << std::dec
                            << " offset=" << current_offset;
                 return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
             }
@@ -432,10 +433,10 @@ tl::expected<size_t, ErrorCode> ThreeFSFile::vector_read(const iovec* iov,
                 static_cast<char*>(current_iov->iov_base) +
                 current_iov_offset);
             nds_segment_infos_t segment_infos;
-            int ret = nds_get_segment_info(reinterpret_cast<void*>(hbm_buf), &segment_infos);
-            if (ret != 0) {
-                LOG(ERROR) << "nds_get_segment_info failed, errno: " << ret
-                           << " addr=0x" << std::hex << hbm_buf << std::dec
+            if (!nds_cache::GetSegmentInfo(reinterpret_cast<void*>(hbm_buf),
+                                           &segment_infos)) {
+                LOG(ERROR) << "NDS segment info not cached, addr=0x"
+                           << std::hex << hbm_buf << std::dec
                            << " offset=" << current_offset;
                 return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
             }

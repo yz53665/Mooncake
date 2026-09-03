@@ -42,6 +42,7 @@
 #endif
 #ifdef USE_NDS
 #include "hf3fs/nds.h"
+#include "hf3fs/nds_cache.h"
 #include <acl/acl.h>
 #endif
 
@@ -3101,7 +3102,19 @@ tl::expected<void, ErrorCode> RealClient::register_nds_buffer_internal(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // Segment metadata is constant for the lifetime of a registered buffer, so
+    // fetch it once here (at nds_init/registration time) and cache it; the
+    // file I/O paths reuse the cache instead of querying NDS on every I/O.
+    nds_segment_infos_t segment_infos;
+    if (nds_get_segment_info(buffer, &segment_infos) != 0) {
+        LOG(ERROR) << "nds_get_segment_info failed, addr=" << buffer
+                   << " size=" << size << " device=" << device_id;
+        nds_buf_deregister(device_id, buffer);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     nds_registered_buffers_[buffer] = {buffer, size, device_id};
+    nds_cache::AddSegmentInfo(buffer, size, segment_infos);
     LOG(INFO) << "NDS buffer registered: addr=" << buffer
               << " size=" << size << " device=" << device_id;
     return {};
@@ -3121,6 +3134,7 @@ tl::expected<void, ErrorCode> RealClient::unregister_nds_buffer_internal(
         LOG(WARNING) << "nds_buf_deregister failed, addr=" << buffer
                      << " device=" << device_id;
     }
+    nds_cache::RemoveSegmentInfo(buffer);
     nds_registered_buffers_.erase(it);
     return {};
 }
