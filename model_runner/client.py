@@ -3,6 +3,7 @@ import torch
 import torch_npu
 
 device = torch.npu.set_device(0)
+torch.manual_seed(42)
 
 # 1. Create store instance
 store = MooncakeDistributedStore()
@@ -18,9 +19,9 @@ store.setup(
     "127.0.0.1:50088",        # Master service
 )
 
-dim1 = 7
-dim2 = 4
-dim3 = 4
+dim1 = 2
+dim2 = 128
+dim3 = 128
 min_bytes = 4096  # 注册/传输的 buffer 大小不能小于 4096 字节
 
 total_size = dim1 * dim2 * dim3
