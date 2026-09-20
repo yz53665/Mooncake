@@ -83,6 +83,28 @@ add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
+
+# ThreeFS NDS batch I/O test: requires 3FS + NDS. It defines its own main()
+# (gflags parsing), so it links gtest (without gtest_main) directly.
+if(USE_3FS AND USE_NDS)
+  add_executable(threefs_nds_batch_test threefs_nds_batch_test.cpp)
+  target_include_directories(
+    threefs_nds_batch_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} $ENV{ASCEND_PATH}/include)
+  target_link_libraries(
+    threefs_nds_batch_test
+    PUBLIC mooncake_store
+           transfer_engine
+           cachelib_memory_allocator
+           ${ETCD_WRAPPER_LIB}
+           glog
+           gflags
+           ibverbs
+           gtest
+           pthread)
+  add_test(NAME threefs_nds_batch_test COMMAND threefs_nds_batch_test)
+endif()
+
 add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(task_manager_test task_manager_test.cpp)
