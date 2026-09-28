@@ -38,29 +38,11 @@
 #ifdef USE_NDS
 #include "transport/nvmeof_transport/nds.h"
 #include "transport/nvmeof_transport/nds_desc_pool.h"
-#include "acl/acl.h"
 #endif
 
 namespace mooncake {
 NVMeoFTransport::NVMeoFTransport() {
 #ifdef USE_NDS
-    int32_t dev_id = -1;
-    if (aclrtGetDevice(&dev_id) == ACL_SUCCESS && dev_id >= 0) {
-        nds_device_id_ = dev_id;
-        LOG(INFO) << "NVMeoFTransport: NDS device_id=" << nds_device_id_
-                  << " obtained from aclrtGetDevice";
-    } else {
-        const char *nds_device_env = getenv("MC_NDS_DEVICE_ID");
-        if (nds_device_env) {
-            auto opt = parseFromString<int32_t>(nds_device_env);
-            if (opt.has_value() && opt.value() >= 0) {
-                nds_device_id_ = opt.value();
-                LOG(INFO) << "NVMeoFTransport: NDS device_id set to "
-                          << nds_device_id_
-                          << " from MC_NDS_DEVICE_ID (fallback)";
-            }
-        }
-    }
     nds_desc_pool_ = std::make_shared<NdsDescPool>();
 #else
     CUFILE_CHECK(cuFileDriverOpen());
@@ -70,8 +52,8 @@ NVMeoFTransport::NVMeoFTransport() {
 
 NVMeoFTransport::~NVMeoFTransport() {
 #ifdef USE_NDS
-    if (nds_initialized_ && nds_device_id_ >= 0) {
-        nds_deinit(nds_device_id_);
+    if (nds_initialized_) {
+        nds_deinit();
         nds_initialized_ = false;
     }
 #endif
@@ -257,8 +239,7 @@ Status NVMeoFTransport::submitTransferTask(
                     RWSpinlock::WriteGuard guard(nds_context_lock_);
                     if (!nds_segment_to_context_.count(buf_key)) {
                         nds_segment_to_context_[buf_key] =
-                            std::make_shared<NdsFileContext>(
-                                file_path, nds_device_id_);
+                            std::make_shared<NdsFileContext>(file_path);
                     }
                     nds_handle = nds_segment_to_context_.at(buf_key)->getHandle();
                 }
@@ -425,30 +406,20 @@ int NVMeoFTransport::registerLocalMemory(void *addr, size_t length,
     (void)remote_accessible;
     (void)update_metadata;
 #ifdef USE_NDS
-    if (nds_device_id_ >= 0) {
-        if (!nds_initialized_) {
-            if (nds_init(nds_device_id_) != 0) {
-                LOG(ERROR) << "NVMeoFTransport: nds_init failed for device_id="
-                           << nds_device_id_;
-                return -1;
-            }
-            int ret = aclrtSetDevice(nds_device_id_);
-            if (ret != ACL_SUCCESS) {
-                LOG(ERROR) << "NVMeoFTransport: aclrtSetDevice failed for "
-                              "device_id="
-                           << nds_device_id_ << ", ret=" << ret;
-                return -1;
-            }
-            nds_initialized_ = true;
-        }
-        if (nds_buf_register(nds_device_id_, addr, length) != 0) {
-            LOG(ERROR) << "NVMeoFTransport: nds_buf_register failed for addr="
-                       << addr << " length=" << length;
+    if (!nds_initialized_) {
+        if (nds_init() != 0) {
+            LOG(ERROR) << "NVMeoFTransport: nds_init failed";
             return -1;
         }
-        LOG(INFO) << "NVMeoFTransport: nds_buf_register success for addr="
-                  << addr << " length=" << length;
+        nds_initialized_ = true;
     }
+    if (nds_buf_register(addr, length) != 0) {
+        LOG(ERROR) << "NVMeoFTransport: nds_buf_register failed for addr="
+                   << addr << " length=" << length;
+        return -1;
+    }
+    LOG(INFO) << "NVMeoFTransport: nds_buf_register success for addr="
+              << addr << " length=" << length;
 #else
     CUFILE_CHECK(cuFileBufRegister(addr, length, 0));
 #endif
@@ -458,8 +429,8 @@ int NVMeoFTransport::registerLocalMemory(void *addr, size_t length,
 int NVMeoFTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
     (void)update_metadata;
 #ifdef USE_NDS
-    if (nds_initialized_ && nds_device_id_ >= 0) {
-        if (nds_buf_deregister(nds_device_id_, addr) != 0) {
+    if (nds_initialized_) {
+        if (nds_buf_deregister(addr) != 0) {
             LOG(ERROR)
                 << "NVMeoFTransport: nds_buf_deregister failed for addr="
                 << addr;
@@ -517,16 +488,14 @@ void NVMeoFTransport::addSliceToNdsBatch(
     int desc_id, TransferRequest::OpCode op, nds_Handle nds_handle,
     Slice *slice) {
     nds_batch_io_params_t params;
-    params.mode = NDS_BATCH_MODE;
-    params.u.batch.buf = source_addr;
-    params.u.batch.file_offset = file_offset;
-    params.u.batch.size = slice_len;
+    params.buf = source_addr;
+    params.offset = file_offset;
+    params.nbyte = slice_len;
     params.nds_handle = nds_handle;
     params.opcode = (op == Transport::TransferRequest::READ)
                         ? NDS_BATCH_IO_READ
                         : NDS_BATCH_IO_WRITE;
     params.cookie = slice;
-    params.device_id = nds_device_id_;
     nds_desc_pool_->pushParams(desc_id, params, slice);
 }
 #endif

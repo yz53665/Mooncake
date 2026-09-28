@@ -6,14 +6,14 @@
 // 对一批"key"（每个 key 对应 3FS 挂载点下的一个文件）做 NDS 批量写入与回读校验。
 //
 // 前置条件：
-//   - 已启用 USE_NDS + USE_3FS 编译（nds_init/buf_register 为带 device_id 的版本）
+//   - 已启用 USE_NDS + USE_3FS 编译（nds_init/buf_register 为不带 device_id 的版本）
 //   - NPU 设备可用（CANN，acl 接口）
 //   - 3FS 已挂载，--mount_point 指向挂载点
 //
 // NDS 使用前必须完成：
 //   1. aclInit + aclrtSetDevice
-//   2. nds_init(device_id)
-//   3. nds_buf_register(device_id, hbm, size) 注册 HBM buffer
+//   2. nds_init()
+//   3. nds_buf_register(hbm, size) 注册 HBM buffer
 //   4. nds_get_segment_info 获取 segment 元信息（一次获取，I/O 时复用）
 //
 // 用法示例：
@@ -46,7 +46,7 @@
 #include <vector>
 
 #ifdef USE_NDS
-// 必须先包含 mooncake 版 nds.h（带 device_id 的签名），再包含 3FS 的
+// 必须先包含 mooncake 版 nds.h（不带 device_id 的签名），再包含 3FS 的
 // hf3fs_usrbio.h（其内部 "nds.h" 因同名 NDS_H 保护宏而不会重复定义）。
 #include <hf3fs/nds.h>
 #include "hf3fs/nds_cache.h"
@@ -95,9 +95,8 @@ class ThreeFsNdsBatchTest : public ::testing::Test {
         ASSERT_NE(hbm_, nullptr);
 
         // 3. NDS 初始化 + 注册 buffer（NDS 使用前必须完成）
-        ASSERT_EQ(nds_init(device_id_), 0)
-            << "nds_init failed, device=" << device_id_;
-        ASSERT_EQ(nds_buf_register(device_id_, hbm_, total_size_), 0)
+        ASSERT_EQ(nds_init(), 0) << "nds_init failed";
+        ASSERT_EQ(nds_buf_register(hbm_, total_size_), 0)
             << "nds_buf_register failed";
         ASSERT_EQ(nds_get_segment_info(hbm_, &seg_infos_), 0)
             << "nds_get_segment_info failed";
@@ -151,8 +150,8 @@ class ThreeFsNdsBatchTest : public ::testing::Test {
             rmdir(dir_.c_str());
         }
         if (nds_initialized_) {
-            nds_buf_deregister(device_id_, hbm_);
-            nds_deinit(device_id_);
+            nds_buf_deregister(hbm_);
+            nds_deinit();
         }
         if (hbm_ != nullptr) {
             aclrtFree(hbm_);

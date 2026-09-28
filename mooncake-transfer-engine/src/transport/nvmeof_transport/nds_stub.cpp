@@ -31,7 +31,6 @@
 
 struct nds_file_ctx_t {
     int fd;
-    int32_t device_id;
 };
 
 struct nds_batch_context {
@@ -48,28 +47,24 @@ static std::unordered_map<int, nds_Handle> g_fd_map;
 // NDS initialization / deinitialization stubs
 // ============================================================================
 
-extern "C" int nds_init(int32_t device_id) {
-    (void)device_id;
+extern "C" int nds_init(void) {
     return 0;
 }
 
-extern "C" void nds_deinit(int32_t device_id) {
-    (void)device_id;
+extern "C" void nds_deinit(void) {
 }
 
 // ============================================================================
 // NDS buffer registration stubs
 // ============================================================================
 
-extern "C" int nds_buf_register(int32_t device_id, void *buf, size_t len) {
-    (void)device_id;
+extern "C" int nds_buf_register(void *buf, size_t len) {
     (void)buf;
     (void)len;
     return 0;
 }
 
-extern "C" int nds_buf_deregister(int32_t device_id, void *buf) {
-    (void)device_id;
+extern "C" int nds_buf_deregister(void *buf) {
     (void)buf;
     return 0;
 }
@@ -93,7 +88,6 @@ extern "C" int nds_get_segment_info(void *buf, nds_segment_infos_t *out) {
 extern "C" nds_Handle nds_file_register(int fd) {
     auto *ctx = new nds_file_ctx_t();
     ctx->fd = fd;
-    ctx->device_id = 0;
     {
         std::lock_guard<std::mutex> lock(g_fd_map_lock);
         g_fd_map[fd] = ctx;
@@ -115,10 +109,9 @@ extern "C" int nds_file_deregister(int fd) {
 // NDS synchronous read/write stubs (return full transfer)
 // ============================================================================
 
-extern "C" ssize_t nds_read(nds_Handle nds_handle, int32_t device_id,
+extern "C" ssize_t nds_read(nds_Handle nds_handle,
                             void *buf, size_t nbyte, off_t offset) {
     (void)nds_handle;
-    (void)device_id;
     (void)buf;
     (void)offset;
     return static_cast<ssize_t>(nbyte);
@@ -134,10 +127,9 @@ extern "C" ssize_t nds_read_imported(nds_Handle nds_handle,
     return static_cast<ssize_t>(nbyte);
 }
 
-extern "C" ssize_t nds_write(nds_Handle nds_handle, int32_t device_id,
+extern "C" ssize_t nds_write(nds_Handle nds_handle,
                              void *buf, size_t nbyte, off_t offset) {
     (void)nds_handle;
-    (void)device_id;
     (void)buf;
     (void)offset;
     return static_cast<ssize_t>(nbyte);
@@ -167,19 +159,15 @@ extern "C" int nds_batch_io_setup(nds_batch_handle_t *handle, unsigned max_nr) {
 }
 
 extern "C" int nds_batch_io_submit(nds_batch_handle_t handle, unsigned nr,
-                                nds_batch_io_params_t *params, unsigned flags) {
-    (void)flags;
+                                nds_batch_io_params_t *params) {
     if (!handle || !params) return -1;
     handle->params.assign(params, params + nr);
     handle->submitted = true;
     return 0;
 }
 
-extern "C" int nds_batch_io_get_status(nds_batch_handle_t handle, unsigned min_nr,
-                                   unsigned *nr, nds_batch_io_events_t *events,
-                                   const struct timespec *timeout) {
-    (void)min_nr;
-    (void)timeout;
+extern "C" int nds_batch_io_get_status(nds_batch_handle_t handle,
+                                   unsigned *nr, nds_batch_io_events_t *events) {
     if (!handle || !nr || !events) return -1;
     if (!handle->submitted) {
         *nr = 0;
@@ -191,10 +179,18 @@ extern "C" int nds_batch_io_get_status(nds_batch_handle_t handle, unsigned min_n
     for (unsigned i = 0; i < count; ++i) {
         events[i].cookie = handle->params[i].cookie;
         events[i].status = NDS_BATCH_IO_COMPLETED;
-        events[i].ret = static_cast<ssize_t>(handle->params[i].u.batch.size);
+        events[i].ret = static_cast<ssize_t>(handle->params[i].nbyte);
         events[i].error = 0;
     }
     *nr = count;
+    return 0;
+}
+
+extern "C" int nds_batch_io_reset(nds_batch_handle_t handle) {
+    if (handle) {
+        handle->params.clear();
+        handle->submitted = false;
+    }
     return 0;
 }
 

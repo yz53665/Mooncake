@@ -837,11 +837,10 @@ class RealClient : public PyClient {
     struct NdsBufferInfo {
         void *addr;
         size_t size;
-        int32_t device_id;
     };
     std::mutex nds_mutex_;
     std::unordered_map<void *, NdsBufferInfo> nds_registered_buffers_;
-    std::unordered_set<int32_t> nds_initialized_devices_;
+    bool nds_initialized_ = false;
 #endif
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.

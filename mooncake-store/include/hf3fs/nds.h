@@ -19,8 +19,6 @@ See the License for the specific language governing permissions and limitations 
 extern "C" {
 #endif
 
-#define NDS_HOST_ID (-1)
-
 /**
  * @brief 声明nds句柄 nds_Handle
  */
@@ -50,7 +48,6 @@ typedef struct nds_segment_infos {
  */
 typedef struct {
     nds_Handle nds_handle;    // nds 句柄
-    int32_t device_id;        // buf 注册时使用的 device_id，Host DDR 使用 NDS_HOST_ID
     void* buf;                // HBM 或 Host DDR 内存数据缓冲区
     size_t nbyte;             // 期望读写长度
     off_t offset;             // nds_handle 中的文件/块设备偏移
@@ -72,7 +69,6 @@ typedef enum {
  */
 typedef struct {
     nds_Handle nds_handle;
-    int32_t device_id;
     void *buf;
     size_t nbyte;
     off_t offset;
@@ -93,52 +89,49 @@ typedef struct {
 /**
  * @brief Initialize NDS user-space library
  * This function performs the initialization of the NDS component, including:
- * @param device_id NPU device ID
  * @return 0 on success, -1 on failure
  * @note Call once per process. Host DDR URMA resources are initialized automatically when available.
  *       Their initialization failure does not block the existing NPU path.
  * @warning This function must be called before any other NDS interfaces.
  * @see nds_deinit
  */
-int nds_init(int32_t device_id);
+int nds_init(void);
 
 /**
  * @brief Release NDS user-space library resources
  * This function releases all resources occupied by the NDS component, including:
- * @param device_id NPU device ID passed to nds_init
  * @note Even if some resources fail to be released, the function will continue to release other resources.
  * @warning Must be called after all buffers are deregistered, otherwise resource leaks may occur.
  * @see nds_init
  */
-void nds_deinit(int32_t device_id);
+void nds_deinit(void);
 
 /**
  * @brief Register a local NDS memory buffer
  * This function registers a local memory buffer to the NDS component, making it available for RDMA communication.
  * After registration, the remote access key (MemKey) for this memory region is obtained for subsequent remote memory access.
- * @param device_id NPU device ID, or NDS_HOST_ID for Host DDR memory
  * @param buf HBM or Host DDR memory buffer address
  * @param len Buffer length in bytes
  * @return 0 on success, -1 on failure
- * @note Must call nds_init with an NPU device ID before registration.
- * @warning Re-registering the same device_id/buf/len is idempotent. Re-registering the same buf
- *          with a different len is not supported. Memory must not be freed before deregistration.
+ * @note Call nds_init after selecting the NPU device with aclrtSetDevice.
+ *       The memory type and device ID are detected from the buffer attributes.
+ * @warning Re-registering the same buf/len is idempotent. Re-registering the same buf
+ *          with a different len or memory type is not supported. Memory must not be freed before deregistration.
  * @see nds_buf_deregister
  */
-int nds_buf_register(int32_t device_id, void *buf, size_t len);
+int nds_buf_register(void *buf, size_t len);
 
 /**
  * @brief Deregister a local NDS memory buffer
  * This function deregisters the previously registered local memory buffer and releases related resources.
  * After deregistration, this memory region can no longer be used for RDMA communication.
- * @param device_id NPU device ID, or NDS_HOST_ID for Host DDR memory
  * @param buf HBM or Host DDR memory buffer address
  * @return 0 on success, -1 on failure
  * @note Must call nds_buf_register to register the buffer first.
  * @warning After deregistration, the buffer should not be used for RDMA operations.
  * @see nds_buf_register
  */
-int nds_buf_deregister(int32_t device_id, void *buf);
+int nds_buf_deregister(void *buf);
 
 /**
  * @brief Get the remote-access metadata for a registered HBM segment address.
@@ -172,7 +165,6 @@ int nds_file_deregister(int fd);
 /**
  * @brief Read data from a file or block device into local registered NPU HBM.
  * @param nds_handle NDS file handle returned by nds_file_register.
- * @param device_id NPU device ID used when registering buf, or NDS_HOST_ID for Host DDR.
  * @param buf Destination buffer address in local registered NPU HBM or Host DDR.
  * @param nbyte Number of bytes to transfer.
  * @param offset File or block device offset.
@@ -180,7 +172,7 @@ int nds_file_deregister(int fd);
  * @note buf can be any address inside a registered buffer range.
  * @see nds_buf_register, nds_file_register
  */
-ssize_t nds_read(nds_Handle nds_handle, int32_t device_id, void *buf, size_t nbyte, off_t offset);
+ssize_t nds_read(nds_Handle nds_handle, void *buf, size_t nbyte, off_t offset);
 
 /**
  * @brief Read data from a file or block device into an imported remote NPU HBM segment.
@@ -210,7 +202,6 @@ ssize_t nds_read_imported(nds_Handle nds_handle, const nds_segment_info_t *segme
  * write, while Host DDR data is written directly with pwrite. Block-device
  * writes use the NDS URMA path for both HBM and Host DDR buffers.
  * @param nds_handle NDS file handle returned by nds_file_register.
- * @param device_id NPU device ID used when registering buf, or NDS_HOST_ID for Host DDR
  * @param buf      Source buffer address in NPU HBM (device memory) or Host DDR
  * @param nbyte    Number of bytes to transfer
  * @param offset   File offset for the write operation
@@ -220,7 +211,7 @@ ssize_t nds_read_imported(nds_Handle nds_handle, const nds_segment_info_t *segme
  *          Use nds_buf_register() to register the buffer first.
  * @see nds_buf_register, nds_buf_deregister
  */
-ssize_t nds_write(nds_Handle nds_handle, int32_t device_id, void *buf, size_t nbyte, off_t offset);
+ssize_t nds_write(nds_Handle nds_handle, void *buf, size_t nbyte, off_t offset);
 
 /**
  * @brief Write data from an imported remote NPU HBM segment to a file or block device

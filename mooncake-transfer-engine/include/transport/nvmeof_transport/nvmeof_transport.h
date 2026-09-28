@@ -152,7 +152,6 @@ class NVMeoFTransport : public Transport {
 
     std::shared_ptr<NdsDescPool> nds_desc_pool_;
 
-    int32_t nds_device_id_ = -1;
     bool nds_initialized_ = false;
 #endif
 };

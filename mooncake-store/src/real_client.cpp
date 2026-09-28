@@ -3072,22 +3072,15 @@ int RealClient::unregister_buffer(void *buffer) {
 #ifdef USE_NDS
 tl::expected<void, ErrorCode> RealClient::register_nds_buffer_internal(
     void *buffer, size_t size) {
-    int32_t device_id = 0;
-    if (aclrtGetDevice(&device_id) != ACL_ERROR_NONE) {
-        LOG(ERROR) << "aclrtGetDevice failed for NDS buffer registration";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
     std::lock_guard<std::mutex> lock(nds_mutex_);
 
-    // Lazy init NDS for this device
-    if (nds_initialized_devices_.find(device_id) ==
-        nds_initialized_devices_.end()) {
-        if (nds_init(device_id) != 0) {
-            LOG(ERROR) << "nds_init failed for device " << device_id;
+    // Lazy init NDS (once per process)
+    if (!nds_initialized_) {
+        if (nds_init() != 0) {
+            LOG(ERROR) << "nds_init failed";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        nds_initialized_devices_.insert(device_id);
+        nds_initialized_ = true;
     }
 
     // Avoid duplicate registration
@@ -3096,9 +3089,9 @@ tl::expected<void, ErrorCode> RealClient::register_nds_buffer_internal(
         return {};
     }
 
-    if (nds_buf_register(device_id, buffer, size) != 0) {
+    if (nds_buf_register(buffer, size) != 0) {
         LOG(ERROR) << "nds_buf_register failed, addr=" << buffer
-                   << " size=" << size << " device=" << device_id;
+                   << " size=" << size;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -3108,15 +3101,15 @@ tl::expected<void, ErrorCode> RealClient::register_nds_buffer_internal(
     nds_segment_infos_t segment_infos;
     if (nds_get_segment_info(buffer, &segment_infos) != 0) {
         LOG(ERROR) << "nds_get_segment_info failed, addr=" << buffer
-                   << " size=" << size << " device=" << device_id;
-        nds_buf_deregister(device_id, buffer);
+                   << " size=" << size;
+        nds_buf_deregister(buffer);
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    nds_registered_buffers_[buffer] = {buffer, size, device_id};
+    nds_registered_buffers_[buffer] = {buffer, size};
     nds_cache::AddSegmentInfo(buffer, size, segment_infos);
     LOG(INFO) << "NDS buffer registered: addr=" << buffer
-              << " size=" << size << " device=" << device_id;
+              << " size=" << size;
     return {};
 }
 
@@ -3129,10 +3122,8 @@ tl::expected<void, ErrorCode> RealClient::unregister_nds_buffer_internal(
         return {};
     }
 
-    int32_t device_id = it->second.device_id;
-    if (nds_buf_deregister(device_id, buffer) != 0) {
-        LOG(WARNING) << "nds_buf_deregister failed, addr=" << buffer
-                     << " device=" << device_id;
+    if (nds_buf_deregister(buffer) != 0) {
+        LOG(WARNING) << "nds_buf_deregister failed, addr=" << buffer;
     }
     nds_cache::RemoveSegmentInfo(buffer);
     nds_registered_buffers_.erase(it);

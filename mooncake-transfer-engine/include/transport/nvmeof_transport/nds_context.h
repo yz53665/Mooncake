@@ -31,8 +31,7 @@ class NdsFileContext {
    public:
     nds_Handle getHandle() const { return handle_; }
 
-    explicit NdsFileContext(const char *filename, int32_t device_id)
-        : device_id_(device_id) {
+    explicit NdsFileContext(const char *filename) {
 #ifdef NDS_USE_STUB
         // Stub mode: skip real file open, use dummy fd
         fd_ = -1;
@@ -71,12 +70,9 @@ class NdsFileContext {
         }
     }
 
-    int32_t getDeviceId() const { return device_id_; }
-
    private:
     nds_Handle handle_ = nullptr;
     int fd_ = -1;
-    int32_t device_id_;
 };
 
 }  // namespace mooncake

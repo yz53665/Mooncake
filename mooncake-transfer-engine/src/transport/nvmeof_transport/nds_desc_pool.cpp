@@ -170,7 +170,7 @@ int NdsDescPool::submitBatch(int idx) {
     // Submit all params in this descriptor
     unsigned nr = static_cast<unsigned>(desc->params.size());
     if (nds_batch_io_submit(desc->batch_handle->handle, nr,
-                         desc->params.data(), 0) != 0) {
+                         desc->params.data()) != 0) {
         LOG(ERROR) << "NdsDescPool: nds_batch_io_submit failed for " << nr
                    << " slices";
         return -1;
@@ -199,8 +199,8 @@ nds_batch_io_events_t NdsDescPool::getTransferStatus(int idx, int slice_id) {
     }
 
     unsigned nr = static_cast<unsigned>(desc->params.size());
-    if (nds_batch_io_get_status(desc->batch_handle->handle, 0, &nr,
-                            desc->events.data(), nullptr) != 0) {
+    if (nds_batch_io_get_status(desc->batch_handle->handle, &nr,
+                            desc->events.data()) != 0) {
         LOG(ERROR) << "NdsDescPool: nds_batch_io_get_status failed for desc " << idx;
         nds_batch_io_events_t event;
         event.status = NDS_BATCH_IO_FAILED;

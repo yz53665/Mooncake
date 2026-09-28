@@ -126,8 +126,6 @@ class NVMeoFNdsTransportTest : public ::testing::Test {
         ret = aclrtSetDevice(device_id_);
         ASSERT_EQ(ret, ACL_SUCCESS) << "Failed to set NPU device " << device_id_ << ", ret=" << ret;
 
-        setenv("MC_NDS_DEVICE_ID", std::to_string(device_id_).c_str(), 1);
-
         engine = std::make_unique<TransferEngine>(false);
         hostname_port = parseHostNameWithPort(FLAGS_local_server_name);
         engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),

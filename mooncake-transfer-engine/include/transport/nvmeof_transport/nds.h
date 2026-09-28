@@ -19,8 +19,6 @@ See the License for the specific language governing permissions and limitations 
 extern "C" {
 #endif
 
-struct timespec;
-
 /**
  * @brief 声明nds句柄 nds_Handle
  */
@@ -50,8 +48,7 @@ typedef struct nds_segment_infos {
  */
 typedef struct {
     nds_Handle nds_handle;    // nds 句柄
-    int32_t device_id;        // HBM buf 注册时使用的deivce_id
-    void* buf;                // HBM内存数据缓冲区
+    void* buf;                // HBM 或 Host DDR 内存数据缓冲区
     size_t nbyte;             // 期望读写长度
     off_t offset;             // nds_handle 中的文件/块设备偏移
 } nds_io_parameter;
@@ -67,37 +64,20 @@ typedef enum {
     NDS_BATCH_IO_FAILED = 2,
 } nds_batch_io_status_t;
 
-typedef enum {
-    NDS_BATCH_MODE = 1,
-} nds_batch_mode_t;
-
 /**
- * @brief HBM address descriptor for one batch async I/O slice.
+ * @brief Submit parameter for one batch async I/O entry.
  */
 typedef struct {
-    void *buf;         // Registered NPU HBM address for this slice.
-    off_t file_offset; // File or block-device offset.
-    size_t size;      // Transfer size in bytes.
-} nds_batch_io_param_batch_t;
-
-/**
- * @brief Submit parameter for one batch async I/O slice.
- * @note buf is the actual HBM address. device_id is still required by NDS to
- *       look up local buffer state and device metadata.
- */
-typedef struct {
-    nds_batch_mode_t mode;
-    union {
-        nds_batch_io_param_batch_t batch;
-    } u;
     nds_Handle nds_handle;
+    void *buf;
+    size_t nbyte;
+    off_t offset;
     nds_batch_io_op_t opcode;
     void *cookie;
-    int32_t device_id;
 } nds_batch_io_params_t;
 
 /**
- * @brief Completion event for one batch async I/O slice.
+ * @brief Completion event for one batch async I/O entry.
  */
 typedef struct {
     void *cookie;
@@ -109,51 +89,49 @@ typedef struct {
 /**
  * @brief Initialize NDS user-space library
  * This function performs the initialization of the NDS component, including:
- * @param device_id NPU device ID
  * @return 0 on success, -1 on failure
- * @note Each device should be initialized only once. Repeated initialization may cause resource leaks.
+ * @note Call once per process. Host DDR URMA resources are initialized automatically when available.
+ *       Their initialization failure does not block the existing NPU path.
  * @warning This function must be called before any other NDS interfaces.
  * @see nds_deinit
  */
-int nds_init(int32_t device_id);
+int nds_init(void);
 
 /**
  * @brief Release NDS user-space library resources
  * This function releases all resources occupied by the NDS component, including:
- * @param device_id NPU device ID
  * @note Even if some resources fail to be released, the function will continue to release other resources.
  * @warning Must be called after all buffers are deregistered, otherwise resource leaks may occur.
  * @see nds_init
  */
-void nds_deinit(int32_t device_id);
+void nds_deinit(void);
 
 /**
- * @brief Register HBM memory buffer
- * This function registers the HBM memory buffer to the NDS component, making it available for RDMA communication.
+ * @brief Register a local NDS memory buffer
+ * This function registers a local memory buffer to the NDS component, making it available for RDMA communication.
  * After registration, the remote access key (MemKey) for this memory region is obtained for subsequent remote memory access.
- * @param device_id NPU device ID
- * @param buf HBM memory buffer address
+ * @param buf HBM or Host DDR memory buffer address
  * @param len Buffer length in bytes
  * @return 0 on success, -1 on failure
- * @note Must call nds_init to initialize the device first.
- * @warning Re-registering the same device_id/buf/len is idempotent. Re-registering the same buf
- *          with a different len is not supported. Memory must not be freed before deregistration.
+ * @note Call nds_init after selecting the NPU device with aclrtSetDevice.
+ *       The memory type and device ID are detected from the buffer attributes.
+ * @warning Re-registering the same buf/len is idempotent. Re-registering the same buf
+ *          with a different len or memory type is not supported. Memory must not be freed before deregistration.
  * @see nds_buf_deregister
  */
-int nds_buf_register(int32_t device_id, void *buf, size_t len);
+int nds_buf_register(void *buf, size_t len);
 
 /**
- * @brief Deregister HBM memory buffer
- * This function deregisters the previously registered HBM memory buffer and releases related resources.
+ * @brief Deregister a local NDS memory buffer
+ * This function deregisters the previously registered local memory buffer and releases related resources.
  * After deregistration, this memory region can no longer be used for RDMA communication.
- * @param device_id NPU device ID
- * @param buf HBM memory buffer address
+ * @param buf HBM or Host DDR memory buffer address
  * @return 0 on success, -1 on failure
  * @note Must call nds_buf_register to register the buffer first.
  * @warning After deregistration, the buffer should not be used for RDMA operations.
  * @see nds_buf_register
  */
-int nds_buf_deregister(int32_t device_id, void *buf);
+int nds_buf_deregister(void *buf);
 
 /**
  * @brief Get the remote-access metadata for a registered HBM segment address.
@@ -187,15 +165,14 @@ int nds_file_deregister(int fd);
 /**
  * @brief Read data from a file or block device into local registered NPU HBM.
  * @param nds_handle NDS file handle returned by nds_file_register.
- * @param device_id NPU device ID used when registering buf.
- * @param buf Destination buffer address in local registered NPU HBM.
+ * @param buf Destination buffer address in local registered NPU HBM or Host DDR.
  * @param nbyte Number of bytes to transfer.
  * @param offset File or block device offset.
  * @return Number of bytes read on success, -1 on failure.
  * @note buf can be any address inside a registered buffer range.
  * @see nds_buf_register, nds_file_register
  */
-ssize_t nds_read(nds_Handle nds_handle, int32_t device_id, void *buf, size_t nbyte, off_t offset);
+ssize_t nds_read(nds_Handle nds_handle, void *buf, size_t nbyte, off_t offset);
 
 /**
  * @brief Read data from a file or block device into an imported remote NPU HBM segment.
@@ -220,23 +197,21 @@ ssize_t nds_read_imported(nds_Handle nds_handle, const nds_segment_info_t *segme
     void *buf, size_t nbyte, off_t offset);
 
 /*
- * @brief Write data from NPU device memory to a file or block device
- * This function copies data from NPU HBM (High Bandwidth Memory) to
- * host memory via aclrtMemcpy (ACL_MEMCPY_DEVICE_TO_HOST), then writes
- * the data to the target device through normal file/block I/O (pwrite).
- * The typical use case is offloading NPU-resident data to persistent
- * storage without an intermediate user-space copy of the full buffer.
- * @param handle   Target device file descriptor (obtained via open/creat)
- * @param buf      Source buffer address in NPU HBM (device memory)
+ * @brief Write data from NPU device memory or Host DDR to a file or block device
+ * For regular files, HBM data is copied to Host staging memory before file
+ * write, while Host DDR data is written directly with pwrite. Block-device
+ * writes use the NDS URMA path for both HBM and Host DDR buffers.
+ * @param nds_handle NDS file handle returned by nds_file_register.
+ * @param buf      Source buffer address in NPU HBM (device memory) or Host DDR
  * @param nbyte    Number of bytes to transfer
  * @param offset   File offset for the write operation
  * @return Number of bytes written on success, -1 on failure
  * @note The caller is responsible for opening/closing the target fd.
- * @warning buf must point to registered HBM memory on the NPU device.
+ * @warning buf must point to registered HBM memory on the NPU device or registered Host DDR memory.
  *          Use nds_buf_register() to register the buffer first.
  * @see nds_buf_register, nds_buf_deregister
  */
-ssize_t nds_write(nds_Handle nds_handle, int32_t device_id, void *buf, size_t nbyte, off_t offset);
+ssize_t nds_write(nds_Handle nds_handle, void *buf, size_t nbyte, off_t offset);
 
 /**
  * @brief Write data from an imported remote NPU HBM segment to a file or block device
@@ -263,33 +238,36 @@ ssize_t nds_write_imported(nds_Handle nds_handle, const nds_segment_info_t *segm
 /**
  * @brief Create a batch async I/O context.
  * @param handle Output batch handle.
- * @param max_nr Maximum number of slices supported by this batch handle.
+ * @param max_io_count Maximum number of I/O entries supported by this batch handle.
  * @return 0 on success, -1 on failure
  */
-int nds_batch_io_setup(nds_batch_handle_t *handle, unsigned max_nr);
+int nds_batch_io_setup(nds_batch_handle_t *handle, unsigned max_io_count);
 
 /**
- * @brief Submit a batch of async I/O slices.
+ * @brief Submit a batch of async I/O entries.
  * @param handle Batch handle returned by nds_batch_io_setup.
- * @param nr Number of slices to submit.
- * @param params I/O parameter array, one entry per slice.
- * @param flags Reserved, must be 0 for now.
+ * @param io_count Number of I/O entries to submit.
+ * @param params I/O parameter array.
  * @return 0 on submit accepted, -1 on failure
  */
-int nds_batch_io_submit(nds_batch_handle_t handle, unsigned nr,
-    nds_batch_io_params_t *params, unsigned flags);
+int nds_batch_io_submit(nds_batch_handle_t handle, unsigned io_count, nds_batch_io_params_t *params);
 
 /**
  * @brief Query completion events for a submitted batch.
  * @param handle Batch handle returned by nds_batch_io_setup.
- * @param min_nr Reserved, must be 0 for now.
- * @param nr Input event capacity, output number of returned events.
+ * @param event_count Input event capacity, output number of returned events.
  * @param events Completion output array.
- * @param timeout Reserved, must be NULL for now.
  * @return 0 on success, -1 on failure
  */
-int nds_batch_io_get_status(nds_batch_handle_t handle, unsigned min_nr,
-    unsigned *nr, nds_batch_io_events_t *events, const struct timespec *timeout);
+int nds_batch_io_get_status(nds_batch_handle_t handle, unsigned *event_count,
+    nds_batch_io_events_t *events);
+
+/**
+ * @brief Reset a completed batch async I/O context for reuse.
+ * @param handle Batch handle returned by nds_batch_io_setup.
+ * @return 0 on success, -1 on failure
+ */
+int nds_batch_io_reset(nds_batch_handle_t handle);
 
 /**
  * @brief Destroy a batch async I/O context and release related resources.
